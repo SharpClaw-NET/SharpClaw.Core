@@ -237,6 +237,9 @@ public sealed class TaskPlanExecutionEngine
         await context.Runtime.WaitIfPausedAsync(context.CancellationToken);
 
         var stepKey = step.StepKey ?? string.Empty;
+        if (TaskLanguageStepKeys.IsIntrinsic(stepKey))
+            return await ExecuteIntrinsicLanguageStepAsync(step, context, host);
+
         var executor = _stepExtensions.FirstOrDefault(e => e.CanExecute(stepKey));
         if (executor is null)
             return TaskStepExecutionResult.Continue;
@@ -292,6 +295,233 @@ public sealed class TaskPlanExecutionEngine
         return keepGoing
             ? TaskStepExecutionResult.Continue
             : TaskStepExecutionResult.Return;
+    }
+
+    private async Task<TaskStepExecutionResult> ExecuteIntrinsicLanguageStepAsync(
+        TaskStepDefinition step,
+        TaskPlanExecutionContext context,
+        ITaskPlanExecutionHost host)
+    {
+        switch (step.StepKey)
+        {
+            case TaskLanguageStepKeys.DeclareVariable:
+            case TaskLanguageStepKeys.Assign:
+                context.Variables[step.VariableName ?? string.Empty] = step.Expression;
+                return TaskStepExecutionResult.Continue;
+
+            case TaskLanguageStepKeys.Evaluate:
+                if (step.ResultVariable is not null)
+                    context.Variables[step.ResultVariable] = step.Expression;
+                return TaskStepExecutionResult.Continue;
+
+            case TaskLanguageStepKeys.Log:
+            {
+                var message = step.Expression is null
+                    ? string.Empty
+                    : _expressions.ResolveExpression(step.Expression, context.Variables);
+                await host.AppendLogAsync(
+                    context.InstanceId,
+                    message,
+                    JobLogLevels.Info,
+                    context.CancellationToken);
+                return TaskStepExecutionResult.Continue;
+            }
+
+            case TaskLanguageStepKeys.Delay:
+            {
+                var resolved = step.Expression is null
+                    ? null
+                    : _expressions.ResolveExpression(step.Expression, context.Variables);
+                if (int.TryParse(resolved, out var delayMs))
+                    await DelayWithPauseAsync(delayMs, context);
+                return TaskStepExecutionResult.Continue;
+            }
+
+            case TaskLanguageStepKeys.WaitUntilStopped:
+                await Task.Delay(Timeout.Infinite, context.CancellationToken);
+                return TaskStepExecutionResult.Continue;
+
+            case TaskLanguageStepKeys.Return:
+                return TaskStepExecutionResult.Return;
+
+            case TaskLanguageStepKeys.Conditional:
+            {
+                var branch = _expressions.EvaluateCondition(step.Expression, context.Variables)
+                    ? step.Body
+                    : step.ElseBody;
+                if (branch is null)
+                    return TaskStepExecutionResult.Continue;
+                return await ExecuteStepDefinitionsAsync(
+                    branch,
+                    context,
+                    host,
+                    context.CancellationToken,
+                    throwOnUnsupportedInvocation: false) == TaskStepResult.Return
+                    ? TaskStepExecutionResult.Return
+                    : TaskStepExecutionResult.Continue;
+            }
+
+            case TaskLanguageStepKeys.Loop:
+                return await ExecuteLoopAsync(step, context, host);
+
+            case TaskLanguageStepKeys.EventHandler:
+            {
+                if (step.ModuleTriggerKey is null)
+                    throw new InvalidOperationException(
+                        "Event handler step requires a module trigger key.");
+                context.EventHandlers.Add(new RegisteredEventHandler(
+                    step.ModuleTriggerKey,
+                    step.HandlerParameter,
+                    step.Body ?? []));
+                await host.AppendLogAsync(
+                    context.InstanceId,
+                    $"Registered event handler: {step.ModuleTriggerKey}",
+                    JobLogLevels.Info,
+                    context.CancellationToken);
+                return TaskStepExecutionResult.Continue;
+            }
+        }
+
+        return TaskStepExecutionResult.Continue;
+    }
+
+    private async Task<TaskStepExecutionResult> ExecuteLoopAsync(
+        TaskStepDefinition step,
+        TaskPlanExecutionContext context,
+        ITaskPlanExecutionHost host)
+    {
+        if (step.VariableName is not null)
+        {
+            foreach (var item in EnumerateLoopValues(step, context))
+            {
+                context.CancellationToken.ThrowIfCancellationRequested();
+                await context.Runtime.WaitIfPausedAsync(context.CancellationToken);
+                context.Variables[step.VariableName] = item;
+                if (step.Body is null)
+                    continue;
+                var result = await ExecuteStepDefinitionsAsync(
+                    step.Body,
+                    context,
+                    host,
+                    context.CancellationToken,
+                    throwOnUnsupportedInvocation: false);
+                if (result == TaskStepResult.Return)
+                    return TaskStepExecutionResult.Return;
+            }
+
+            return TaskStepExecutionResult.Continue;
+        }
+
+        while (_expressions.EvaluateCondition(step.Expression, context.Variables))
+        {
+            context.CancellationToken.ThrowIfCancellationRequested();
+            await context.Runtime.WaitIfPausedAsync(context.CancellationToken);
+            if (step.Body is null)
+                continue;
+            var result = await ExecuteStepDefinitionsAsync(
+                step.Body,
+                context,
+                host,
+                context.CancellationToken,
+                throwOnUnsupportedInvocation: false);
+            if (result == TaskStepResult.Return)
+                return TaskStepExecutionResult.Return;
+        }
+
+        return TaskStepExecutionResult.Continue;
+    }
+
+    private IEnumerable<object?> EnumerateLoopValues(
+        TaskStepDefinition step,
+        TaskPlanExecutionContext context)
+    {
+        if (string.IsNullOrWhiteSpace(step.Expression))
+            yield break;
+
+        if (context.Variables.TryGetValue(step.Expression, out var direct))
+        {
+            foreach (var item in EnumerateValue(direct))
+                yield return item;
+            yield break;
+        }
+
+        var resolved = _expressions.ResolveExpression(
+            step.Expression,
+            context.Variables);
+        if (string.IsNullOrWhiteSpace(resolved))
+            yield break;
+
+        if (context.Variables.TryGetValue(resolved, out var variableValue))
+        {
+            foreach (var item in EnumerateValue(variableValue))
+                yield return item;
+            yield break;
+        }
+
+        foreach (var item in EnumerateValue(resolved))
+            yield return item;
+    }
+
+    private static IEnumerable<object?> EnumerateValue(object? value)
+    {
+        if (value is null)
+            yield break;
+
+        if (value is string text)
+        {
+            if (TryEnumerateJsonArray(text, out var items))
+            {
+                foreach (var item in items)
+                    yield return item;
+                yield break;
+            }
+
+            yield return text;
+            yield break;
+        }
+
+        if (value is System.Collections.IEnumerable enumerable and not string)
+        {
+            foreach (var item in enumerable)
+                yield return item;
+        }
+    }
+
+    private static bool TryEnumerateJsonArray(string text, out List<object?> values)
+    {
+        values = [];
+        try
+        {
+            using var doc = JsonDocument.Parse(text);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array)
+                return false;
+            foreach (var item in doc.RootElement.EnumerateArray())
+            {
+                values.Add(item.ValueKind == JsonValueKind.String
+                    ? item.GetString()
+                    : item.GetRawText());
+            }
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static async Task DelayWithPauseAsync(
+        int delayMs,
+        TaskPlanExecutionContext context)
+    {
+        const int chunkMs = 250;
+        var remaining = delayMs;
+        while (remaining > 0)
+        {
+            await context.Runtime.WaitIfPausedAsync(context.CancellationToken);
+            var nextDelay = Math.Min(chunkMs, remaining);
+            await Task.Delay(nextDelay, context.CancellationToken);
+            remaining -= nextDelay;
+        }
     }
 
     private async Task<TaskStepResult> ExecuteStepDefinitionsAsync(

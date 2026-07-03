@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using SharpClaw.Core.Tasks;
 using SharpClaw.Core.Tasks.Models;
 using SharpClaw.Core.Tasks.Parsing;
 using SharpClaw.Contracts.Tasks;
@@ -25,7 +26,7 @@ public sealed class TaskScriptValidator
     {
         var diagnostics = new List<TaskDiagnostic>();
 
-        // Build set of known types: primitives + task-defined data types
+        // Build set of known types: built-in scalar types + task-defined data types
         var knownTypes = new HashSet<string>(AllowedPrimitiveTypes, StringComparer.Ordinal);
         foreach (var dt in definition.DataTypes)
         {
@@ -118,7 +119,7 @@ public sealed class TaskScriptValidator
         List<TaskDiagnostic> diagnostics)
     {
         // Track declared variables
-        if (step.StepKey == TaskScriptParser.Primitives.DeclareVariable && step.VariableName is not null)
+        if (step.StepKey == TaskLanguageStepKeys.DeclareVariable && step.VariableName is not null)
         {
             if (context.DeclaredVariables.Contains(step.VariableName))
             {
@@ -152,7 +153,7 @@ public sealed class TaskScriptValidator
             context.DeclaredVariables.Add(step.ResultVariable);
         }
 
-        if (step.StepKey == TaskScriptParser.Primitives.Loop && step.VariableName is not null)
+        if (step.StepKey == TaskLanguageStepKeys.Loop && step.VariableName is not null)
         {
             if (string.IsNullOrWhiteSpace(step.Expression))
             {
@@ -165,7 +166,7 @@ public sealed class TaskScriptValidator
             }
         }
 
-        if (step.StepKey == TaskScriptParser.Primitives.ParseResponse &&
+        if (step.StepKey == TaskLanguageStepKeys.ParseResponse &&
             !string.IsNullOrWhiteSpace(step.TypeName) &&
             !IsValidType(step.TypeName, context.KnownTypes))
         {

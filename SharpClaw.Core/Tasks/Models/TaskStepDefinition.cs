@@ -13,10 +13,9 @@ public sealed record TaskStepDefinition : ITaskStepInvocation
     /// <summary>
     /// Stable wire-format string key identifying this step's operation
     /// (e.g. <c>core.chat</c>). Step keys are owned by modules and exposed
-    /// through module-local constant classes (for example
-    /// <c>TaskScriptingStepKeys</c>, <c>AgentOrchestrationStepKeys</c>, and
-    /// <c>HttpStepKeys</c>); the literal values are stable across versions
-    /// for backward compatibility with serialized task scripts.
+    /// through task-language constants or module-local constant classes
+    /// (for example <c>TaskLanguageStepKeys</c>,
+    /// <c>AgentOrchestrationStepKeys</c>, and <c>HttpStepKeys</c>).
     /// </summary>
     public required string StepKey { get; init; }
 

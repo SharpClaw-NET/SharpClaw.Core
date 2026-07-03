@@ -29,19 +29,6 @@ public interface ITaskParserModuleExtension
     IReadOnlySet<string> SingleArgExpressionMethods { get; }
 
     /// <summary>
-    /// Optional contribution of the wire-format step-key strings the parser
-    /// stamps on statement-shaped constructs that have no method-name
-    /// binding (declarations, assignments, control flow, return, delay,
-    /// evaluate, log, parse-response).
-    /// <para>
-    /// Exactly one registered module must provide a non-null value.
-    /// Core owns no statement step-key constants; the parser depends
-    /// entirely on this contribution.
-    /// </para>
-    /// </summary>
-    TaskParserPrimitives? Primitives => null;
-
-    /// <summary>
     /// Maps trigger-attribute names (short form, e.g. <c>"Schedule"</c>) to
     /// module-owned handlers that emit a <see cref="TaskTriggerDefinition"/>
     /// for each matching attribute occurrence. The parser also accepts the

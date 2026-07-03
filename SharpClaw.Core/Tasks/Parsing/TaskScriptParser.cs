@@ -1,6 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using SharpClaw.Core.Tasks;
 using SharpClaw.Core.Tasks.Models;
 using SharpClaw.Core.Tasks.Registry;
 using SharpClaw.Contracts.Tasks;
@@ -47,22 +48,6 @@ public sealed class TaskScriptParser
     private static readonly Dictionary<string, int> _moduleSingleArgMethodCounts
         = new(StringComparer.Ordinal);
     private static readonly Lock _registryLock = new();
-    private static TaskParserPrimitives? _primitives;
-    private static string? _primitivesOwnerKey;
-    private static int _primitivesRegistrationCount;
-
-    /// <summary>
-    /// Wire-format step keys for statement-shaped primitives, supplied by
-    /// the registering scripting module. Core defines no step-name
-    /// constants; the parser refuses to emit statement steps until a
-    /// module contributes them.
-    /// </summary>
-    internal static TaskParserPrimitives Primitives =>
-        _primitives ?? throw new InvalidOperationException(
-            "Task script parser primitives have not been registered. " +
-            "A module implementing ITaskParserModuleExtension must supply " +
-            "TaskParserPrimitives via Primitives before parsing.");
-
     /// <summary>
     /// Register a module's parser extension. Safe to call multiple times
     /// (duplicate method names for the same module are ignored).
@@ -140,30 +125,6 @@ public sealed class TaskScriptParser
                     RegisterTriggerAttributeHandler(attrName + "Attribute", handler);
             }
 
-            if (extension.Primitives is { } primitives)
-            {
-                var ownerKey = ResolveParserExtensionOwnerKey(extension);
-                if (_primitives is not null
-                    && (!_primitives.Equals(primitives)
-                        || !string.Equals(_primitivesOwnerKey, ownerKey, StringComparison.Ordinal)))
-                {
-                    throw new InvalidOperationException(
-                        "Task script parser primitives have already been registered " +
-                        "by another module. Only one module may own the scripting-language " +
-                        "statement step keys.");
-                }
-
-                if (_primitives is null)
-                {
-                    _primitives = primitives;
-                    _primitivesOwnerKey = ownerKey;
-                    _primitivesRegistrationCount = 1;
-                }
-                else
-                {
-                    _primitivesRegistrationCount++;
-                }
-            }
         }
     }
 
@@ -210,18 +171,6 @@ public sealed class TaskScriptParser
                     UnregisterTriggerAttributeHandler(attrName + "Attribute", handler);
             }
 
-            if (extension.Primitives is { } primitives
-                && _primitives is not null
-                && _primitives.Equals(primitives)
-                && string.Equals(_primitivesOwnerKey, ResolveParserExtensionOwnerKey(extension), StringComparison.Ordinal))
-            {
-                _primitivesRegistrationCount = Math.Max(0, _primitivesRegistrationCount - 1);
-                if (_primitivesRegistrationCount == 0)
-                {
-                    _primitives = null;
-                    _primitivesOwnerKey = null;
-                }
-            }
         }
     }
 
@@ -1209,7 +1158,7 @@ public sealed class TaskScriptParser
         {
             return new TaskStepDefinition
             {
-                StepKey  = Primitives.DeclareVariable,
+                StepKey  = TaskLanguageStepKeys.DeclareVariable,
                 Line     = line,
                 Column   = column,
                 VariableName = variableName,
@@ -1238,7 +1187,7 @@ public sealed class TaskScriptParser
         // Plain declaration: var x = new Foo(), var x = expr, var x = a ?? await b()
         return new TaskStepDefinition
         {
-            StepKey      = Primitives.DeclareVariable,
+            StepKey      = TaskLanguageStepKeys.DeclareVariable,
             Line         = line,
             Column       = column,
             VariableName = variableName,
@@ -1287,7 +1236,7 @@ public sealed class TaskScriptParser
             {
                 return new TaskStepDefinition
                 {
-                    StepKey    = Primitives.Log,
+                    StepKey    = TaskLanguageStepKeys.Log,
                     Line       = line,
                     Column     = column,
                     Expression = ExtractFirstArgText(invocation),
@@ -1306,7 +1255,7 @@ public sealed class TaskScriptParser
         {
             return new TaskStepDefinition
             {
-                StepKey      = Primitives.Assign,
+                StepKey      = TaskLanguageStepKeys.Assign,
                 Line         = line,
                 Column       = column,
                 VariableName = assignment.Left.ToString(),
@@ -1317,7 +1266,7 @@ public sealed class TaskScriptParser
         // Fallback: arbitrary expression (e.g. list.AddRange(...))
         return new TaskStepDefinition
         {
-            StepKey    = Primitives.Evaluate,
+            StepKey    = TaskLanguageStepKeys.Evaluate,
             Line       = line,
             Column     = column,
             Expression = expression.ToString()
@@ -1337,7 +1286,7 @@ public sealed class TaskScriptParser
 
         return new TaskStepDefinition
         {
-            StepKey    = Primitives.Conditional,
+            StepKey    = TaskLanguageStepKeys.Conditional,
             Line       = GetLine(ifStmt),
             Column     = GetColumn(ifStmt),
             Expression = ifStmt.Condition.ToString(),
@@ -1352,7 +1301,7 @@ public sealed class TaskScriptParser
     {
         return new TaskStepDefinition
         {
-            StepKey    = Primitives.Loop,
+            StepKey    = TaskLanguageStepKeys.Loop,
             Line       = GetLine(whileStmt),
             Column     = GetColumn(whileStmt),
             Expression = whileStmt.Condition.ToString(),
@@ -1366,7 +1315,7 @@ public sealed class TaskScriptParser
     {
         return new TaskStepDefinition
         {
-            StepKey      = Primitives.Loop,
+            StepKey      = TaskLanguageStepKeys.Loop,
             Line         = GetLine(forEachStmt),
             Column       = GetColumn(forEachStmt),
             VariableName = forEachStmt.Identifier.Text,
@@ -1380,7 +1329,7 @@ public sealed class TaskScriptParser
     {
         return new TaskStepDefinition
         {
-            StepKey = Primitives.Return,
+            StepKey = TaskLanguageStepKeys.Return,
             Line    = GetLine(ret),
             Column  = GetColumn(ret)
         };
@@ -1416,7 +1365,19 @@ public sealed class TaskScriptParser
         {
             return new TaskStepDefinition
             {
-                StepKey    = Primitives.Delay,
+                StepKey    = TaskLanguageStepKeys.Delay,
+                Line       = line,
+                Column     = column,
+                Expression = ExtractFirstArgText(invocation),
+                Arguments  = ExtractArgumentTexts(invocation)
+            };
+        }
+
+        if (methodName == "WaitUntilStopped")
+        {
+            return new TaskStepDefinition
+            {
+                StepKey    = TaskLanguageStepKeys.WaitUntilStopped,
                 Line       = line,
                 Column     = column,
                 Expression = ExtractFirstArgText(invocation),
@@ -1525,7 +1486,7 @@ public sealed class TaskScriptParser
 
         return new TaskStepDefinition
         {
-            StepKey          = Primitives.EventHandler,
+            StepKey          = TaskLanguageStepKeys.EventHandler,
             Line             = line,
             Column           = column,
             ModuleTriggerKey = moduleTriggerKey,
@@ -1547,7 +1508,7 @@ public sealed class TaskScriptParser
         [
             new TaskStepDefinition
             {
-                StepKey    = Primitives.Evaluate,
+                StepKey    = TaskLanguageStepKeys.Evaluate,
                 Line       = GetLine(body),
                 Column     = GetColumn(body),
                 Expression = body.ToString()

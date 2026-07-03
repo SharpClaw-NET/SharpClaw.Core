@@ -1,18 +1,15 @@
 namespace SharpClaw.Contracts.Tasks;
 
 /// <summary>
-/// Describes a single task step operation that can be registered in
-/// the task step registry. All descriptors are owned by a module
-/// (<see cref="OwnerId"/>) and contributed to the host via
-/// <see cref="ITaskStepDescriptorProvider"/>.
+/// Describes a single module task step operation that can be registered in
+/// the task step registry. Core intrinsic C# statements are parsed directly
+/// and do not use module descriptors.
 /// </summary>
 public sealed record TaskStepDescriptor
 {
     /// <summary>
-    /// The script method name as it appears in a task script body
-    /// (e.g. <c>Chat</c>, <c>EditTask</c>).
-    /// For statement constructs that are not method calls (declarations,
-    /// assignments, control flow) this is <see langword="null"/>.
+    /// The script method name as it appears in a task script body for
+    /// descriptor-backed module operations (e.g. <c>Chat</c>, <c>EditTask</c>).
     /// </summary>
     public string? MethodName { get; init; }
 

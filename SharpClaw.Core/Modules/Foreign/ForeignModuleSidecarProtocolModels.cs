@@ -278,7 +278,6 @@ public sealed record ForeignModuleTaskParserDescriptor(
     IReadOnlyList<ForeignModuleTaskParserStepMapping>? StepKeyMappings = null,
     IReadOnlyList<ForeignModuleTaskParserEventMapping>? EventTriggerMappings = null,
     IReadOnlyList<string>? SingleArgExpressionMethods = null,
-    TaskParserPrimitives? Primitives = null,
     IReadOnlyList<ForeignModuleTaskTriggerAttributeHandlerDescriptor>? TriggerAttributeHandlers = null);
 
 public sealed record ForeignModuleTaskParserStepMapping(

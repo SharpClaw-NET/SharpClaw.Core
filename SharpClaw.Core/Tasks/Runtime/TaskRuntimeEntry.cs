@@ -16,7 +16,7 @@ public sealed class TaskRuntimeEntry : IDisposable
     private long _sequenceCounter;
 
     /// <summary>
-    /// Creates a task runtime entry from host-supplied primitives.
+    /// Creates a task runtime entry from host-supplied runtime resources.
     /// </summary>
     public TaskRuntimeEntry(
         CancellationTokenSource cancellationSource,

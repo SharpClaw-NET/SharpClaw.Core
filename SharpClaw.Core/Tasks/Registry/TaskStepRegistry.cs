@@ -3,9 +3,9 @@ using SharpClaw.Contracts.Tasks;
 namespace SharpClaw.Core.Tasks.Registry;
 
 /// <summary>
-/// Single authoritative registry for all task step descriptors. All
-/// descriptors are module-owned: the registry starts empty and modules
-/// populate it during startup via <see cref="Register"/>.
+/// Single authoritative registry for module task step descriptors. Core
+/// intrinsic C# statements bypass this registry and are handled by the task
+/// language runtime before module dispatch.
 /// </summary>
 public sealed class TaskStepRegistry
 {

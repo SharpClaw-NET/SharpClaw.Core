@@ -2,11 +2,10 @@ namespace SharpClaw.Contracts.Tasks;
 
 /// <summary>
 /// Read-only projection of a single task step as seen by module-side
-/// invocation executors.  Unlike the resolved-argument execution path
+/// invocation executors. Unlike the resolved-argument execution path
 /// used by <see cref="ITaskStepExecutorExtension"/>, this surface preserves
-/// the <em>raw</em> step shape so control-flow primitives (conditionals,
-/// loops, event handlers, declare/assign, evaluate, return) can drive
-/// their own nested execution.
+/// the <em>raw</em> step shape so Core intrinsic statements and module
+/// invocation executors can drive nested execution.
 /// </summary>
 public interface ITaskStepInvocation
 {
@@ -24,9 +23,8 @@ public interface ITaskStepInvocation
 
     /// <summary>
     /// The raw, unresolved expression text from the source script.  Modules
-    /// that semantically store expressions verbatim (e.g.
-    /// <c>declare_variable</c>, <c>assign</c>, <c>evaluate</c>) read this
-    /// directly; modules that consume runtime values resolve it via
+    /// Core intrinsic statements that store expressions verbatim read this
+    /// directly. Modules that consume runtime values resolve it via
     /// <see cref="ITaskStepExecutionContext.ResolveExpression(string)"/>.
     /// </summary>
     string? RawExpression { get; }
