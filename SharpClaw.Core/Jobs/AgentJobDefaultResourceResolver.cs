@@ -39,7 +39,24 @@ public sealed class AgentJobDefaultResourceResolver(
                 resourceType,
                 request.ChannelDefaults,
                 request.ContextDefaults,
-                request.OrderedPermissionSets));
+                BuildPermissionSetFallbackOrder(request)));
+    }
+
+    private static IReadOnlyList<PermissionSetSnapshot> BuildPermissionSetFallbackOrder(
+        AgentJobDefaultResourceResolutionRequest request)
+    {
+        var permissionSets = new List<PermissionSetSnapshot>(3);
+
+        if (request.ChannelPermissionSet is not null)
+            permissionSets.Add(request.ChannelPermissionSet);
+
+        if (request.ContextPermissionSet is not null)
+            permissionSets.Add(request.ContextPermissionSet);
+
+        if (request.AgentRolePermissionSet is not null)
+            permissionSets.Add(request.AgentRolePermissionSet);
+
+        return permissionSets;
     }
 }
 
@@ -51,4 +68,6 @@ public sealed record AgentJobDefaultResourceResolutionRequest(
     ModuleRegistry ModuleRegistry,
     DefaultResourceSetSnapshot? ChannelDefaults,
     DefaultResourceSetSnapshot? ContextDefaults,
-    IReadOnlyList<PermissionSetSnapshot> OrderedPermissionSets);
+    PermissionSetSnapshot? ChannelPermissionSet,
+    PermissionSetSnapshot? ContextPermissionSet,
+    PermissionSetSnapshot? AgentRolePermissionSet);
