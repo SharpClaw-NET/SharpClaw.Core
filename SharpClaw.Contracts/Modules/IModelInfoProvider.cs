@@ -1,15 +1,14 @@
 namespace SharpClaw.Contracts.Modules;
 
 /// <summary>
-/// Provides read-only model and provider information needed to start
-/// module-owned inference jobs.
-/// Implemented host-side; injected into modules that must resolve a
-/// model's API key and provider key without touching Core directly.
+/// Provides read-only model and provider metadata for modules.
+/// Implemented host-side; injected into modules that must resolve model
+/// identity without touching Core directly.
 /// </summary>
 public interface IModelInfoProvider
 {
     /// <summary>
-    /// Returns the information required to call a model's provider API.
+    /// Returns non-secret provider metadata for the requested model.
     /// </summary>
     /// <param name="modelId">The model to resolve.</param>
     /// <param name="ct">Cancellation token.</param>
@@ -31,12 +30,14 @@ public interface IModelInfoProvider
 }
 
 /// <summary>
-/// Resolved model + provider information required for inference.
+/// Resolved model and provider metadata.
 /// </summary>
 /// <param name="ModelName">The model name / identifier string to pass to the API.</param>
 /// <param name="ProviderKey">The provider key that owns the model.</param>
-/// <param name="DecryptedApiKey">Decrypted API key, or empty for local models.</param>
+/// <param name="RequiresApiKey">Whether the registered provider plugin requires an API key.</param>
+/// <param name="HasApiKey">Whether the host has a protected API key configured for the provider.</param>
 public sealed record ModelProviderInfo(
     string ModelName,
     string ProviderKey,
-    string DecryptedApiKey);
+    bool RequiresApiKey,
+    bool HasApiKey);
