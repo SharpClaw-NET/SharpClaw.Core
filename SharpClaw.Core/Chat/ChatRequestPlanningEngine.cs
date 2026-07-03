@@ -11,8 +11,7 @@ namespace SharpClaw.Core.Chat;
 /// Plans the provider-facing shape of a chat request from host-loaded facts.
 /// </summary>
 public sealed class ChatRequestPlanningEngine(
-    ChatPromptEngine prompts,
-    ProviderApiClientFactory clientFactory)
+    ChatPromptEngine prompts)
 {
     /// <summary>
     /// Builds the provider-call plan for a non-streaming chat request.
@@ -22,27 +21,25 @@ public sealed class ChatRequestPlanningEngine(
         AgentDB agent,
         Guid? threadId,
         bool disableDefaultSystemPrompt,
-        bool disableCustomProviderParameters)
+        bool disableCustomProviderParameters,
+        ChatProviderPlanningFacts? providerFacts)
     {
         var facts = ResolveFacts(agent);
-        var requiresApiKey = ResolveRequiresApiKey(facts.Provider);
-        EnsureApiKeyConfigured(facts.Provider, requiresApiKey);
-        var client = clientFactory.GetClient(
-            facts.Provider.ProviderKey,
-            facts.Provider.ApiEndpoint);
+        ArgumentNullException.ThrowIfNull(providerFacts);
+
+        EnsureProviderAccessSatisfied(providerFacts.ProviderAccessSatisfied);
 
         var disableTools = channel.DisableToolSchemas || agent.DisableToolSchemas;
-        var useNativeTools = client.SupportsNativeToolCalling;
+        var useNativeTools = providerFacts.SupportsNativeToolCalling;
         var enableTools = !disableTools && useNativeTools;
         var completionParameters = BuildAndValidateCompletionParameters(
             agent,
             facts.Model,
             facts.Provider,
-            threadId);
+            threadId,
+            providerFacts.CompletionParameterSpec);
 
         return new ChatRequestPlan(
-            Client: client,
-            RequiresApiKey: requiresApiKey,
             UseNativeTools: useNativeTools,
             DisableTools: disableTools,
             EnableTools: enableTools,
@@ -76,14 +73,13 @@ public sealed class ChatRequestPlanningEngine(
         AgentDB agent,
         Guid? threadId,
         bool disableDefaultSystemPrompt,
-        bool disableCustomProviderParameters)
+        bool disableCustomProviderParameters,
+        ChatProviderPlanningFacts? providerFacts)
     {
         var facts = ResolveFacts(agent);
-        var requiresApiKey = ResolveRequiresApiKey(facts.Provider);
-        EnsureApiKeyConfigured(facts.Provider, requiresApiKey);
-        var client = clientFactory.GetClient(
-            facts.Provider.ProviderKey,
-            facts.Provider.ApiEndpoint);
+        ArgumentNullException.ThrowIfNull(providerFacts);
+
+        EnsureProviderAccessSatisfied(providerFacts.ProviderAccessSatisfied);
 
         var disableTools = channel.DisableToolSchemas || agent.DisableToolSchemas;
         var enableTools = !disableTools;
@@ -91,12 +87,11 @@ public sealed class ChatRequestPlanningEngine(
             agent,
             facts.Model,
             facts.Provider,
-            threadId);
+            threadId,
+            providerFacts.CompletionParameterSpec);
 
         return new ChatRequestPlan(
-            Client: client,
-            RequiresApiKey: requiresApiKey,
-            UseNativeTools: client.SupportsNativeToolCalling,
+            UseNativeTools: providerFacts.SupportsNativeToolCalling,
             DisableTools: disableTools,
             EnableTools: enableTools,
             SupportsVision: facts.Model.CapabilityTags.Contains(
@@ -125,29 +120,26 @@ public sealed class ChatRequestPlanningEngine(
         AgentDB agent,
         ModelDB model,
         ProviderDB provider,
-        Guid? threadId)
+        Guid? threadId,
+        ICompletionParameterSpec completionParameterSpec)
     {
+        ArgumentNullException.ThrowIfNull(completionParameterSpec);
+
         var completionParameters = prompts.BuildCompletionParameters(
             agent,
             model.Id,
             threadId);
         CompletionParameterValidator.ValidateOrThrow(
             completionParameters,
-            clientFactory.GetParameterSpec(provider.ProviderKey),
+            completionParameterSpec,
             provider.ProviderKey);
         return completionParameters;
     }
 
-    private bool ResolveRequiresApiKey(ProviderDB provider)
+    private static void EnsureProviderAccessSatisfied(
+        bool providerAccessSatisfied)
     {
-        return clientFactory.GetPlugin(provider.ProviderKey)?.RequiresApiKey ?? true;
-    }
-
-    private static void EnsureApiKeyConfigured(
-        ProviderDB provider,
-        bool requiresApiKey)
-    {
-        if (requiresApiKey && string.IsNullOrEmpty(provider.EncryptedApiKey))
+        if (!providerAccessSatisfied)
             throw new InvalidOperationException(
                 "Provider does not have an API key configured.");
     }
@@ -174,8 +166,6 @@ public sealed class ChatRequestPlanningEngine(
 /// Provider-facing request plan produced from store-loaded chat facts.
 /// </summary>
 public sealed record ChatRequestPlan(
-    IProviderApiClient Client,
-    bool RequiresApiKey,
     bool UseNativeTools,
     bool DisableTools,
     bool EnableTools,
@@ -191,3 +181,8 @@ public sealed record ChatRequestPlan(
     string ProviderKey,
     string ProviderName,
     string? ProviderEndpoint);
+
+public sealed record ChatProviderPlanningFacts(
+    bool ProviderAccessSatisfied,
+    bool SupportsNativeToolCalling,
+    ICompletionParameterSpec CompletionParameterSpec);

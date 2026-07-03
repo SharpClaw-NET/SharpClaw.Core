@@ -84,16 +84,15 @@ public sealed class ChatNativeToolLoopEngine(
             ChatCompletionResult result;
             try
             {
-                result = await request.Client.ChatCompletionWithToolsAsync(
-                    request.HttpClient,
-                    request.ApiKey,
-                    request.ModelName,
-                    request.SystemPrompt,
-                    messages,
-                    request.EffectiveTools,
-                    request.MaxCompletionTokens,
-                    request.ProviderParameters,
-                    request.CompletionParameters,
+                result = await request.Provider.CompleteWithToolsAsync(
+                    new ChatProviderToolCompletionRequest(
+                        request.ModelName,
+                        request.SystemPrompt,
+                        messages,
+                        request.EffectiveTools,
+                        request.MaxCompletionTokens,
+                        request.ProviderParameters,
+                        request.CompletionParameters),
                     request.CancellationToken);
             }
             catch (LocalInferenceEnvelopeException ex)
@@ -237,16 +236,15 @@ public sealed class ChatNativeToolLoopEngine(
                 var finalApprovalTiming = Stopwatch.StartNew();
                 try
                 {
-                    finalResult = await request.Client.ChatCompletionWithToolsAsync(
-                        request.HttpClient,
-                        request.ApiKey,
-                        request.ModelName,
-                        request.SystemPrompt,
-                        messages,
-                        request.EffectiveTools,
-                        request.MaxCompletionTokens,
-                        request.ProviderParameters,
-                        request.CompletionParameters,
+                    finalResult = await request.Provider.CompleteWithToolsAsync(
+                        new ChatProviderToolCompletionRequest(
+                            request.ModelName,
+                            request.SystemPrompt,
+                            messages,
+                            request.EffectiveTools,
+                            request.MaxCompletionTokens,
+                            request.ProviderParameters,
+                            request.CompletionParameters),
                         request.CancellationToken);
                 }
                 catch (LocalInferenceEnvelopeException ex)
@@ -348,16 +346,15 @@ public sealed class ChatNativeToolLoopEngine(
             ChatCompletionResult? roundResult = null;
             var roundDeltaContent = new StringBuilder();
 
-            await foreach (var chunk in request.Client.StreamChatCompletionWithToolsAsync(
-                request.HttpClient,
-                request.ApiKey,
-                request.ModelName,
-                request.SystemPrompt,
-                messages,
-                request.EffectiveTools,
-                request.MaxCompletionTokens,
-                request.ProviderParameters,
-                request.CompletionParameters,
+            await foreach (var chunk in request.Provider.StreamWithToolsAsync(
+                new ChatProviderToolCompletionRequest(
+                    request.ModelName,
+                    request.SystemPrompt,
+                    messages,
+                    request.EffectiveTools,
+                    request.MaxCompletionTokens,
+                    request.ProviderParameters,
+                    request.CompletionParameters),
                 cancellationToken))
             {
                 if (chunk.Delta is not null)
@@ -551,9 +548,7 @@ public sealed class ChatNativeToolLoopEngine(
 /// Request data for the Core buffered native chat tool loop.
 /// </summary>
 public sealed record ChatNativeToolLoopRequest(
-    IProviderApiClient Client,
-    HttpClient HttpClient,
-    string ApiKey,
+    IChatProviderRoundExecutor Provider,
     string ModelName,
     string? SystemPrompt,
     IReadOnlyList<ChatCompletionMessage> History,

@@ -41,9 +41,7 @@ public sealed class ChatProviderExecutionWorkflowEngine(
 
             var result = await _nativeToolLoop.RunAsync(
                 new ChatNativeToolLoopRequest(
-                    request.Client,
-                    request.HttpClient,
-                    request.ApiKey,
+                    request.Provider,
                     request.ModelName,
                     request.SystemPrompt,
                     request.History,
@@ -72,15 +70,14 @@ public sealed class ChatProviderExecutionWorkflowEngine(
                 result.ProviderMetadataJson);
         }
 
-        var plain = await request.Client.ChatCompletionAsync(
-            request.HttpClient,
-            request.ApiKey,
-            request.ModelName,
-            request.SystemPrompt,
-            request.History,
-            request.MaxCompletionTokens,
-            request.ProviderParameters,
-            request.CompletionParameters,
+        var plain = await request.Provider.CompleteAsync(
+            new ChatProviderCompletionRequest(
+                request.ModelName,
+                request.SystemPrompt,
+                request.History,
+                request.MaxCompletionTokens,
+                request.ProviderParameters,
+                request.CompletionParameters),
             request.CancellationToken);
 
         return new ChatBufferedProviderExecutionResult(
@@ -117,9 +114,7 @@ public sealed class ChatProviderExecutionWorkflowEngine(
 
         await foreach (var loopEvent in _nativeToolLoop.StreamAsync(
             new ChatNativeToolLoopRequest(
-                request.Client,
-                request.HttpClient,
-                request.ApiKey,
+                request.Provider,
                 request.ModelName,
                 request.SystemPrompt,
                 request.History,
@@ -147,9 +142,7 @@ public sealed class ChatProviderExecutionWorkflowEngine(
 }
 
 public sealed record ChatBufferedProviderExecutionRequest(
-    IProviderApiClient Client,
-    HttpClient HttpClient,
-    string ApiKey,
+    IChatProviderRoundExecutor Provider,
     string ModelName,
     string? SystemPrompt,
     IReadOnlyList<ChatCompletionMessage> History,
@@ -178,9 +171,7 @@ public sealed record ChatBufferedProviderExecutionResult(
     string? ProviderMetadataJson = null);
 
 public sealed record ChatStreamingProviderExecutionRequest(
-    IProviderApiClient Client,
-    HttpClient HttpClient,
-    string ApiKey,
+    IChatProviderRoundExecutor Provider,
     string ModelName,
     string? SystemPrompt,
     IReadOnlyList<ChatCompletionMessage> History,
@@ -200,3 +191,35 @@ public sealed record ChatStreamingProviderExecutionRequest(
     string? TimingRequestId = null,
     Func<long?>? GetElapsedMilliseconds = null,
     int MaxToolCallRounds = 50);
+
+public interface IChatProviderRoundExecutor
+{
+    Task<ChatCompletionResult> CompleteAsync(
+        ChatProviderCompletionRequest request,
+        CancellationToken ct);
+
+    Task<ChatCompletionResult> CompleteWithToolsAsync(
+        ChatProviderToolCompletionRequest request,
+        CancellationToken ct);
+
+    IAsyncEnumerable<ChatStreamChunk> StreamWithToolsAsync(
+        ChatProviderToolCompletionRequest request,
+        CancellationToken ct);
+}
+
+public sealed record ChatProviderCompletionRequest(
+    string ModelName,
+    string? SystemPrompt,
+    IReadOnlyList<ChatCompletionMessage> History,
+    int? MaxCompletionTokens,
+    Dictionary<string, JsonElement>? ProviderParameters,
+    CompletionParameters? CompletionParameters);
+
+public sealed record ChatProviderToolCompletionRequest(
+    string ModelName,
+    string? SystemPrompt,
+    IReadOnlyList<ToolAwareMessage> Messages,
+    IReadOnlyList<ChatToolDefinition> Tools,
+    int? MaxCompletionTokens,
+    Dictionary<string, JsonElement>? ProviderParameters,
+    CompletionParameters? CompletionParameters);
