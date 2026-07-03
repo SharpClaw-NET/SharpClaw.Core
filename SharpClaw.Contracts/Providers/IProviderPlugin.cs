@@ -9,6 +9,11 @@ namespace SharpClaw.Contracts.Providers;
 /// </summary>
 public interface IProviderPlugin
 {
+    public const string DefaultCostFeedPermissionDeniedNote =
+        "Cost API is available for this provider but the current API key "
+        + "lacks the required permissions. Update the API key to one with "
+        + "billing/usage access to retrieve cost data.";
+
     /// <summary>The well-known provider key this plugin handles.</summary>
     string ProviderKey { get; }
 
@@ -63,7 +68,7 @@ public interface IProviderPlugin
     /// clients return a cached singleton; endpoint-bound providers
     /// construct a new client per call.
     /// </summary>
-    IProviderApiClient CreateClient(string? endpoint);
+    IProviderApiClient CreateClient(ProviderClientOptions options);
 
     /// <summary>Resolves model capability flags for this provider's models.</summary>
     IModelCapabilityResolver Capabilities { get; }
@@ -86,10 +91,25 @@ public interface IProviderPlugin
     IDeviceCodeFlow? DeviceCodeFlow { get; }
 
     /// <summary>
-    /// Optional live-cost reporting surface. <see langword="null"/> for
-    /// providers that do not expose a billing/usage API.
+    /// Indicates whether this provider can expose a live-cost reporting
+    /// surface when the host supplies valid provider credentials.
     /// </summary>
-    IProviderCostFeed? CostFeed => null;
+    bool SupportsCostFeed => false;
+
+    /// <summary>
+    /// Human-readable explanation surfaced when a supported cost feed
+    /// cannot return data because the supplied credentials lack billing
+    /// permissions.
+    /// </summary>
+    string CostFeedPermissionDeniedNote =>
+        DefaultCostFeedPermissionDeniedNote;
+
+    /// <summary>
+    /// Creates the provider's optional live-cost reporting surface.
+    /// Returns <see langword="null"/> when <see cref="SupportsCostFeed"/>
+    /// is <see langword="false"/>.
+    /// </summary>
+    IProviderCostFeed? CreateCostFeed(ProviderClientOptions options) => null;
 
     /// <summary>
     /// Computes the provider-shape suffix used when synthesising the

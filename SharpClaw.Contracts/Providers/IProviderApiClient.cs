@@ -13,12 +13,9 @@ public interface IProviderApiClient
     /// </summary>
     bool SupportsNativeToolCalling => false;
 
-    Task<IReadOnlyList<string>> ListModelIdsAsync(
-        HttpClient httpClient, string apiKey, CancellationToken ct = default);
+    Task<IReadOnlyList<string>> ListModelIdsAsync(CancellationToken ct = default);
 
     Task<ChatCompletionResult> ChatCompletionAsync(
-        HttpClient httpClient,
-        string apiKey,
         string model,
         string? systemPrompt,
         IReadOnlyList<ChatCompletionMessage> messages,
@@ -32,8 +29,6 @@ public interface IProviderApiClient
     /// returns a structured result that distinguishes text from tool calls.
     /// </summary>
     Task<ChatCompletionResult> ChatCompletionWithToolsAsync(
-        HttpClient httpClient,
-        string apiKey,
         string model,
         string? systemPrompt,
         IReadOnlyList<ToolAwareMessage> messages,
@@ -55,8 +50,6 @@ public interface IProviderApiClient
     /// fall back to <see cref="ChatCompletionWithToolsAsync"/>.</para>
     /// </summary>
     IAsyncEnumerable<ChatStreamChunk> StreamChatCompletionWithToolsAsync(
-        HttpClient httpClient,
-        string apiKey,
         string model,
         string? systemPrompt,
         IReadOnlyList<ToolAwareMessage> messages,

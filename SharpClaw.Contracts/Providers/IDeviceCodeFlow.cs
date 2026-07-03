@@ -15,7 +15,7 @@ public interface IDeviceCodeFlow
     /// verification URI plus the polling parameters needed to complete
     /// the flow.
     /// </summary>
-    Task<DeviceCodeSession> StartAsync(HttpClient httpClient, CancellationToken ct = default);
+    Task<DeviceCodeSession> StartAsync(CancellationToken ct = default);
 
     /// <summary>
     /// Polls the provider's token endpoint with the device code from a
@@ -24,7 +24,6 @@ public interface IDeviceCodeFlow
     /// session is still pending.
     /// </summary>
     Task<string?> PollAsync(
-        HttpClient httpClient,
         DeviceCodeSession session,
         CancellationToken ct = default);
 }

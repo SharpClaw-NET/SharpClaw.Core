@@ -251,13 +251,9 @@ public sealed class ProviderModelAdministrationEngine(
         if (plugin is null)
             throw new ProviderUnavailableException(provider.ProviderKey);
 
-        var apiKey = string.IsNullOrEmpty(provider.EncryptedApiKey)
-            ? string.Empty
-            : host.UnprotectProviderSecret(provider.EncryptedApiKey);
-
         var modelIds = await host.ListProviderModelIdsAsync(
-            plugin.CreateClient(provider.ApiEndpoint),
-            apiKey,
+            provider,
+            plugin,
             ct);
 
         var existingNames = provider.Models
@@ -443,8 +439,8 @@ public interface IProviderModelAdministrationHost
         CancellationToken ct);
 
     Task<IReadOnlyList<string>> ListProviderModelIdsAsync(
-        IProviderApiClient client,
-        string apiKey,
+        ProviderDB provider,
+        IProviderPlugin plugin,
         CancellationToken ct);
 
     Task<DeviceCodeSession> StartDeviceCodeFlowAsync(

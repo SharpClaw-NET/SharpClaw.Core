@@ -194,23 +194,18 @@ public sealed class ProviderCostEngine
         CancellationToken ct)
     {
         var plugin = host.GetProviderPlugin(provider.ProviderKey);
-        var costFeed = plugin?.CostFeed;
         var isLocal = plugin is { RequiresApiKey: false };
         var costProvider = new ProviderCostProvider(
             provider.Id,
             provider.Name,
             provider.ProviderKey);
 
-        if (costFeed is not null
-            && (!plugin!.RequiresApiKey || !string.IsNullOrEmpty(provider.ProtectedApiKey)))
+        if (plugin is { SupportsCostFeed: true }
+            && (!plugin.RequiresApiKey || !string.IsNullOrEmpty(provider.ProtectedApiKey)))
         {
-            var apiKey = string.IsNullOrEmpty(provider.ProtectedApiKey)
-                ? string.Empty
-                : host.UnprotectProviderSecret(provider.ProtectedApiKey);
-
             var result = await host.GetCostsAsync(
-                costFeed,
-                apiKey,
+                provider,
+                plugin,
                 periodStart,
                 periodEnd,
                 ct);
@@ -229,7 +224,7 @@ public sealed class ProviderCostEngine
                 isLocal,
                 periodStart,
                 periodEnd,
-                costFeed.PermissionDeniedNote);
+                plugin.CostFeedPermissionDeniedNote);
         }
 
         return CreateUnsupportedResponse(
@@ -255,6 +250,7 @@ public readonly record struct ProviderCostProviderConfiguration(
     Guid Id,
     string Name,
     string ProviderKey,
+    string? ApiEndpoint,
     string? ProtectedApiKey);
 
 /// <summary>
@@ -279,10 +275,10 @@ public interface IProviderCostHost
     /// <summary>Unprotects a stored provider API key.</summary>
     string UnprotectProviderSecret(string protectedSecret);
 
-    /// <summary>Executes a provider cost feed through host-owned HTTP.</summary>
+    /// <summary>Executes a provider cost feed through host-owned transport.</summary>
     Task<ProviderCostResult?> GetCostsAsync(
-        IProviderCostFeed costFeed,
-        string apiKey,
+        ProviderCostProviderConfiguration provider,
+        IProviderPlugin plugin,
         DateTimeOffset periodStart,
         DateTimeOffset periodEnd,
         CancellationToken ct);

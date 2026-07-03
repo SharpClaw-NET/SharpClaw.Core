@@ -77,22 +77,23 @@ public sealed class ProviderApiClientFactory
         .Select(g => g.First());
 
     /// <summary>
-    /// Returns the API client for the given provider key. For providers
-    /// whose plugin sets <see cref="IProviderPlugin.RequiresEndpoint"/>
-    /// (e.g. Custom or Ollama), supply the
-    /// <paramref name="apiEndpoint"/> stored on the provider record.
+    /// Returns the API client for the given provider key. Hosts supply
+    /// provider construction facts without passing transport handles
+    /// through Core contracts.
     /// </summary>
     /// <exception cref="ProviderUnavailableException">
     /// Thrown when no plugin is registered for the requested key,
     /// typically because the owning provider module is disabled.
     /// </exception>
-    public IProviderApiClient GetClient(string providerKey, string? apiEndpoint = null)
+    public IProviderApiClient GetClient(string providerKey, ProviderClientOptions options)
     {
+        ArgumentNullException.ThrowIfNull(options);
+
         var plugin = GetActivePlugin(providerKey);
         if (plugin is null)
             throw new ProviderUnavailableException(providerKey);
 
-        return plugin.CreateClient(apiEndpoint);
+        return plugin.CreateClient(options);
     }
 
     /// <summary>

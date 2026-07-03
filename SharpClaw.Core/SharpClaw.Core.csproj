@@ -45,6 +45,6 @@
     <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.8" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.8" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.8" />
-    <PackageReference Include="SharpClaw.Contracts" Version="0.3.7" />
+    <PackageReference Include="SharpClaw.Contracts" Version="0.3.8" />
   </ItemGroup>
 </Project>
