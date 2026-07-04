@@ -1,11 +1,11 @@
 namespace SharpClaw.Core.Tasks;
 
 /// <summary>
-/// Stable wire-format step keys for intrinsic task-language statements.
+/// Stable wire-format statement keys for intrinsic task-language statements.
 /// These keys represent ordinary C# script syntax, not module-contributed
 /// operations.
 /// </summary>
-public static class TaskLanguageStepKeys
+public static class TaskLanguageStatementKeys
 {
     /// <summary>Declares a task-local variable.</summary>
     public const string DeclareVariable = "core.declare_variable";
@@ -29,10 +29,10 @@ public static class TaskLanguageStepKeys
     public const string Log = "core.log";
 
     /// <summary>
-    /// Returns true when the step is implemented by the Core task language
-    /// runtime rather than a module step executor.
+    /// Returns true when the statement is implemented by the Core task language
+    /// runtime rather than a module operation executor.
     /// </summary>
-    public static bool IsIntrinsic(string stepKey) => stepKey is
+    public static bool IsIntrinsic(string statementKey) => statementKey is
         DeclareVariable
         or Assign
         or EventHandler

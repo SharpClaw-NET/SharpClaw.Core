@@ -53,8 +53,8 @@ public sealed record ForeignModuleDiscoveryResponse(
     IReadOnlyList<ModuleStorageContractDescriptor>? StorageContracts = null,
     IReadOnlyList<ForeignModuleCliCommandDescriptor>? CliCommands = null,
     ForeignModuleTaskParserDescriptor? TaskParser = null,
-    IReadOnlyList<TaskStepDescriptor>? TaskStepDescriptors = null,
-    IReadOnlyList<ForeignModuleTaskStepExecutorDescriptor>? TaskStepExecutors = null,
+    IReadOnlyList<TaskOperationDescriptor>? TaskOperationDescriptors = null,
+    IReadOnlyList<ForeignModuleTaskOperationExecutorDescriptor>? TaskOperationExecutors = null,
     IReadOnlyList<ForeignModuleTaskTriggerSourceDescriptor>? TaskTriggerSources = null,
     IReadOnlyList<ForeignModuleTaskTriggerBindingSideEffectDescriptor>? TaskTriggerBindingSideEffects = null,
     IReadOnlyList<ForeignModuleTaskMetricProviderDescriptor>? TaskMetricProviders = null,
@@ -275,14 +275,14 @@ public sealed record ForeignModuleProtocolContractInvocationResponse(
     JsonElement Result);
 
 public sealed record ForeignModuleTaskParserDescriptor(
-    IReadOnlyList<ForeignModuleTaskParserStepMapping>? StepKeyMappings = null,
+    IReadOnlyList<ForeignModuleTaskParserOperationMapping>? OperationKeyMappings = null,
     IReadOnlyList<ForeignModuleTaskParserEventMapping>? EventTriggerMappings = null,
     IReadOnlyList<string>? SingleArgExpressionMethods = null,
     IReadOnlyList<ForeignModuleTaskTriggerAttributeHandlerDescriptor>? TriggerAttributeHandlers = null);
 
-public sealed record ForeignModuleTaskParserStepMapping(
+public sealed record ForeignModuleTaskParserOperationMapping(
     string MethodName,
-    string StepKey,
+    string StatementKey,
     string ModuleId);
 
 public sealed record ForeignModuleTaskParserEventMapping(
@@ -296,9 +296,9 @@ public sealed record ForeignModuleTaskTriggerAttributeHandlerDescriptor(
     IReadOnlyList<string>? NamedIntArgs = null,
     IReadOnlyList<string>? NamedDoubleArgs = null);
 
-public sealed record ForeignModuleTaskStepExecutorDescriptor(
+public sealed record ForeignModuleTaskOperationExecutorDescriptor(
     string ModuleId,
-    IReadOnlyList<string> StepKeys,
+    IReadOnlyList<string> OperationKeys,
     bool SupportsInvocation = false);
 
 public sealed record ForeignModuleTaskTriggerSourceDescriptor(

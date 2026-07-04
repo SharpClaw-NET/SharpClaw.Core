@@ -4,7 +4,7 @@ namespace SharpClaw.Contracts.Tasks;
 /// Generic host-side bridge for agent-related operations: chat, structured
 /// response parsing, lookups, and provisioning of agents/threads/roles/channels.
 /// Any module (or other host consumer) that needs to drive these flows resolves
-/// this bridge from <see cref="ITaskStepExecutionContext.Services"/> instead of
+/// this bridge from <see cref="ITaskOperationExecutionContext.Services"/> instead of
 /// taking a direct dependency on <c>SharpClawDbContext</c>, <c>ChatService</c>,
 /// <c>RoleService</c>, etc.
 ///

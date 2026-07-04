@@ -74,7 +74,7 @@ public sealed class TaskScriptCompiler
             return new TaskScriptCompilationResult(null, diagnostics);
         }
 
-        var executionSteps = NormalizeSteps(definition.Steps);
+        var executionStatements = NormalizeStatements(definition.Statements);
 
         var plan = new CompiledTaskPlan
         {
@@ -82,7 +82,7 @@ public sealed class TaskScriptCompiler
             Description = definition.Description,
             Definition = definition,
             ParameterValues = resolvedParams,
-            ExecutionSteps = executionSteps,
+            ExecutionStatements = executionStatements,
             ToolCallHooks = definition.ToolCallHooks,
             AgentOutputFormat = definition.AgentOutputFormat
         };
@@ -90,13 +90,13 @@ public sealed class TaskScriptCompiler
         return new TaskScriptCompilationResult(plan, diagnostics);
     }
 
-    private static IReadOnlyList<TaskStepDefinition> NormalizeSteps(IReadOnlyList<TaskStepDefinition> steps)
+    private static IReadOnlyList<TaskStatementDefinition> NormalizeStatements(IReadOnlyList<TaskStatementDefinition> steps)
     {
         return steps
             .Select(step => step with
             {
-                Body = step.Body is not null ? NormalizeSteps(step.Body) : step.Body,
-                ElseBody = step.ElseBody is not null ? NormalizeSteps(step.ElseBody) : step.ElseBody,
+                Body = step.Body is not null ? NormalizeStatements(step.Body) : step.Body,
+                ElseBody = step.ElseBody is not null ? NormalizeStatements(step.ElseBody) : step.ElseBody,
             })
             .ToList();
     }

@@ -32,7 +32,7 @@ public sealed class TaskScriptParser
 {
     // ── Module extension registry ─────────────────────────────────
 
-    private static readonly Dictionary<string, (string StepKey, string ModuleId)> _moduleStepKeys = [];
+    private static readonly Dictionary<string, (string OperationKey, string ModuleId)> _moduleOperationKeys = [];
     private static readonly Dictionary<string, (string TriggerKey, string ModuleId)> _moduleEventTriggers = [];
     private static readonly HashSet<string> _moduleSingleArgMethods = [];
     private static readonly Dictionary<string, ITaskTriggerAttributeHandler> _moduleTriggerAttributeHandlers
@@ -41,7 +41,7 @@ public sealed class TaskScriptParser
         = new(StringComparer.Ordinal);
     private static readonly Dictionary<string, int> _moduleTriggerAttributeHandlerCounts
         = new(StringComparer.Ordinal);
-    private static readonly Dictionary<string, int> _moduleStepKeyCounts
+    private static readonly Dictionary<string, int> _moduleOperationKeyCounts
         = new(StringComparer.Ordinal);
     private static readonly Dictionary<string, int> _moduleEventTriggerCounts
         = new(StringComparer.Ordinal);
@@ -58,20 +58,20 @@ public sealed class TaskScriptParser
         ArgumentNullException.ThrowIfNull(extension);
         lock (_registryLock)
         {
-            foreach (var (method, entry) in extension.StepKeyMappings)
+            foreach (var (method, entry) in extension.OperationKeyMappings)
             {
-                if (_moduleStepKeys.TryGetValue(method, out var existingEntry))
+                if (_moduleOperationKeys.TryGetValue(method, out var existingEntry))
                 {
-                    if (string.Equals(existingEntry.StepKey, entry.StepKey, StringComparison.Ordinal)
+                    if (string.Equals(existingEntry.OperationKey, entry.OperationKey, StringComparison.Ordinal)
                         && string.Equals(existingEntry.ModuleId, entry.ModuleId, StringComparison.Ordinal))
                     {
-                        IncrementCount(_moduleStepKeyCounts, method);
+                        IncrementCount(_moduleOperationKeyCounts, method);
                     }
                 }
                 else
                 {
-                    _moduleStepKeys[method] = entry;
-                    _moduleStepKeyCounts[method] = 1;
+                    _moduleOperationKeys[method] = entry;
+                    _moduleOperationKeyCounts[method] = 1;
                 }
 
                 // Register a descriptor in the unified step registry so that
@@ -79,15 +79,15 @@ public sealed class TaskScriptParser
                 // path as core steps. Foreign modules can provide richer
                 // descriptors through the protocol; keep those when they have
                 // already claimed the same method/key/owner.
-                var existingDescriptor = TaskStepRegistry.Default.FindByMethod(method);
+                var existingDescriptor = TaskOperationRegistry.Default.FindByMethod(method);
                 if (existingDescriptor is null
-                    || !string.Equals(existingDescriptor.StepKey, entry.StepKey, StringComparison.Ordinal)
+                    || !string.Equals(existingDescriptor.OperationKey, entry.OperationKey, StringComparison.Ordinal)
                     || !string.Equals(existingDescriptor.OwnerId, entry.ModuleId, StringComparison.Ordinal))
                 {
-                    TaskStepRegistry.Default.Register(new TaskStepDescriptor
+                    TaskOperationRegistry.Default.Register(new TaskOperationDescriptor
                     {
                         MethodName           = method,
-                        StepKey              = entry.StepKey,
+                        OperationKey              = entry.OperationKey,
                         OwnerId              = entry.ModuleId,
                         FirstArgIsExpression = extension.SingleArgExpressionMethods.Contains(method),
                     });
@@ -133,21 +133,21 @@ public sealed class TaskScriptParser
         ArgumentNullException.ThrowIfNull(extension);
         lock (_registryLock)
         {
-            foreach (var (method, entry) in extension.StepKeyMappings)
+            foreach (var (method, entry) in extension.OperationKeyMappings)
             {
-                if (_moduleStepKeys.TryGetValue(method, out var registered)
-                    && string.Equals(registered.StepKey, entry.StepKey, StringComparison.Ordinal)
+                if (_moduleOperationKeys.TryGetValue(method, out var registered)
+                    && string.Equals(registered.OperationKey, entry.OperationKey, StringComparison.Ordinal)
                     && string.Equals(registered.ModuleId, entry.ModuleId, StringComparison.Ordinal))
                 {
-                    if (DecrementCount(_moduleStepKeyCounts, method) == 0)
-                        _moduleStepKeys.Remove(method);
+                    if (DecrementCount(_moduleOperationKeyCounts, method) == 0)
+                        _moduleOperationKeys.Remove(method);
                 }
             }
 
             foreach (var method in extension.SingleArgExpressionMethods)
             {
                 if (DecrementCount(_moduleSingleArgMethodCounts, method) == 0
-                    && !_moduleStepKeys.ContainsKey(method))
+                    && !_moduleOperationKeys.ContainsKey(method))
                 {
                     _moduleSingleArgMethods.Remove(method);
                 }
@@ -268,7 +268,7 @@ public sealed class TaskScriptParser
 
     private static string ResolveParserExtensionOwnerKey(ITaskParserModuleExtension extension)
     {
-        var ownerIds = extension.StepKeyMappings.Values
+        var ownerIds = extension.OperationKeyMappings.Values
             .Select(entry => entry.ModuleId)
             .Concat(extension.EventTriggerMappings.Values.Select(entry => entry.ModuleId))
             .Where(moduleId => !string.IsNullOrWhiteSpace(moduleId))
@@ -394,7 +394,7 @@ public sealed class TaskScriptParser
         }
 
         // Parse body statements
-        var steps = new List<TaskStepDefinition>();
+        var steps = new List<TaskStatementDefinition>();
         if (entryPoint.Body is not null)
         {
             foreach (var statement in entryPoint.Body.Statements)
@@ -417,7 +417,7 @@ public sealed class TaskScriptParser
             Parameters = parameters,
             DataTypes = dataTypes,
             OutputType = outputType,
-            Steps = steps,
+            Statements = steps,
             ToolCallHooks = toolCallHooks,
             AgentOutputFormat = agentOutputFormat,
             Requirements = requirements,
@@ -950,7 +950,7 @@ public sealed class TaskScriptParser
             }
 
             // Parse method body
-            var body = new List<TaskStepDefinition>();
+            var body = new List<TaskStatementDefinition>();
             if (method.Body is not null)
             {
                 foreach (var statement in method.Body.Statements)
@@ -1120,7 +1120,7 @@ public sealed class TaskScriptParser
 
     // ── Statement parsing ────────────────────────────────────────
 
-    private static TaskStepDefinition? ParseStatement(
+    private static TaskStatementDefinition? ParseStatement(
         StatementSyntax statement,
         List<TaskDiagnostic> diagnostics)
     {
@@ -1138,7 +1138,7 @@ public sealed class TaskScriptParser
 
     // ── Local declaration ─────────────────────────────────────────
 
-    private static TaskStepDefinition? ParseLocalDeclaration(
+    private static TaskStatementDefinition? ParseLocalDeclaration(
         LocalDeclarationStatementSyntax local,
         List<TaskDiagnostic> diagnostics)
     {
@@ -1156,9 +1156,9 @@ public sealed class TaskScriptParser
         // No initializer – bare declaration
         if (declarator.Initializer is null)
         {
-            return new TaskStepDefinition
+            return new TaskStatementDefinition
             {
-                StepKey  = TaskLanguageStepKeys.DeclareVariable,
+                StatementKey  = TaskLanguageStatementKeys.DeclareVariable,
                 Line     = line,
                 Column   = column,
                 VariableName = variableName,
@@ -1185,9 +1185,9 @@ public sealed class TaskScriptParser
         }
 
         // Plain declaration: var x = new Foo(), var x = expr, var x = a ?? await b()
-        return new TaskStepDefinition
+        return new TaskStatementDefinition
         {
-            StepKey      = TaskLanguageStepKeys.DeclareVariable,
+            StatementKey      = TaskLanguageStatementKeys.DeclareVariable,
             Line         = line,
             Column       = column,
             VariableName = variableName,
@@ -1198,7 +1198,7 @@ public sealed class TaskScriptParser
 
     // ── Expression statement ──────────────────────────────────────
 
-    private static TaskStepDefinition? ParseExpressionStatement(
+    private static TaskStatementDefinition? ParseExpressionStatement(
         ExpressionStatementSyntax exprStmt,
         List<TaskDiagnostic> diagnostics)
     {
@@ -1234,9 +1234,9 @@ public sealed class TaskScriptParser
             var methodName = GetMethodName(invocation);
             if (methodName == "Log")
             {
-                return new TaskStepDefinition
+                return new TaskStatementDefinition
                 {
-                    StepKey    = TaskLanguageStepKeys.Log,
+                    StatementKey    = TaskLanguageStatementKeys.Log,
                     Line       = line,
                     Column     = column,
                     Expression = ExtractFirstArgText(invocation),
@@ -1253,9 +1253,9 @@ public sealed class TaskScriptParser
         // Assignment: x = ..., x.Prop += ..., etc.
         if (expression is AssignmentExpressionSyntax assignment)
         {
-            return new TaskStepDefinition
+            return new TaskStatementDefinition
             {
-                StepKey      = TaskLanguageStepKeys.Assign,
+                StatementKey      = TaskLanguageStatementKeys.Assign,
                 Line         = line,
                 Column       = column,
                 VariableName = assignment.Left.ToString(),
@@ -1264,9 +1264,9 @@ public sealed class TaskScriptParser
         }
 
         // Fallback: arbitrary expression (e.g. list.AddRange(...))
-        return new TaskStepDefinition
+        return new TaskStatementDefinition
         {
-            StepKey    = TaskLanguageStepKeys.Evaluate,
+            StatementKey    = TaskLanguageStatementKeys.Evaluate,
             Line       = line,
             Column     = column,
             Expression = expression.ToString()
@@ -1275,7 +1275,7 @@ public sealed class TaskScriptParser
 
     // ── Control flow ──────────────────────────────────────────────
 
-    private static TaskStepDefinition ParseIfStatement(
+    private static TaskStatementDefinition ParseIfStatement(
         IfStatementSyntax ifStmt,
         List<TaskDiagnostic> diagnostics)
     {
@@ -1284,9 +1284,9 @@ public sealed class TaskScriptParser
             ? ParseBlock(ifStmt.Else.Statement, diagnostics)
             : null;
 
-        return new TaskStepDefinition
+        return new TaskStatementDefinition
         {
-            StepKey    = TaskLanguageStepKeys.Conditional,
+            StatementKey    = TaskLanguageStatementKeys.Conditional,
             Line       = GetLine(ifStmt),
             Column     = GetColumn(ifStmt),
             Expression = ifStmt.Condition.ToString(),
@@ -1295,13 +1295,13 @@ public sealed class TaskScriptParser
         };
     }
 
-    private static TaskStepDefinition ParseWhileStatement(
+    private static TaskStatementDefinition ParseWhileStatement(
         WhileStatementSyntax whileStmt,
         List<TaskDiagnostic> diagnostics)
     {
-        return new TaskStepDefinition
+        return new TaskStatementDefinition
         {
-            StepKey    = TaskLanguageStepKeys.Loop,
+            StatementKey    = TaskLanguageStatementKeys.Loop,
             Line       = GetLine(whileStmt),
             Column     = GetColumn(whileStmt),
             Expression = whileStmt.Condition.ToString(),
@@ -1309,13 +1309,13 @@ public sealed class TaskScriptParser
         };
     }
 
-    private static TaskStepDefinition ParseForEachStatement(
+    private static TaskStatementDefinition ParseForEachStatement(
         ForEachStatementSyntax forEachStmt,
         List<TaskDiagnostic> diagnostics)
     {
-        return new TaskStepDefinition
+        return new TaskStatementDefinition
         {
-            StepKey      = TaskLanguageStepKeys.Loop,
+            StatementKey      = TaskLanguageStatementKeys.Loop,
             Line         = GetLine(forEachStmt),
             Column       = GetColumn(forEachStmt),
             VariableName = forEachStmt.Identifier.Text,
@@ -1325,17 +1325,17 @@ public sealed class TaskScriptParser
         };
     }
 
-    private static TaskStepDefinition ParseReturnStatement(ReturnStatementSyntax ret)
+    private static TaskStatementDefinition ParseReturnStatement(ReturnStatementSyntax ret)
     {
-        return new TaskStepDefinition
+        return new TaskStatementDefinition
         {
-            StepKey = TaskLanguageStepKeys.Return,
+            StatementKey = TaskLanguageStatementKeys.Return,
             Line    = GetLine(ret),
             Column  = GetColumn(ret)
         };
     }
 
-    private static TaskStepDefinition? UnrecognizedStatement(
+    private static TaskStatementDefinition? UnrecognizedStatement(
         StatementSyntax statement,
         List<TaskDiagnostic> diagnostics)
     {
@@ -1350,7 +1350,7 @@ public sealed class TaskScriptParser
 
     // -- Descriptor-backed module call recognition -----------------------------
 
-    private static TaskStepDefinition? TryParseContextApiCall(
+    private static TaskStatementDefinition? TryParseContextApiCall(
         InvocationExpressionSyntax invocation,
         int line,
         int column)
@@ -1363,9 +1363,9 @@ public sealed class TaskScriptParser
         // so that bare "Delay" calls to a context method are not confused with Task.Delay.
         if (methodName == "Delay" && IsTaskMemberAccess(invocation))
         {
-            return new TaskStepDefinition
+            return new TaskStatementDefinition
             {
-                StepKey    = TaskLanguageStepKeys.Delay,
+                StatementKey    = TaskLanguageStatementKeys.Delay,
                 Line       = line,
                 Column     = column,
                 Expression = ExtractFirstArgText(invocation),
@@ -1375,9 +1375,9 @@ public sealed class TaskScriptParser
 
         if (methodName == "WaitUntilStopped")
         {
-            return new TaskStepDefinition
+            return new TaskStatementDefinition
             {
-                StepKey    = TaskLanguageStepKeys.WaitUntilStopped,
+                StatementKey    = TaskLanguageStatementKeys.WaitUntilStopped,
                 Line       = line,
                 Column     = column,
                 Expression = ExtractFirstArgText(invocation),
@@ -1385,15 +1385,15 @@ public sealed class TaskScriptParser
             };
         }
 
-        var descriptor = TaskStepRegistry.Default.FindByMethod(methodName);
+        var descriptor = TaskOperationRegistry.Default.FindByMethod(methodName);
         if (descriptor is null)
             return null;
 
         return BuildStepFromDescriptor(descriptor, invocation, line, column, methodName);
     }
 
-    private static TaskStepDefinition BuildStepFromDescriptor(
-        TaskStepDescriptor descriptor,
+    private static TaskStatementDefinition BuildStepFromDescriptor(
+        TaskOperationDescriptor descriptor,
         InvocationExpressionSyntax invocation,
         int line,
         int column,
@@ -1416,9 +1416,9 @@ public sealed class TaskScriptParser
             arguments = prefixed;
         }
 
-        var step = new TaskStepDefinition
+        var step = new TaskStatementDefinition
         {
-            StepKey    = descriptor.StepKey,
+            StatementKey    = descriptor.OperationKey,
             Line       = line,
             Column     = column,
             Expression = expression,
@@ -1437,7 +1437,7 @@ public sealed class TaskScriptParser
 
     // ── Event handler parsing ─────────────────────────────────────
 
-    private static TaskStepDefinition? TryParseEventHandler(
+    private static TaskStatementDefinition? TryParseEventHandler(
         InvocationExpressionSyntax invocation,
         int line,
         int column,
@@ -1457,7 +1457,7 @@ public sealed class TaskScriptParser
 
         // Find the lambda argument (parenthesized or simple form)
         string? handlerParam = null;
-        IReadOnlyList<TaskStepDefinition>? body = null;
+        IReadOnlyList<TaskStatementDefinition>? body = null;
 
         var parenLambda = invocation.ArgumentList.Arguments
             .Select(a => a.Expression)
@@ -1484,9 +1484,9 @@ public sealed class TaskScriptParser
             }
         }
 
-        return new TaskStepDefinition
+        return new TaskStatementDefinition
         {
-            StepKey          = TaskLanguageStepKeys.EventHandler,
+            StatementKey          = TaskLanguageStatementKeys.EventHandler,
             Line             = line,
             Column           = column,
             ModuleTriggerKey = moduleTriggerKey,
@@ -1496,7 +1496,7 @@ public sealed class TaskScriptParser
         };
     }
 
-    private static IReadOnlyList<TaskStepDefinition> ParseLambdaBody(
+    private static IReadOnlyList<TaskStatementDefinition> ParseLambdaBody(
         CSharpSyntaxNode body,
         List<TaskDiagnostic> diagnostics)
     {
@@ -1506,9 +1506,9 @@ public sealed class TaskScriptParser
         // Expression-bodied lambda → single Evaluate step
         return
         [
-            new TaskStepDefinition
+            new TaskStatementDefinition
             {
-                StepKey    = TaskLanguageStepKeys.Evaluate,
+                StatementKey    = TaskLanguageStatementKeys.Evaluate,
                 Line       = GetLine(body),
                 Column     = GetColumn(body),
                 Expression = body.ToString()
@@ -1518,7 +1518,7 @@ public sealed class TaskScriptParser
 
     // ── Block / statement-list helpers ─────────────────────────────
 
-    private static IReadOnlyList<TaskStepDefinition> ParseBlock(
+    private static IReadOnlyList<TaskStatementDefinition> ParseBlock(
         StatementSyntax statement,
         List<TaskDiagnostic> diagnostics)
     {
@@ -1529,11 +1529,11 @@ public sealed class TaskScriptParser
         return step is not null ? [step] : [];
     }
 
-    private static IReadOnlyList<TaskStepDefinition> ParseStatements(
+    private static IReadOnlyList<TaskStatementDefinition> ParseStatements(
         SyntaxList<StatementSyntax> statements,
         List<TaskDiagnostic> diagnostics)
     {
-        var steps = new List<TaskStepDefinition>();
+        var steps = new List<TaskStatementDefinition>();
         foreach (var stmt in statements)
         {
             var step = ParseStatement(stmt, diagnostics);

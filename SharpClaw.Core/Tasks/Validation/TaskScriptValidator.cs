@@ -80,7 +80,7 @@ public sealed class TaskScriptValidator
             knownTypes,
             declaredDataTypes,
             new HashSet<string>(StringComparer.Ordinal));
-        foreach (var step in definition.Steps)
+        foreach (var step in definition.Statements)
         {
             ValidateStep(step, context, diagnostics);
         }
@@ -120,12 +120,12 @@ public sealed class TaskScriptValidator
     }
 
     private static void ValidateStep(
-        TaskStepDefinition step,
+        TaskStatementDefinition step,
         ValidationContext context,
         List<TaskDiagnostic> diagnostics)
     {
         // Track declared variables
-        if (step.StepKey == TaskLanguageStepKeys.DeclareVariable && step.VariableName is not null)
+        if (step.StatementKey == TaskLanguageStatementKeys.DeclareVariable && step.VariableName is not null)
         {
             if (context.DeclaredVariables.Contains(step.VariableName))
             {
@@ -159,7 +159,7 @@ public sealed class TaskScriptValidator
             context.DeclaredVariables.Add(step.ResultVariable);
         }
 
-        if (step.StepKey == TaskLanguageStepKeys.Loop && step.VariableName is not null)
+        if (step.StatementKey == TaskLanguageStatementKeys.Loop && step.VariableName is not null)
         {
             if (string.IsNullOrWhiteSpace(step.Expression))
             {
@@ -193,11 +193,11 @@ public sealed class TaskScriptValidator
     }
 
     private static void ValidateDescriptorGenericType(
-        TaskStepDefinition step,
+        TaskStatementDefinition step,
         ValidationContext context,
         List<TaskDiagnostic> diagnostics)
     {
-        var descriptor = TaskStepRegistry.Default.FindByKey(step.StepKey);
+        var descriptor = TaskOperationRegistry.Default.FindByKey(step.StatementKey);
         if (descriptor?.RequiresDeclaredGenericType != true)
             return;
 
@@ -206,7 +206,7 @@ public sealed class TaskScriptValidator
             diagnostics.Add(new TaskDiagnostic(
                 TaskDiagnosticSeverity.Error,
                 "TASK108",
-                $"Module operation '{step.StepKey}' requires a declared task data type generic argument.",
+                $"Module operation '{step.StatementKey}' requires a declared task data type generic argument.",
                 step.Line,
                 step.Column));
             return;
@@ -219,7 +219,7 @@ public sealed class TaskScriptValidator
         diagnostics.Add(new TaskDiagnostic(
             TaskDiagnosticSeverity.Error,
             "TASK108",
-            $"Module operation '{step.StepKey}' references unknown task data type '{step.TypeName}'.",
+            $"Module operation '{step.StatementKey}' references unknown task data type '{step.TypeName}'.",
             step.Line,
             step.Column));
     }

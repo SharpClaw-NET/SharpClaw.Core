@@ -36,7 +36,7 @@ public sealed record TaskScriptDefinition
     public TaskDataTypeDefinition? OutputType { get; init; }
 
     /// <summary>Ordered steps in the task entry-point body.</summary>
-    public required IReadOnlyList<TaskStepDefinition> Steps { get; init; }
+    public required IReadOnlyList<TaskStatementDefinition> Statements { get; init; }
 
     /// <summary>
     /// Custom tool-call hooks defined via <c>[ToolCall("name")]</c> methods in

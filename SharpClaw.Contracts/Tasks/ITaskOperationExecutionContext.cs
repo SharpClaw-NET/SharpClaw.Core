@@ -2,12 +2,12 @@ namespace SharpClaw.Contracts.Tasks;
 
 /// <summary>
 /// Public projection of a running task instance's execution context. Passed to
-/// <see cref="ITaskStepExecutorExtension" /> implementations so modules can
-/// read and write task variables, enumerate event handlers, and execute step
+/// <see cref="ITaskOperationExecutor" /> implementations so modules can
+/// read and write task variables, enumerate event handlers, and execute statement
 /// bodies without taking a dependency on the internal orchestrator or
 /// Infrastructure.Tasks.
 /// </summary>
-public interface ITaskStepExecutionContext
+public interface ITaskOperationExecutionContext
 {
     /// <summary>The running task instance ID.</summary>
     Guid InstanceId { get; }
@@ -20,8 +20,8 @@ public interface ITaskStepExecutionContext
 
     /// <summary>
     /// Scoped service provider for the running task instance. Modules may
-    /// resolve services from this provider when executing steps. The scope is
-    /// owned by the orchestrator and is valid for the duration of step
+    /// resolve services from this provider when executing operations. The scope is
+    /// owned by the orchestrator and is valid for the duration of operation
     /// execution.
     /// </summary>
     IServiceProvider Services { get; }
@@ -55,18 +55,18 @@ public interface ITaskStepExecutionContext
     /// <summary>
     /// Update the channel currently associated with this running task
     /// instance. Used by a module executor that provisions a channel while
-    /// the task is running; subsequent module-owned steps then resolve to the
+    /// the task is running; subsequent module-owned operations then resolve to the
     /// newly-created channel.
     /// </summary>
     void SetChannelId(Guid channelId);
 
     /// <summary>
-    /// Recursively execute a nested step list. Returns
-    /// <see cref="TaskStepResult.Return" /> if any nested step requested an
+    /// Recursively execute a nested statement list. Returns
+    /// <see cref="TaskStatementResult.Return" /> if any nested statement requested an
     /// early return so the caller can unwind.
     /// </summary>
-    Task<TaskStepResult> ExecuteStepsAsync(
-        IReadOnlyList<ITaskStepInvocation> steps,
+    Task<TaskStatementResult> ExecuteStatementsAsync(
+        IReadOnlyList<ITaskStatementInvocation> statements,
         CancellationToken cancellationToken);
 
     /// <summary>
@@ -80,7 +80,7 @@ public interface ITaskStepExecutionContext
     void RegisterEventHandler(
         string moduleTriggerKey,
         string? parameterName,
-        IReadOnlyList<ITaskStepInvocation> body);
+        IReadOnlyList<ITaskStatementInvocation> body);
 
     /// <summary>
     /// Block until the task instance has been resumed.

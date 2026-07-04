@@ -14,11 +14,11 @@ namespace SharpClaw.Core.Tests;
 public sealed class TaskOperationOwnershipTests
 {
     [Fact]
-    public async Task Intrinsic_log_step_executes_without_module_executor()
+    public async Task Intrinsic_log_statement_executes_without_module_executor()
     {
-        var step = new TaskStepDefinition
+        var statement = new TaskStatementDefinition
         {
-            StepKey = TaskLanguageStepKeys.Log,
+            StatementKey = TaskLanguageStatementKeys.Log,
             Line = 1,
             Column = 1,
             Expression = "\"core log\""
@@ -32,7 +32,7 @@ public sealed class TaskOperationOwnershipTests
 
         var outcome = await engine.ExecuteAsync(new TaskPlanExecutionRequest(
             instanceId,
-            Plan(step),
+            Plan(statement),
             runtime.CreateInstance(instanceId),
             new TestServiceProvider(),
             host,
@@ -46,9 +46,9 @@ public sealed class TaskOperationOwnershipTests
     [Fact]
     public async Task Missing_module_executor_fails_instead_of_continuing()
     {
-        var step = new TaskStepDefinition
+        var statement = new TaskStatementDefinition
         {
-            StepKey = "module.missing_operation",
+            StatementKey = "module.missing_operation",
             Line = 7,
             Column = 3
         };
@@ -61,7 +61,7 @@ public sealed class TaskOperationOwnershipTests
 
         var outcome = await engine.ExecuteAsync(new TaskPlanExecutionRequest(
             instanceId,
-            Plan(step),
+            Plan(statement),
             runtime.CreateInstance(instanceId),
             new TestServiceProvider(),
             host,
@@ -79,19 +79,19 @@ public sealed class TaskOperationOwnershipTests
     [Fact]
     public void Module_operation_key_is_not_a_core_intrinsic_language_key()
     {
-        Assert.False(TaskLanguageStepKeys.IsIntrinsic("module.schema_read"));
+        Assert.False(TaskLanguageStatementKeys.IsIntrinsic("module.schema_read"));
     }
 
     [Fact]
     public void Descriptor_backed_module_calls_parse_generically()
     {
-        TaskStepRegistry.Default.Reset();
+        TaskOperationRegistry.Default.Reset();
         try
         {
-            TaskStepRegistry.Default.Register(new TaskStepDescriptor
+            TaskOperationRegistry.Default.Register(new TaskOperationDescriptor
             {
                 MethodName = "ModuleCall",
-                StepKey = "module.custom_operation",
+                OperationKey = "module.custom_operation",
                 OwnerId = "ExampleModule",
                 FirstArgIsExpression = true,
                 CapturesGenericType = true
@@ -117,29 +117,29 @@ public sealed class TaskOperationOwnershipTests
                 """);
 
             Assert.True(result.Success, string.Join(Environment.NewLine, result.Diagnostics));
-            var step = Assert.Single(result.Definition!.Steps);
-            Assert.Equal("module.custom_operation", step.StepKey);
-            Assert.Equal("Result", step.TypeName);
-            Assert.Equal("output", step.ResultVariable);
-            Assert.Equal("payload", step.Expression);
-            Assert.Equal(new[] { "payload", "ct" }, step.Arguments);
+            var statement = Assert.Single(result.Definition!.Statements);
+            Assert.Equal("module.custom_operation", statement.StatementKey);
+            Assert.Equal("Result", statement.TypeName);
+            Assert.Equal("output", statement.ResultVariable);
+            Assert.Equal("payload", statement.Expression);
+            Assert.Equal(new[] { "payload", "ct" }, statement.Arguments);
         }
         finally
         {
-            TaskStepRegistry.Default.Reset();
+            TaskOperationRegistry.Default.Reset();
         }
     }
 
     [Fact]
     public void Module_descriptor_requiring_declared_generic_type_fails_unknown_type()
     {
-        TaskStepRegistry.Default.Reset();
+        TaskOperationRegistry.Default.Reset();
         try
         {
-            TaskStepRegistry.Default.Register(new TaskStepDescriptor
+            TaskOperationRegistry.Default.Register(new TaskOperationDescriptor
             {
                 MethodName = "ReadSchema",
-                StepKey = "module.schema_read",
+                OperationKey = "module.schema_read",
                 OwnerId = "SchemaModule",
                 FirstArgIsExpression = true,
                 CapturesGenericType = true,
@@ -171,20 +171,20 @@ public sealed class TaskOperationOwnershipTests
         }
         finally
         {
-            TaskStepRegistry.Default.Reset();
+            TaskOperationRegistry.Default.Reset();
         }
     }
 
     [Fact]
     public void Module_descriptor_requiring_declared_generic_type_passes_declared_type()
     {
-        TaskStepRegistry.Default.Reset();
+        TaskOperationRegistry.Default.Reset();
         try
         {
-            TaskStepRegistry.Default.Register(new TaskStepDescriptor
+            TaskOperationRegistry.Default.Register(new TaskOperationDescriptor
             {
                 MethodName = "ReadSchema",
-                StepKey = "module.schema_read",
+                OperationKey = "module.schema_read",
                 OwnerId = "SchemaModule",
                 FirstArgIsExpression = true,
                 CapturesGenericType = true,
@@ -218,20 +218,20 @@ public sealed class TaskOperationOwnershipTests
         }
         finally
         {
-            TaskStepRegistry.Default.Reset();
+            TaskOperationRegistry.Default.Reset();
         }
     }
 
     [Fact]
     public void Generic_module_descriptor_without_declared_type_requirement_does_not_emit_task108()
     {
-        TaskStepRegistry.Default.Reset();
+        TaskOperationRegistry.Default.Reset();
         try
         {
-            TaskStepRegistry.Default.Register(new TaskStepDescriptor
+            TaskOperationRegistry.Default.Register(new TaskOperationDescriptor
             {
                 MethodName = "LooseGeneric",
-                StepKey = "module.loose_generic",
+                OperationKey = "module.loose_generic",
                 OwnerId = "LooseModule",
                 FirstArgIsExpression = true,
                 CapturesGenericType = true
@@ -252,10 +252,10 @@ public sealed class TaskOperationOwnershipTests
                 """);
 
             Assert.True(result.Success, string.Join(Environment.NewLine, result.Diagnostics));
-            var step = Assert.Single(result.Definition!.Steps);
-            Assert.Equal("module.loose_generic", step.StepKey);
-            Assert.Equal("ExternalRuntimeType", step.TypeName);
-            Assert.Equal("parsed", step.ResultVariable);
+            var statement = Assert.Single(result.Definition!.Statements);
+            Assert.Equal("module.loose_generic", statement.StatementKey);
+            Assert.Equal("ExternalRuntimeType", statement.TypeName);
+            Assert.Equal("parsed", statement.ResultVariable);
 
             var validation = TaskScriptValidator.Validate(result.Definition!);
             Assert.True(validation.IsValid, string.Join(Environment.NewLine, validation.Diagnostics));
@@ -263,11 +263,11 @@ public sealed class TaskOperationOwnershipTests
         }
         finally
         {
-            TaskStepRegistry.Default.Reset();
+            TaskOperationRegistry.Default.Reset();
         }
     }
 
-    private static CompiledTaskPlan Plan(params TaskStepDefinition[] steps)
+    private static CompiledTaskPlan Plan(params TaskStatementDefinition[] statements)
     {
         var definition = new TaskScriptDefinition
         {
@@ -277,7 +277,7 @@ public sealed class TaskOperationOwnershipTests
             EntryPointMethod = "RunAsync",
             Parameters = [],
             DataTypes = [],
-            Steps = steps
+            Statements = statements
         };
 
         return new CompiledTaskPlan
@@ -285,7 +285,7 @@ public sealed class TaskOperationOwnershipTests
             TaskName = definition.Name,
             Definition = definition,
             ParameterValues = new Dictionary<string, object?>(),
-            ExecutionSteps = steps
+            ExecutionStatements = statements
         };
     }
 

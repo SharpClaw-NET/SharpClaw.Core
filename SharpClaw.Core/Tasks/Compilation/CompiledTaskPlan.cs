@@ -21,7 +21,7 @@ public sealed record CompiledTaskPlan
     /// <summary>
     /// The compiled entry-point body ready for execution.
     /// </summary>
-    public required IReadOnlyList<TaskStepDefinition> ExecutionSteps { get; init; }
+    public required IReadOnlyList<TaskStatementDefinition> ExecutionStatements { get; init; }
 
     /// <summary>
     /// Custom tool-call hooks defined via <c>[ToolCall("name")]</c>

@@ -2,7 +2,7 @@ namespace SharpClaw.Contracts.Tasks;
 
 /// <summary>
 /// Allows a module to extend the task script parser with additional
-/// context-API step kinds and event-trigger handler names.
+/// context-API operation names and event-trigger handler names.
 /// Implementations are registered once at startup via
 /// <c>TaskScriptParser.RegisterModule</c>.
 /// </summary>
@@ -10,21 +10,21 @@ public interface ITaskParserModuleExtension
 {
     /// <summary>
     /// Maps context-API method names (as they appear in task scripts) to a
-    /// module-owned step key and the owning module ID.
-    /// The parser records the step key in <c>TaskStepDefinition.StepKey</c>.
+    /// module-owned operation key and the owning module ID.
+    /// The parser records the operation key in <c>TaskStatementDefinition.StatementKey</c>.
     /// </summary>
-    IReadOnlyDictionary<string, (string StepKey, string ModuleId)> StepKeyMappings { get; }
+    IReadOnlyDictionary<string, (string OperationKey, string ModuleId)> OperationKeyMappings { get; }
 
     /// <summary>
     /// Maps event-handler method names (as they appear in task scripts) to a
     /// module-owned trigger key and the owning module ID.
-    /// The parser stores the key in <c>TaskStepDefinition.ModuleTriggerKey</c>.
+    /// The parser stores the key in <c>TaskStatementDefinition.ModuleTriggerKey</c>.
     /// </summary>
     IReadOnlyDictionary<string, (string TriggerKey, string ModuleId)> EventTriggerMappings { get; }
 
     /// <summary>
-    /// Method names in <see cref="StepKeyMappings"/> whose first argument
-    /// should be captured as <c>Expression</c> on the parsed step.
+    /// Method names in <see cref="OperationKeyMappings"/> whose first argument
+    /// should be captured as <c>Expression</c> on the parsed statement.
     /// </summary>
     IReadOnlySet<string> SingleArgExpressionMethods { get; }
 

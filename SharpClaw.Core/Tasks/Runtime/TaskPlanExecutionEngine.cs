@@ -18,27 +18,27 @@ namespace SharpClaw.Core.Tasks.Runtime;
 /// </summary>
 public sealed class TaskPlanExecutionEngine
 {
-    private readonly IReadOnlyList<ITaskStepExecutorExtension> _stepExtensions;
+    private readonly IReadOnlyList<ITaskOperationExecutor> _operationExecutors;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly TaskExpressionEngine _expressions;
     private readonly TaskRuntimeLifecycleEngine _runtimeLifecycle;
     private readonly ILogger<TaskPlanExecutionEngine> _logger;
 
     /// <summary>
-    /// Creates the execution engine with module step extensions and host DI
+    /// Creates the execution engine with module operation executors and host DI
     /// scope support.
     /// </summary>
     public TaskPlanExecutionEngine(
         IServiceScopeFactory scopeFactory,
-        IEnumerable<ITaskStepExecutorExtension> stepExtensions,
+        IEnumerable<ITaskOperationExecutor> operationExecutors,
         TaskExpressionEngine? expressions = null,
         TaskRuntimeLifecycleEngine? runtimeLifecycle = null,
         ILogger<TaskPlanExecutionEngine>? logger = null)
     {
         _scopeFactory = scopeFactory
             ?? throw new ArgumentNullException(nameof(scopeFactory));
-        _stepExtensions = stepExtensions?.ToList()
-            ?? throw new ArgumentNullException(nameof(stepExtensions));
+        _operationExecutors = operationExecutors?.ToList()
+            ?? throw new ArgumentNullException(nameof(operationExecutors));
         _expressions = expressions ?? new TaskExpressionEngine();
         _runtimeLifecycle = runtimeLifecycle ?? new TaskRuntimeLifecycleEngine();
         _logger = logger ?? NullLogger<TaskPlanExecutionEngine>.Instance;
@@ -72,8 +72,8 @@ public sealed class TaskPlanExecutionEngine
                 request.CancellationToken);
             context.ChannelId = initialChannelId ?? Guid.Empty;
 
-            await ExecuteStepDefinitionsAsync(
-                request.Plan.ExecutionSteps,
+            await ExecuteStatementDefinitionsAsync(
+                request.Plan.ExecutionStatements,
                 context,
                 request.Host,
                 request.CancellationToken,
@@ -209,7 +209,7 @@ public sealed class TaskPlanExecutionEngine
                     context.Variables[parameter.Name] = value;
                 }
 
-                await ExecuteStepDefinitionsAsync(
+                await ExecuteStatementDefinitionsAsync(
                     hook.Body,
                     context,
                     request.Host,
@@ -226,8 +226,8 @@ public sealed class TaskPlanExecutionEngine
         }
     }
 
-    private async Task<TaskStepExecutionResult> ExecuteStepAsync(
-        TaskStepDefinition step,
+    private async Task<TaskStatementExecutionResult> ExecuteStatementAsync(
+        TaskStatementDefinition statement,
         TaskPlanExecutionContext context,
         ITaskPlanExecutionHost host,
         CancellationToken ct)
@@ -236,89 +236,89 @@ public sealed class TaskPlanExecutionEngine
         ct.ThrowIfCancellationRequested();
         await context.Runtime.WaitIfPausedAsync(context.CancellationToken);
 
-        var stepKey = step.StepKey ?? string.Empty;
-        if (TaskLanguageStepKeys.IsIntrinsic(stepKey))
-            return await ExecuteIntrinsicLanguageStepAsync(step, context, host);
+        var statementKey = statement.StatementKey ?? string.Empty;
+        if (TaskLanguageStatementKeys.IsIntrinsic(statementKey))
+            return await ExecuteIntrinsicLanguageStepAsync(statement, context, host);
 
-        var executor = _stepExtensions.FirstOrDefault(e => e.CanExecute(stepKey));
+        var executor = _operationExecutors.FirstOrDefault(e => e.CanExecute(statementKey));
         if (executor is null)
         {
             throw new InvalidOperationException(
-                $"No task step executor is registered for step key '{stepKey}' at line {step.Line}, column {step.Column}. " +
-                "The module or operation that owns this task step is missing or was not loaded.");
+                $"No task operation executor is registered for statement key '{statementKey}' at line {statement.Line}, column {statement.Column}. " +
+                "The module or operation that owns this task statement is missing or was not loaded.");
         }
 
-        var moduleContext = new TaskStepContextAdapter(context, this, host);
-        var stepTiming = Stopwatch.StartNew();
+        var moduleContext = new TaskOperationContextAdapter(context, this, host);
+        var operationTiming = Stopwatch.StartNew();
 
-        if (executor is ITaskStepInvocationExecutor invocationExecutor)
+        if (executor is ITaskOperationInvocationExecutor invocationExecutor)
         {
             var result = await invocationExecutor.ExecuteInvocationAsync(
-                step,
+                statement,
                 moduleContext);
-            stepTiming.Stop();
+            operationTiming.Stop();
             _logger.LogDebug(
-                "Task instance {InstanceId} step {StepKey} completed in {ElapsedMs}ms. Result={Result}",
+                "Task instance {InstanceId} statement {StatementKey} completed in {ElapsedMs}ms. Result={Result}",
                 context.InstanceId,
-                SanitizeForLog(stepKey),
-                stepTiming.ElapsedMilliseconds,
+                SanitizeForLog(statementKey),
+                operationTiming.ElapsedMilliseconds,
                 result);
-            return result == TaskStepResult.Return
-                ? TaskStepExecutionResult.Return
-                : TaskStepExecutionResult.Continue;
+            return result == TaskStatementResult.Return
+                ? TaskStatementExecutionResult.Return
+                : TaskStatementExecutionResult.Continue;
         }
 
-        var resolvedArguments = step.Arguments?
+        var resolvedArguments = statement.Arguments?
             .Select(argument => _expressions.ResolveExpression(
                 argument,
                 context.Variables))
             .ToList();
-        if (step.TypeName is not null)
+        if (statement.TypeName is not null)
         {
             resolvedArguments ??= [];
-            resolvedArguments.Insert(0, step.TypeName);
+            resolvedArguments.Insert(0, statement.TypeName);
         }
 
-        var resolvedExpression = step.Expression is not null
-            ? _expressions.ResolveExpression(step.Expression, context.Variables)
+        var resolvedExpression = statement.Expression is not null
+            ? _expressions.ResolveExpression(statement.Expression, context.Variables)
             : null;
         var keepGoing = await executor.ExecuteAsync(
-            stepKey,
+            statementKey,
             moduleContext,
             resolvedArguments,
             resolvedExpression,
-            step.ResultVariable);
+            statement.ResultVariable);
 
-        stepTiming.Stop();
+        operationTiming.Stop();
         _logger.LogDebug(
-            "Task instance {InstanceId} step {StepKey} completed in {ElapsedMs}ms. Continue={Continue}",
+            "Task instance {InstanceId} operation statement {StatementKey} completed in {ElapsedMs}ms. Continue={Continue}",
             context.InstanceId,
-            SanitizeForLog(stepKey),
-            stepTiming.ElapsedMilliseconds,
+            SanitizeForLog(statementKey),
+            operationTiming.ElapsedMilliseconds,
             keepGoing);
         return keepGoing
-            ? TaskStepExecutionResult.Continue
-            : TaskStepExecutionResult.Return;
+            ? TaskStatementExecutionResult.Continue
+            : TaskStatementExecutionResult.Return;
     }
 
-    private async Task<TaskStepExecutionResult> ExecuteIntrinsicLanguageStepAsync(
-        TaskStepDefinition step,
+    private async Task<TaskStatementExecutionResult> ExecuteIntrinsicLanguageStepAsync(
+        TaskStatementDefinition step,
         TaskPlanExecutionContext context,
         ITaskPlanExecutionHost host)
     {
-        switch (step.StepKey)
+        switch (step.StatementKey)
         {
-            case TaskLanguageStepKeys.DeclareVariable:
-            case TaskLanguageStepKeys.Assign:
+            case TaskLanguageStatementKeys.DeclareVariable:
+            case TaskLanguageStatementKeys.Assign:
                 context.Variables[step.VariableName ?? string.Empty] = step.Expression;
-                return TaskStepExecutionResult.Continue;
+                return TaskStatementExecutionResult.Continue;
 
-            case TaskLanguageStepKeys.Evaluate:
+            case TaskLanguageStatementKeys.Evaluate:
                 if (step.ResultVariable is not null)
                     context.Variables[step.ResultVariable] = step.Expression;
-                return TaskStepExecutionResult.Continue;
+                return TaskStatementExecutionResult.Continue;
 
-            case TaskLanguageStepKeys.Log:
+            case TaskLanguageStatementKeys.Log:
             {
                 var message = step.Expression is null
                     ? string.Empty
@@ -328,47 +328,47 @@ public sealed class TaskPlanExecutionEngine
                     message,
                     JobLogLevels.Info,
                     context.CancellationToken);
-                return TaskStepExecutionResult.Continue;
+                return TaskStatementExecutionResult.Continue;
             }
 
-            case TaskLanguageStepKeys.Delay:
+            case TaskLanguageStatementKeys.Delay:
             {
                 var resolved = step.Expression is null
                     ? null
                     : _expressions.ResolveExpression(step.Expression, context.Variables);
                 if (int.TryParse(resolved, out var delayMs))
                     await DelayWithPauseAsync(delayMs, context);
-                return TaskStepExecutionResult.Continue;
+                return TaskStatementExecutionResult.Continue;
             }
 
-            case TaskLanguageStepKeys.WaitUntilStopped:
+            case TaskLanguageStatementKeys.WaitUntilStopped:
                 await Task.Delay(Timeout.Infinite, context.CancellationToken);
-                return TaskStepExecutionResult.Continue;
+                return TaskStatementExecutionResult.Continue;
 
-            case TaskLanguageStepKeys.Return:
-                return TaskStepExecutionResult.Return;
+            case TaskLanguageStatementKeys.Return:
+                return TaskStatementExecutionResult.Return;
 
-            case TaskLanguageStepKeys.Conditional:
+            case TaskLanguageStatementKeys.Conditional:
             {
                 var branch = _expressions.EvaluateCondition(step.Expression, context.Variables)
                     ? step.Body
                     : step.ElseBody;
                 if (branch is null)
-                    return TaskStepExecutionResult.Continue;
-                return await ExecuteStepDefinitionsAsync(
+                    return TaskStatementExecutionResult.Continue;
+                return await ExecuteStatementDefinitionsAsync(
                     branch,
                     context,
                     host,
                     context.CancellationToken,
-                    throwOnUnsupportedInvocation: false) == TaskStepResult.Return
-                    ? TaskStepExecutionResult.Return
-                    : TaskStepExecutionResult.Continue;
+                    throwOnUnsupportedInvocation: false) == TaskStatementResult.Return
+                    ? TaskStatementExecutionResult.Return
+                    : TaskStatementExecutionResult.Continue;
             }
 
-            case TaskLanguageStepKeys.Loop:
+            case TaskLanguageStatementKeys.Loop:
                 return await ExecuteLoopAsync(step, context, host);
 
-            case TaskLanguageStepKeys.EventHandler:
+            case TaskLanguageStatementKeys.EventHandler:
             {
                 if (step.ModuleTriggerKey is null)
                     throw new InvalidOperationException(
@@ -382,15 +382,15 @@ public sealed class TaskPlanExecutionEngine
                     $"Registered event handler: {step.ModuleTriggerKey}",
                     JobLogLevels.Info,
                     context.CancellationToken);
-                return TaskStepExecutionResult.Continue;
+                return TaskStatementExecutionResult.Continue;
             }
         }
 
-        return TaskStepExecutionResult.Continue;
+        return TaskStatementExecutionResult.Continue;
     }
 
-    private async Task<TaskStepExecutionResult> ExecuteLoopAsync(
-        TaskStepDefinition step,
+    private async Task<TaskStatementExecutionResult> ExecuteLoopAsync(
+        TaskStatementDefinition step,
         TaskPlanExecutionContext context,
         ITaskPlanExecutionHost host)
     {
@@ -403,17 +403,17 @@ public sealed class TaskPlanExecutionEngine
                 context.Variables[step.VariableName] = item;
                 if (step.Body is null)
                     continue;
-                var result = await ExecuteStepDefinitionsAsync(
+                var result = await ExecuteStatementDefinitionsAsync(
                     step.Body,
                     context,
                     host,
                     context.CancellationToken,
                     throwOnUnsupportedInvocation: false);
-                if (result == TaskStepResult.Return)
-                    return TaskStepExecutionResult.Return;
+                if (result == TaskStatementResult.Return)
+                    return TaskStatementExecutionResult.Return;
             }
 
-            return TaskStepExecutionResult.Continue;
+            return TaskStatementExecutionResult.Continue;
         }
 
         while (_expressions.EvaluateCondition(step.Expression, context.Variables))
@@ -422,21 +422,21 @@ public sealed class TaskPlanExecutionEngine
             await context.Runtime.WaitIfPausedAsync(context.CancellationToken);
             if (step.Body is null)
                 continue;
-            var result = await ExecuteStepDefinitionsAsync(
+            var result = await ExecuteStatementDefinitionsAsync(
                 step.Body,
                 context,
                 host,
                 context.CancellationToken,
                 throwOnUnsupportedInvocation: false);
-            if (result == TaskStepResult.Return)
-                return TaskStepExecutionResult.Return;
+            if (result == TaskStatementResult.Return)
+                return TaskStatementExecutionResult.Return;
         }
 
-        return TaskStepExecutionResult.Continue;
+        return TaskStatementExecutionResult.Continue;
     }
 
     private IEnumerable<object?> EnumerateLoopValues(
-        TaskStepDefinition step,
+        TaskStatementDefinition step,
         TaskPlanExecutionContext context)
     {
         if (string.IsNullOrWhiteSpace(step.Expression))
@@ -528,8 +528,8 @@ public sealed class TaskPlanExecutionEngine
         }
     }
 
-    private async Task<TaskStepResult> ExecuteStepDefinitionsAsync(
-        IReadOnlyList<ITaskStepInvocation> steps,
+    private async Task<TaskStatementResult> ExecuteStatementDefinitionsAsync(
+        IReadOnlyList<ITaskStatementInvocation> steps,
         TaskPlanExecutionContext context,
         ITaskPlanExecutionHost host,
         CancellationToken ct,
@@ -538,7 +538,7 @@ public sealed class TaskPlanExecutionEngine
         foreach (var step in steps)
         {
             ct.ThrowIfCancellationRequested();
-            if (step is not TaskStepDefinition definition)
+            if (step is not TaskStatementDefinition definition)
             {
                 if (throwOnUnsupportedInvocation)
                     throw new InvalidOperationException(
@@ -546,20 +546,20 @@ public sealed class TaskPlanExecutionEngine
                 continue;
             }
 
-            var result = await ExecuteStepAsync(
+            var result = await ExecuteStatementAsync(
                 definition,
                 context,
                 host,
                 ct);
-            if (result == TaskStepExecutionResult.Return)
-                return TaskStepResult.Return;
+            if (result == TaskStatementExecutionResult.Return)
+                return TaskStatementResult.Return;
         }
 
-        return TaskStepResult.Continue;
+        return TaskStatementResult.Continue;
     }
 
-    private async Task ExecuteScopedStepDefinitionsAsync(
-        IReadOnlyList<ITaskStepInvocation> steps,
+    private async Task ExecuteScopedStatementDefinitionsAsync(
+        IReadOnlyList<ITaskStatementInvocation> steps,
         TaskPlanExecutionContext context,
         ITaskPlanExecutionHost host,
         CancellationToken ct,
@@ -568,7 +568,7 @@ public sealed class TaskPlanExecutionEngine
         using var scope = _scopeFactory.CreateScope();
         using var serviceScope = context.UseServices(scope.ServiceProvider);
 
-        await ExecuteStepDefinitionsAsync(
+        await ExecuteStatementDefinitionsAsync(
             steps,
             context,
             host,
@@ -642,12 +642,12 @@ public sealed class TaskPlanExecutionEngine
     private sealed record RegisteredEventHandler(
         string ModuleTriggerKey,
         string? ParameterName,
-        IReadOnlyList<ITaskStepInvocation> Body);
+        IReadOnlyList<ITaskStatementInvocation> Body);
 
-    private sealed class TaskStepContextAdapter(
+    private sealed class TaskOperationContextAdapter(
         TaskPlanExecutionContext context,
         TaskPlanExecutionEngine engine,
-        ITaskPlanExecutionHost host) : ITaskStepExecutionContext
+        ITaskPlanExecutionHost host) : ITaskOperationExecutionContext
     {
         public Guid InstanceId => context.InstanceId;
         public Guid ChannelId => context.ChannelId;
@@ -697,7 +697,7 @@ public sealed class TaskPlanExecutionEngine
         public void RegisterEventHandler(
             string moduleTriggerKey,
             string? parameterName,
-            IReadOnlyList<ITaskStepInvocation> body)
+            IReadOnlyList<ITaskStatementInvocation> body)
         {
             context.EventHandlers.Add(new RegisteredEventHandler(
                 moduleTriggerKey,
@@ -705,14 +705,14 @@ public sealed class TaskPlanExecutionEngine
                 body));
         }
 
-        public async Task<TaskStepResult> ExecuteStepsAsync(
-            IReadOnlyList<ITaskStepInvocation> steps,
+        public async Task<TaskStatementResult> ExecuteStatementsAsync(
+            IReadOnlyList<ITaskStatementInvocation> steps,
             CancellationToken cancellationToken)
         {
             using var scope = engine._scopeFactory.CreateScope();
             using var serviceScope = context.UseServices(scope.ServiceProvider);
 
-            return await engine.ExecuteStepDefinitionsAsync(
+            return await engine.ExecuteStatementDefinitionsAsync(
                 steps,
                 context,
                 host,
@@ -732,7 +732,7 @@ public sealed class TaskPlanExecutionEngine
 
         public async Task ExecuteBodyAsync(CancellationToken ct)
         {
-            await engine.ExecuteScopedStepDefinitionsAsync(
+            await engine.ExecuteScopedStatementDefinitionsAsync(
                 handler.Body,
                 context,
                 host,
@@ -746,7 +746,7 @@ public sealed class TaskPlanExecutionEngine
         public void Dispose() => restore();
     }
 
-    private enum TaskStepExecutionResult
+    private enum TaskStatementExecutionResult
     {
         Continue,
         Return,

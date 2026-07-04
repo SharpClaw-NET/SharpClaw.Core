@@ -29,7 +29,7 @@ public sealed record TaskToolCallHook
     /// <summary>
     /// The compiled body steps executed when the tool is invoked.
     /// </summary>
-    public required IReadOnlyList<TaskStepDefinition> Body { get; init; }
+    public required IReadOnlyList<TaskStatementDefinition> Body { get; init; }
 
     /// <summary>
     /// The variable name whose value is returned as the tool result

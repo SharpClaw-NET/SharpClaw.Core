@@ -3,19 +3,19 @@ using SharpClaw.Contracts.Tasks;
 namespace SharpClaw.Core.Tasks.Models;
 
 /// <summary>
-/// A single step in a task script body. The <see cref="StepKey" /> discriminator
+/// A single step in a task script body. The <see cref="StatementKey" /> discriminator
 /// determines which properties are relevant. Steps form a tree: event handlers,
 /// conditionals, and loops contain nested body steps.
 /// </summary>
-public sealed record TaskStepDefinition : ITaskStepInvocation
+public sealed record TaskStatementDefinition : ITaskStatementInvocation
 {
     /// <summary>
     /// Stable wire-format string key identifying this step's operation.
-    /// Intrinsic language keys are exposed by <see cref="TaskLanguageStepKeys" />.
+    /// Intrinsic language keys are exposed by <see cref="TaskLanguageStatementKeys" />.
     /// Module operations use keys provided by the descriptor or executor owned
     /// by that module.
     /// </summary>
-    public required string StepKey { get; init; }
+    public required string StatementKey { get; init; }
 
     /// <summary>Source line number (1-based) for diagnostics.</summary>
     public required int Line { get; init; }
@@ -42,7 +42,7 @@ public sealed record TaskStepDefinition : ITaskStepInvocation
     public string? ResultVariable { get; init; }
 
     /// <summary>
-    /// Expression text whose interpretation depends on <see cref="StepKey" />.
+    /// Expression text whose interpretation depends on <see cref="StatementKey" />.
     /// Intrinsic examples include declaration initializers, assignment values,
     /// conditional predicates, loop predicates, delay durations, log messages,
     /// and evaluated expressions. Module operations define their own expression
@@ -69,12 +69,12 @@ public sealed record TaskStepDefinition : ITaskStepInvocation
     /// <summary>
     /// Nested steps: event-handler body, conditional then-branch, or loop body.
     /// </summary>
-    public IReadOnlyList<TaskStepDefinition>? Body { get; init; }
+    public IReadOnlyList<TaskStatementDefinition>? Body { get; init; }
 
     /// <summary>Else branch for <c>core.conditional</c> steps.</summary>
-    public IReadOnlyList<TaskStepDefinition>? ElseBody { get; init; }
+    public IReadOnlyList<TaskStatementDefinition>? ElseBody { get; init; }
 
-    string? ITaskStepInvocation.RawExpression => Expression;
-    IReadOnlyList<ITaskStepInvocation>? ITaskStepInvocation.Body => Body;
-    IReadOnlyList<ITaskStepInvocation>? ITaskStepInvocation.ElseBody => ElseBody;
+    string? ITaskStatementInvocation.RawExpression => Expression;
+    IReadOnlyList<ITaskStatementInvocation>? ITaskStatementInvocation.Body => Body;
+    IReadOnlyList<ITaskStatementInvocation>? ITaskStatementInvocation.ElseBody => ElseBody;
 }

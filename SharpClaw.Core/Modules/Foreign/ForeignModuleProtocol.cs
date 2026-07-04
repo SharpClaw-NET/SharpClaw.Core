@@ -30,8 +30,8 @@ public static class ForeignModuleProtocol
     public const string ResourceIdsPath = "/.sharpclaw/resources/ids";
     public const string ResourceLookupPath = "/.sharpclaw/resources/lookup";
     public const string CliExecutePath = "/.sharpclaw/cli/execute";
-    public const string TaskStepExecutePath = "/.sharpclaw/tasks/steps/execute";
-    public const string TaskStepInvokePath = "/.sharpclaw/tasks/steps/invoke";
+    public const string TaskOperationExecutePath = "/.sharpclaw/tasks/operations/execute";
+    public const string TaskOperationInvokePath = "/.sharpclaw/tasks/operations/invoke";
     public const string TaskTriggerAttributeHandlePath = "/.sharpclaw/tasks/triggers/attributes/handle";
     public const string TaskTriggerStartPath = "/.sharpclaw/tasks/triggers/start";
     public const string TaskTriggerStopPath = "/.sharpclaw/tasks/triggers/stop";
@@ -114,7 +114,7 @@ public static class ForeignModuleHostCapabilityProtocol
     public const string TaskUpdatePath = "/.sharpclaw/host/tasks/update";
     public const string TaskDeletePath = "/.sharpclaw/host/tasks/delete";
     public const string TaskLaunchPath = "/.sharpclaw/host/tasks/launch";
-    public const string TaskContextExecuteStepsPath = "/.sharpclaw/host/tasks/context/execute-steps";
+    public const string TaskContextExecuteStatementsPath = "/.sharpclaw/host/tasks/context/execute-statements";
     public const string TaskContextExecuteEventHandlerPath = "/.sharpclaw/host/tasks/context/event-handler/execute";
     public const string CoreAgentIdsPath = "/.sharpclaw/host/core/agents/ids";
     public const string CoreChannelIdsPath = "/.sharpclaw/host/core/channels/ids";

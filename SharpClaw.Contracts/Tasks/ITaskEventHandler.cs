@@ -3,7 +3,7 @@ namespace SharpClaw.Contracts.Tasks;
 /// <summary>
 /// A registered event handler within a running task instance.
 /// The handler body is exposed as a pre-bound async delegate so modules
-/// can fire it without referencing <c>TaskStepDefinition</c>.
+/// can fire it without referencing <c>TaskStatementDefinition</c>.
 /// </summary>
 public interface ITaskEventHandler
 {

@@ -130,12 +130,12 @@ public sealed record ForeignModuleTaskLaunchRequest
 
 public sealed record ForeignModuleTaskLaunchResponse(Guid InstanceId);
 
-public sealed record ForeignModuleTaskContextExecuteStepsRequest
+public sealed record ForeignModuleTaskContextExecuteStatementsRequest
 {
     public string ContextId { get; init; } = string.Empty;
     public Guid? ChannelId { get; init; }
     public IReadOnlyDictionary<string, JsonElement>? Variables { get; init; }
-    public IReadOnlyList<ForeignModuleTaskStepInvocationDescriptor> Steps { get; init; } = [];
+    public IReadOnlyList<ForeignModuleTaskStatementInvocationDescriptor> Steps { get; init; } = [];
 }
 
 public sealed record ForeignModuleTaskContextExecuteEventHandlerRequest
@@ -146,7 +146,7 @@ public sealed record ForeignModuleTaskContextExecuteEventHandlerRequest
 }
 
 public sealed record ForeignModuleTaskContextExecutionResponse(
-    TaskStepResult Result,
+    TaskStatementResult Result,
     Guid ChannelId,
     IReadOnlyDictionary<string, JsonElement> Variables);
 

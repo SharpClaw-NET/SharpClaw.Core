@@ -112,7 +112,7 @@ public sealed class TaskRuntimeEntry : IDisposable
 }
 
 /// <summary>
-/// Lightweight execution handle used by task interpreters and step executors.
+/// Lightweight execution handle used by task interpreters and operation executors.
 /// </summary>
 public sealed class TaskRuntimeInstance
 {
