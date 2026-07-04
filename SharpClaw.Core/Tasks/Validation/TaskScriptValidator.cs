@@ -166,18 +166,6 @@ public sealed class TaskScriptValidator
             }
         }
 
-        if (step.StepKey == TaskLanguageStepKeys.ParseResponse &&
-            !string.IsNullOrWhiteSpace(step.TypeName) &&
-            !IsValidType(step.TypeName, context.KnownTypes))
-        {
-            diagnostics.Add(new TaskDiagnostic(
-                TaskDiagnosticSeverity.Error,
-                "TASK108",
-                $"ParseResponse references unknown type '{step.TypeName}'.",
-                step.Line,
-                step.Column));
-        }
-
         // Validate nested bodies
         if (step.Body is not null)
         {

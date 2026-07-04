@@ -4,8 +4,8 @@ using SharpClaw.Core.Tasks.Models;
 namespace SharpClaw.Core.Tasks.Runtime;
 
 /// <summary>
-/// Extracts and validates structured JSON responses produced by task runtime
-/// chat steps.
+/// Extracts and validates structured JSON responses produced by module-owned
+/// task operations.
 /// </summary>
 public sealed class TaskStructuredResponseParser
 {
@@ -22,13 +22,13 @@ public sealed class TaskStructuredResponseParser
 
         var jsonText = ExtractJsonObject(text)
             ?? throw new InvalidOperationException(
-                "ParseResponse expected a JSON object in the source text.");
+                "Structured response parsing expected a JSON object in the source text.");
 
         using var doc = JsonDocument.Parse(jsonText);
         if (doc.RootElement.ValueKind != JsonValueKind.Object)
         {
             throw new InvalidOperationException(
-                "ParseResponse expected a JSON object payload.");
+                "Structured response parsing expected a JSON object payload.");
         }
 
         if (!string.IsNullOrWhiteSpace(typeName) && dataTypes is not null)
@@ -71,7 +71,7 @@ public sealed class TaskStructuredResponseParser
             if (!element.TryGetProperty(property.Name, out var propertyElement))
             {
                 throw new InvalidOperationException(
-                    $"ParseResponse<{dataType.Name}> missing property '{property.Name}'.");
+                    $"Structured response '{dataType.Name}' missing property '{property.Name}'.");
             }
 
             if (property.IsCollection)

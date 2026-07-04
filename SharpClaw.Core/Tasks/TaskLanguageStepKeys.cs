@@ -27,8 +27,6 @@ public static class TaskLanguageStepKeys
     public const string WaitUntilStopped = "core.wait_until_stopped";
     /// <summary>Appends a task log entry.</summary>
     public const string Log = "core.log";
-    /// <summary>Parses a structured response through the task host bridge.</summary>
-    public const string ParseResponse = "core.parse_response";
 
     /// <summary>
     /// Returns true when the step is implemented by the Core task language

@@ -4,8 +4,7 @@ namespace SharpClaw.Contracts.Tasks;
 /// Read-only facade over the set of <see cref="ITaskTriggerSource"/>
 /// implementations registered with the host. Introduced by the trigger
 /// extraction plan so that <c>TaskTriggerRegistrar</c> can resolve a source
-/// by its trigger key and delegate binding-value derivation to it instead
-/// of switching on well-known core key strings.
+/// by its module-owned trigger key and delegate binding-value derivation to it.
 /// </summary>
 public interface ITaskTriggerSourceRegistry
 {

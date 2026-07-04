@@ -1176,7 +1176,7 @@ public sealed class TaskScriptParser
                 return apiStep with { ResultVariable = variableName };
         }
 
-        // Non-awaited context API call: var x = FindModel(...), var x = Chat(...)
+        // Non-awaited descriptor-backed module call: var x = ModuleCall(...)
         if (initializer is InvocationExpressionSyntax directInvocation)
         {
             var apiStep = TryParseContextApiCall(directInvocation, line, column);
@@ -1244,7 +1244,7 @@ public sealed class TaskScriptParser
                 };
             }
 
-            // Non-awaited context API call: ChatToThread(...), CreateAgent(...), etc.
+            // Non-awaited descriptor-backed module call: ModuleCall(...), etc.
             var apiStep = TryParseContextApiCall(invocation, line, column);
             if (apiStep is not null)
                 return apiStep;
@@ -1348,7 +1348,7 @@ public sealed class TaskScriptParser
         return null;
     }
 
-    // ── Context API call recognition ──────────────────────────────
+    // -- Descriptor-backed module call recognition -----------------------------
 
     private static TaskStepDefinition? TryParseContextApiCall(
         InvocationExpressionSyntax invocation,

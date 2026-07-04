@@ -242,7 +242,11 @@ public sealed class TaskPlanExecutionEngine
 
         var executor = _stepExtensions.FirstOrDefault(e => e.CanExecute(stepKey));
         if (executor is null)
-            return TaskStepExecutionResult.Continue;
+        {
+            throw new InvalidOperationException(
+                $"No task step executor is registered for step key '{stepKey}' at line {step.Line}, column {step.Column}. " +
+                "The module or operation that owns this task step is missing or was not loaded.");
+        }
 
         var moduleContext = new TaskStepContextAdapter(context, this, host);
         var stepTiming = Stopwatch.StartNew();

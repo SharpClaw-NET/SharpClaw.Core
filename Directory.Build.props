@@ -3,10 +3,10 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <Version>0.1.100-alpha</Version>
-    <AssemblyVersion>0.1.100.0</AssemblyVersion>
-    <FileVersion>0.1.100.0</FileVersion>
-    <InformationalVersion>0.1.100-alpha</InformationalVersion>
+    <Version>0.1.101-alpha</Version>
+    <AssemblyVersion>0.1.101.0</AssemblyVersion>
+    <FileVersion>0.1.101.0</FileVersion>
+    <InformationalVersion>0.1.101-alpha</InformationalVersion>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
   </PropertyGroup>
 </Project>

@@ -9,12 +9,12 @@ public sealed record TaskStepDescriptor
 {
     /// <summary>
     /// The script method name as it appears in a task script body for
-    /// descriptor-backed module operations (e.g. <c>Chat</c>, <c>EditTask</c>).
+    /// descriptor-backed module operations.
     /// </summary>
     public string? MethodName { get; init; }
 
     /// <summary>
-    /// Stable wire-style step key (e.g. <c>core.chat</c>).
+    /// Stable wire-style step key owned by the registering module.
     /// </summary>
     public required string StepKey { get; init; }
 
@@ -40,7 +40,7 @@ public sealed record TaskStepDescriptor
 
     /// <summary>
     /// <see langword="true"/> when the method uses a generic type argument
-    /// that should be captured as <c>TypeName</c> (e.g. <c>ParseResponse&lt;T&gt;</c>).
+    /// that should be captured as <c>TypeName</c>.
     /// </summary>
     public bool CapturesGenericType { get; init; }
 

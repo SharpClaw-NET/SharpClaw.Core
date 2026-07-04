@@ -5,8 +5,8 @@ namespace SharpClaw.Contracts.Tasks;
 /// <c>StepKey</c> is owned by this module. Registered at startup via
 /// <c>TaskScriptParser.RegisterModule</c> and injected into the
 /// orchestrator as <c>IEnumerable&lt;ITaskStepExecutorExtension&gt;</c>.
-/// The orchestrator routes any step whose key is not a well-known core key
-/// to the extension that claims it via <see cref="CanExecute"/>.
+/// The orchestrator executes intrinsic language keys directly and routes
+/// all other step keys to the extension that claims them via <see cref="CanExecute"/>.
 /// </summary>
 public interface ITaskStepExecutorExtension
 {

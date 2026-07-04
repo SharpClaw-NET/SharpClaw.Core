@@ -166,7 +166,7 @@ public sealed class TaskStepRegistry
 
     /// <summary>
     /// Returns <see langword="true"/> when <paramref name="methodName"/> is
-    /// registered as a core or module method.
+    /// registered as a descriptor-backed module method.
     /// </summary>
     public bool IsRegisteredMethod(string methodName)
     {
