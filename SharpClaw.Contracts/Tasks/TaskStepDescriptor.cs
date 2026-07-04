@@ -45,6 +45,13 @@ public sealed record TaskStepDescriptor
     public bool CapturesGenericType { get; init; }
 
     /// <summary>
+    /// <see langword="true"/> when the captured generic type must name a
+    /// data type declared inside the task script. This is an opt-in module
+    /// contract for operations that consume task-defined structured schemas.
+    /// </summary>
+    public bool RequiresDeclaredGenericType { get; init; }
+
+    /// <summary>
     /// When set, the index of the argument that becomes <c>Expression</c>
     /// (overrides <see cref="FirstArgIsExpression"/> when non-zero).
     /// </summary>

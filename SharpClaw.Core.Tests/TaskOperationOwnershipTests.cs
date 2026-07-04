@@ -1,4 +1,3 @@
-using System.Reflection;
 using Microsoft.Extensions.DependencyInjection;
 using SharpClaw.Contracts.Enums;
 using SharpClaw.Contracts.Tasks;
@@ -8,6 +7,7 @@ using SharpClaw.Core.Tasks.Models;
 using SharpClaw.Core.Tasks.Parsing;
 using SharpClaw.Core.Tasks.Registry;
 using SharpClaw.Core.Tasks.Runtime;
+using SharpClaw.Core.Tasks.Validation;
 
 namespace SharpClaw.Core.Tests;
 
@@ -77,19 +77,9 @@ public sealed class TaskOperationOwnershipTests
     }
 
     [Fact]
-    public void Parse_response_is_not_a_core_intrinsic_language_key()
+    public void Module_operation_key_is_not_a_core_intrinsic_language_key()
     {
-        var parseResponseField = typeof(TaskLanguageStepKeys)
-            .GetField("ParseResponse", BindingFlags.Public | BindingFlags.Static);
-        var intrinsicKeys = typeof(TaskLanguageStepKeys)
-            .GetFields(BindingFlags.Public | BindingFlags.Static)
-            .Where(field => field.IsLiteral)
-            .Select(field => field.GetRawConstantValue())
-            .OfType<string>();
-
-        Assert.Null(parseResponseField);
-        Assert.DoesNotContain("core.parse_response", intrinsicKeys);
-        Assert.False(TaskLanguageStepKeys.IsIntrinsic("core.parse_response"));
+        Assert.False(TaskLanguageStepKeys.IsIntrinsic("module.schema_read"));
     }
 
     [Fact]
@@ -141,16 +131,108 @@ public sealed class TaskOperationOwnershipTests
     }
 
     [Fact]
-    public void Parse_response_can_only_arrive_from_a_module_descriptor()
+    public void Module_descriptor_requiring_declared_generic_type_fails_unknown_type()
     {
         TaskStepRegistry.Default.Reset();
         try
         {
             TaskStepRegistry.Default.Register(new TaskStepDescriptor
             {
-                MethodName = "ParseResponse",
-                StepKey = "core.parse_response",
-                OwnerId = "AgentOrchestration",
+                MethodName = "ReadSchema",
+                StepKey = "module.schema_read",
+                OwnerId = "SchemaModule",
+                FirstArgIsExpression = true,
+                CapturesGenericType = true,
+                RequiresDeclaredGenericType = true
+            });
+
+            var result = TaskScriptParser.Parse("""
+                using System.Threading;
+                using System.Threading.Tasks;
+
+                [Task("schema-read")]
+                public sealed class SchemaReadTask
+                {
+                    public async Task RunAsync(CancellationToken ct)
+                    {
+                        var parsed = await ReadSchema<MissingSchema>(raw);
+                    }
+                }
+                """);
+
+            Assert.True(result.Success, string.Join(Environment.NewLine, result.Diagnostics));
+            var validation = TaskScriptValidator.Validate(result.Definition!);
+
+            var diagnostic = Assert.Single(validation.Diagnostics);
+            Assert.False(validation.IsValid);
+            Assert.Equal("TASK108", diagnostic.Code);
+            Assert.Contains("module.schema_read", diagnostic.Message);
+            Assert.Contains("MissingSchema", diagnostic.Message);
+        }
+        finally
+        {
+            TaskStepRegistry.Default.Reset();
+        }
+    }
+
+    [Fact]
+    public void Module_descriptor_requiring_declared_generic_type_passes_declared_type()
+    {
+        TaskStepRegistry.Default.Reset();
+        try
+        {
+            TaskStepRegistry.Default.Register(new TaskStepDescriptor
+            {
+                MethodName = "ReadSchema",
+                StepKey = "module.schema_read",
+                OwnerId = "SchemaModule",
+                FirstArgIsExpression = true,
+                CapturesGenericType = true,
+                RequiresDeclaredGenericType = true
+            });
+
+            var result = TaskScriptParser.Parse("""
+                using System.Threading;
+                using System.Threading.Tasks;
+
+                [Task("schema-read")]
+                public sealed class SchemaReadTask
+                {
+                    public async Task RunAsync(CancellationToken ct)
+                    {
+                        var parsed = await ReadSchema<KnownSchema>(raw);
+                    }
+
+                    public sealed class KnownSchema
+                    {
+                        public string Value { get; set; }
+                    }
+                }
+                """);
+
+            Assert.True(result.Success, string.Join(Environment.NewLine, result.Diagnostics));
+            var validation = TaskScriptValidator.Validate(result.Definition!);
+
+            Assert.True(validation.IsValid, string.Join(Environment.NewLine, validation.Diagnostics));
+            Assert.DoesNotContain(validation.Diagnostics, diagnostic => diagnostic.Code == "TASK108");
+        }
+        finally
+        {
+            TaskStepRegistry.Default.Reset();
+        }
+    }
+
+    [Fact]
+    public void Generic_module_descriptor_without_declared_type_requirement_does_not_emit_task108()
+    {
+        TaskStepRegistry.Default.Reset();
+        try
+        {
+            TaskStepRegistry.Default.Register(new TaskStepDescriptor
+            {
+                MethodName = "LooseGeneric",
+                StepKey = "module.loose_generic",
+                OwnerId = "LooseModule",
                 FirstArgIsExpression = true,
                 CapturesGenericType = true
             });
@@ -159,28 +241,25 @@ public sealed class TaskOperationOwnershipTests
                 using System.Threading;
                 using System.Threading.Tasks;
 
-                [Task("parse-response")]
-                public sealed class ParseResponseTask
+                [Task("loose-generic")]
+                public sealed class LooseGenericTask
                 {
                     public async Task RunAsync(CancellationToken ct)
                     {
-                        var parsed = await ParseResponse<Result>(raw);
-                    }
-
-                    public sealed class Result
-                    {
-                        public string Value { get; set; }
+                        var parsed = await LooseGeneric<ExternalRuntimeType>(raw);
                     }
                 }
                 """);
 
             Assert.True(result.Success, string.Join(Environment.NewLine, result.Diagnostics));
             var step = Assert.Single(result.Definition!.Steps);
-            Assert.Equal("core.parse_response", step.StepKey);
-            Assert.Equal("AgentOrchestration", TaskStepRegistry.Default.FindByKey(step.StepKey)!.OwnerId);
-            Assert.Equal("Result", step.TypeName);
+            Assert.Equal("module.loose_generic", step.StepKey);
+            Assert.Equal("ExternalRuntimeType", step.TypeName);
             Assert.Equal("parsed", step.ResultVariable);
-            Assert.False(TaskLanguageStepKeys.IsIntrinsic(step.StepKey));
+
+            var validation = TaskScriptValidator.Validate(result.Definition!);
+            Assert.True(validation.IsValid, string.Join(Environment.NewLine, validation.Diagnostics));
+            Assert.DoesNotContain(validation.Diagnostics, diagnostic => diagnostic.Code == "TASK108");
         }
         finally
         {

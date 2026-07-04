@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using SharpClaw.Core.Tasks;
 using SharpClaw.Core.Tasks.Models;
 using SharpClaw.Core.Tasks.Parsing;
+using SharpClaw.Core.Tasks.Registry;
 using SharpClaw.Contracts.Tasks;
 
 namespace SharpClaw.Core.Tasks.Validation;
@@ -28,9 +29,11 @@ public sealed class TaskScriptValidator
 
         // Build set of known types: built-in scalar types + task-defined data types
         var knownTypes = new HashSet<string>(AllowedPrimitiveTypes, StringComparer.Ordinal);
+        var declaredDataTypes = new HashSet<string>(StringComparer.Ordinal);
         foreach (var dt in definition.DataTypes)
         {
             knownTypes.Add(dt.Name);
+            declaredDataTypes.Add(dt.Name);
         }
 
         // Validate parameters
@@ -73,7 +76,10 @@ public sealed class TaskScriptValidator
         }
 
         // Validate steps (recursive)
-        var context = new ValidationContext(knownTypes, new HashSet<string>(StringComparer.Ordinal));
+        var context = new ValidationContext(
+            knownTypes,
+            declaredDataTypes,
+            new HashSet<string>(StringComparer.Ordinal));
         foreach (var step in definition.Steps)
         {
             ValidateStep(step, context, diagnostics);
@@ -166,6 +172,8 @@ public sealed class TaskScriptValidator
             }
         }
 
+        ValidateDescriptorGenericType(step, context, diagnostics);
+
         // Validate nested bodies
         if (step.Body is not null)
         {
@@ -183,6 +191,43 @@ public sealed class TaskScriptValidator
             }
         }
     }
+
+    private static void ValidateDescriptorGenericType(
+        TaskStepDefinition step,
+        ValidationContext context,
+        List<TaskDiagnostic> diagnostics)
+    {
+        var descriptor = TaskStepRegistry.Default.FindByKey(step.StepKey);
+        if (descriptor?.RequiresDeclaredGenericType != true)
+            return;
+
+        if (string.IsNullOrWhiteSpace(step.TypeName))
+        {
+            diagnostics.Add(new TaskDiagnostic(
+                TaskDiagnosticSeverity.Error,
+                "TASK108",
+                $"Module operation '{step.StepKey}' requires a declared task data type generic argument.",
+                step.Line,
+                step.Column));
+            return;
+        }
+
+        var typeName = NormalizeTypeName(step.TypeName);
+        if (context.DeclaredDataTypes.Contains(typeName))
+            return;
+
+        diagnostics.Add(new TaskDiagnostic(
+            TaskDiagnosticSeverity.Error,
+            "TASK108",
+            $"Module operation '{step.StepKey}' references unknown task data type '{step.TypeName}'.",
+            step.Line,
+            step.Column));
+    }
+
+    private static string NormalizeTypeName(string typeName) =>
+        typeName.EndsWith("?", StringComparison.Ordinal)
+            ? typeName[..^1]
+            : typeName;
 
     private static void ValidateRequirements(
         TaskScriptDefinition definition,
@@ -345,11 +390,16 @@ public sealed class TaskScriptValidator
     private sealed class ValidationContext
     {
         public HashSet<string> KnownTypes { get; }
+        public HashSet<string> DeclaredDataTypes { get; }
         public HashSet<string> DeclaredVariables { get; }
 
-        public ValidationContext(HashSet<string> knownTypes, HashSet<string> declaredVariables)
+        public ValidationContext(
+            HashSet<string> knownTypes,
+            HashSet<string> declaredDataTypes,
+            HashSet<string> declaredVariables)
         {
             KnownTypes = knownTypes;
+            DeclaredDataTypes = declaredDataTypes;
             DeclaredVariables = declaredVariables;
         }
     }
