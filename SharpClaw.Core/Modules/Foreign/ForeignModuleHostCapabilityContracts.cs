@@ -135,7 +135,7 @@ public sealed record ForeignModuleTaskContextExecuteStatementsRequest
     public string ContextId { get; init; } = string.Empty;
     public Guid? ChannelId { get; init; }
     public IReadOnlyDictionary<string, JsonElement>? Variables { get; init; }
-    public IReadOnlyList<ForeignModuleTaskStatementInvocationDescriptor> Steps { get; init; } = [];
+    public IReadOnlyList<ForeignModuleTaskStatementInvocationDescriptor> Statements { get; init; } = [];
 }
 
 public sealed record ForeignModuleTaskContextExecuteEventHandlerRequest
