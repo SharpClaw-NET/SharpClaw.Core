@@ -1,5 +1,4 @@
 <Solution>
-  <Project Path="SharpClaw.Contracts/SharpClaw.Contracts.csproj" />
   <Project Path="SharpClaw.Core/SharpClaw.Core.csproj" />
   <Project Path="SharpClaw.Core.Tests/SharpClaw.Core.Tests.csproj" />
 </Solution>
