@@ -3,6 +3,7 @@ using SharpClaw.Contracts.DTOs.AgentActions;
 using SharpClaw.Contracts.DTOs.Providers;
 using SharpClaw.Contracts.Enums;
 using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Modules.Foreign;
 using SharpClaw.Contracts.Providers;
 using SharpClaw.Contracts.Tasks;
 

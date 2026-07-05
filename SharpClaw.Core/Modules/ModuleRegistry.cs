@@ -4,6 +4,7 @@ using SharpClaw.Core.Clients;
 using SharpClaw.Core.DefaultResources;
 using SharpClaw.Core.Modules.Foreign;
 using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Modules.Foreign;
 using SharpClaw.Contracts.Providers;
 
 namespace SharpClaw.Core.Modules;

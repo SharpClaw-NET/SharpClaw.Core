@@ -1,6 +1,6 @@
 using System.Text.Json;
 
-namespace SharpClaw.Core.Modules.Foreign;
+namespace SharpClaw.Contracts.Modules.Foreign;
 
 public sealed record ForeignModuleProtocolContractOperation(
     string Name,
