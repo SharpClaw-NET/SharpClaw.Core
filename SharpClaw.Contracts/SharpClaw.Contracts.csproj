@@ -3,14 +3,14 @@
   <PropertyGroup>
     <IsPackable>true</IsPackable>
     <PackageId>SharpClaw.Contracts</PackageId>
-    <Version>0.3.16</Version>
-    <AssemblyVersion>0.3.16.0</AssemblyVersion>
-    <FileVersion>0.3.16.0</FileVersion>
-    <InformationalVersion>0.3.16</InformationalVersion>
+    <Version>0.3.15</Version>
+    <AssemblyVersion>0.3.15.0</AssemblyVersion>
+    <FileVersion>0.3.15.0</FileVersion>
+    <InformationalVersion>0.3.15</InformationalVersion>
     <Authors>mkn8rn</Authors>
     <Description>Contracts and interfaces for building SharpClaw core and runtime modules. Provides ISharpClawCoreModule, ISharpClawRuntimeModule, DTOs, and shared abstractions.</Description>
     <PackageTags>sharpclaw;modules;contracts;sdk</PackageTags>
-    <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <RepositoryUrl>https://github.com/mkn8rn/SharpClaw.Core</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageProjectUrl>https://github.com/mkn8rn/SharpClaw.Core</PackageProjectUrl>
@@ -19,6 +19,7 @@
 
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="LICENSE" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>
