@@ -7,8 +7,8 @@
     <PackageTags>sharpclaw;core;pipeline;modules;agents</PackageTags>
     <PackageLicenseFile>LICENSE.md</PackageLicenseFile>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageProjectUrl>https://github.com/mkn8rn/SharpClaw.Core</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/mkn8rn/SharpClaw.Core</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/SharpClaw-NET/SharpClaw.Core</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/SharpClaw-NET/SharpClaw.Core</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
