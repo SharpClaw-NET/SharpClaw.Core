@@ -1,8 +1,9 @@
-using SharpClaw.Contracts.DTOs.AgentActions;
-using SharpClaw.Contracts.Entities.Core.Jobs;
-
 namespace SharpClaw.Core.Jobs;
 
+/// <summary>
+/// Store-neutral orchestration for job administration state transitions.
+/// Query projection and diagnostic retrieval belong to the host.
+/// </summary>
 public sealed class AgentJobAdministrationWorkflowEngine(
     AgentJobAdministrationEngine jobs,
     AgentJobLifecycleEngine lifecycle)
@@ -10,92 +11,6 @@ public sealed class AgentJobAdministrationWorkflowEngine(
     public AgentJobAdministrationWorkflowEngine()
         : this(new AgentJobAdministrationEngine(), new AgentJobLifecycleEngine())
     {
-    }
-
-    public async Task<AgentJobResponse?> GetAsync(
-        Guid jobId,
-        IAgentJobAdministrationHost host,
-        CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(host);
-
-        var job = await host.LoadJobAsync(jobId, ct);
-        return job is null ? null : await BuildResponseAsync(job, host, ct);
-    }
-
-    public async Task<AgentJobSummaryResponse?> GetSummaryAsync(
-        Guid jobId,
-        IAgentJobAdministrationHost host,
-        CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(host);
-
-        var job = await host.LoadJobAsync(jobId, ct);
-        return job is null ? null : jobs.ToSummaryResponse(job);
-    }
-
-    public async Task<IReadOnlyList<AgentJobResponse>> ListAsync(
-        Guid channelId,
-        IAgentJobAdministrationHost host,
-        CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(host);
-
-        var loaded = await host.ListJobsForChannelAsync(channelId, ct);
-        return await BuildResponsesAsync(jobs.OrderMostRecent(loaded), host, ct);
-    }
-
-    public async Task<IReadOnlyList<AgentJobSummaryResponse>> ListSummariesAsync(
-        Guid channelId,
-        IAgentJobAdministrationHost host,
-        CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(host);
-
-        var loaded = await host.ListJobsForChannelAsync(channelId, ct);
-        return jobs
-            .OrderMostRecent(loaded)
-            .Select(jobs.ToSummaryResponse)
-            .ToList();
-    }
-
-    public async Task<IReadOnlyList<AgentJobResponse>> ListByActionPrefixAsync(
-        string actionKeyPrefix,
-        Guid? resourceId,
-        IAgentJobAdministrationHost host,
-        CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(actionKeyPrefix);
-        ArgumentNullException.ThrowIfNull(host);
-
-        var loaded = await host.ListJobsByActionPrefixAsync(
-            actionKeyPrefix,
-            resourceId,
-            ct);
-        return await BuildResponsesAsync(
-            jobs.OrderMostRecent(FilterByActionPrefix(loaded, actionKeyPrefix, resourceId)),
-            host,
-            ct);
-    }
-
-    public async Task<IReadOnlyList<AgentJobSummaryResponse>>
-        ListSummariesByActionPrefixAsync(
-            string actionKeyPrefix,
-            Guid? resourceId,
-            IAgentJobAdministrationHost host,
-            CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(actionKeyPrefix);
-        ArgumentNullException.ThrowIfNull(host);
-
-        var loaded = await host.ListJobsByActionPrefixAsync(
-            actionKeyPrefix,
-            resourceId,
-            ct);
-        return jobs
-            .OrderMostRecent(FilterByActionPrefix(loaded, actionKeyPrefix, resourceId))
-            .Select(jobs.ToSummaryResponse)
-            .ToList();
     }
 
     public async Task<bool> JobExistsWithActionPrefixAsync(
@@ -111,78 +26,52 @@ public sealed class AgentJobAdministrationWorkflowEngine(
         return jobs.JobMatchesActionPrefix(job, actionKeyPrefix);
     }
 
-    public async Task<AgentJobResponse?> CancelAsync(
+    public Task<AgentJobState?> CancelAsync(
         Guid jobId,
         IAgentJobAdministrationHost host,
         CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(host);
-
-        var job = await host.LoadJobAsync(jobId, ct);
-        if (job is null)
-            return null;
-
-        await ApplySaveAndRespondAsync(
-            job,
-            lifecycle.Cancel(job.Status, DateTimeOffset.UtcNow),
+        => ApplyAsync(
+            jobId,
+            static (job, engine) => engine.Cancel(
+                job.Status,
+                DateTimeOffset.UtcNow),
             host,
             ct);
-        return await BuildResponseAsync(job, host, ct);
-    }
 
-    public async Task<AgentJobResponse?> StopAsync(
+    public Task<AgentJobState?> StopAsync(
         Guid jobId,
         string? requiredActionPrefix,
         IAgentJobAdministrationHost host,
         CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(host);
-
-        var job = await host.LoadJobAsync(jobId, ct);
-        if (job is null)
-            return null;
-
-        await ApplySaveAndRespondAsync(
-            job,
-            lifecycle.Stop(
+        => ApplyAsync(
+            jobId,
+            (job, engine) => engine.Stop(
                 job.Status,
                 job.ActionKey,
                 requiredActionPrefix,
                 DateTimeOffset.UtcNow),
             host,
             ct);
-        return await BuildResponseAsync(job, host, ct);
-    }
 
-    public async Task<AgentJobResponse?> PauseAsync(
+    public Task<AgentJobState?> PauseAsync(
         Guid jobId,
         IAgentJobAdministrationHost host,
         CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(host);
+        => ApplyAsync(
+            jobId,
+            static (job, engine) => engine.Pause(job.Status),
+            host,
+            ct);
 
-        var job = await host.LoadJobAsync(jobId, ct);
-        if (job is null)
-            return null;
-
-        await ApplySaveAndRespondAsync(job, lifecycle.Pause(job.Status), host, ct);
-        return await BuildResponseAsync(job, host, ct);
-    }
-
-    public async Task<AgentJobResponse?> ResumeAsync(
+    public Task<AgentJobState?> ResumeAsync(
         Guid jobId,
         IAgentJobAdministrationHost host,
         CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(host);
-
-        var job = await host.LoadJobAsync(jobId, ct);
-        if (job is null)
-            return null;
-
-        await ApplySaveAndRespondAsync(job, lifecycle.Resume(job.Status), host, ct);
-        return await BuildResponseAsync(job, host, ct);
-    }
+        => ApplyAsync(
+            jobId,
+            static (job, engine) => engine.Resume(job.Status),
+            host,
+            ct);
 
     public async Task RecordTokensAsync(
         IReadOnlyList<Guid> jobIds,
@@ -209,101 +98,47 @@ public sealed class AgentJobAdministrationWorkflowEngine(
             return;
 
         jobs.ApplyTokenUsage(ordered, promptTokens, completionTokens);
-        await host.SaveAsync([], ct);
+        await host.PersistStatesAsync(ordered, ct);
     }
 
-    public async Task<AgentJobResponse> BuildResponseAsync(
-        AgentJobDB job,
+    private async Task<AgentJobState?> ApplyAsync(
+        Guid jobId,
+        Func<AgentJobState, AgentJobLifecycleEngine, AgentJobLifecycleDecision>
+            decide,
         IAgentJobAdministrationHost host,
-        CancellationToken ct = default)
+        CancellationToken ct)
     {
-        ArgumentNullException.ThrowIfNull(job);
+        ArgumentNullException.ThrowIfNull(decide);
         ArgumentNullException.ThrowIfNull(host);
 
-        var logs = await LoadLogResponsesAsync(job.Id, host, ct);
-        return jobs.ToResponse(job, logs);
-    }
+        var job = await host.LoadJobAsync(jobId, ct);
+        if (job is null)
+            return null;
 
-    private async Task<IReadOnlyList<AgentJobResponse>> BuildResponsesAsync(
-        IReadOnlyList<AgentJobDB> loaded,
-        IAgentJobAdministrationHost host,
-        CancellationToken ct)
-    {
-        var responses = new List<AgentJobResponse>(loaded.Count);
-        foreach (var job in loaded)
-            responses.Add(await BuildResponseAsync(job, host, ct));
-
-        return responses;
-    }
-
-    private async Task<IReadOnlyList<AgentJobLogResponse>> LoadLogResponsesAsync(
-        Guid jobId,
-        IAgentJobAdministrationHost host,
-        CancellationToken ct)
-    {
-        if (host.TryGetCachedJobLogResponses(jobId, out var cached))
-            return cached ?? [];
-
-        var entries = await host.LoadJobLogEntriesAsync(jobId, ct);
-        var responses = jobs.ToLogResponses(entries);
-        host.CacheJobLogResponses(jobId, responses);
-        return responses;
-    }
-
-    private async Task ApplySaveAndRespondAsync(
-        AgentJobDB job,
-        AgentJobLifecycleDecision decision,
-        IAgentJobAdministrationHost host,
-        CancellationToken ct)
-    {
-        var logs = jobs.ApplyLifecycleDecision(job, decision);
-        await host.SaveAsync(logs, ct);
-    }
-
-    private static IReadOnlyList<AgentJobDB> FilterByActionPrefix(
-        IEnumerable<AgentJobDB> source,
-        string actionKeyPrefix,
-        Guid? resourceId)
-    {
-        return source
-            .Where(job => job.ActionKey?.StartsWith(
-                actionKeyPrefix,
-                StringComparison.OrdinalIgnoreCase) == true)
-            .Where(job => resourceId is null || job.ResourceId == resourceId)
-            .ToList();
+        var decision = decide(job, lifecycle);
+        jobs.ApplyLifecycleState(job, decision);
+        await host.PersistDecisionAsync(job, decision, ct);
+        return job;
     }
 }
 
+/// <summary>
+/// Host persistence port for compact job state and ordered lifecycle events.
+/// </summary>
 public interface IAgentJobAdministrationHost
 {
-    Task<AgentJobDB?> LoadJobAsync(Guid jobId, CancellationToken ct);
+    Task<AgentJobState?> LoadJobAsync(Guid jobId, CancellationToken ct);
 
-    Task<IReadOnlyList<AgentJobDB>> LoadJobsByIdsAsync(
+    Task<IReadOnlyList<AgentJobState>> LoadJobsByIdsAsync(
         IReadOnlyList<Guid> jobIds,
         CancellationToken ct);
 
-    Task<IReadOnlyList<AgentJobDB>> ListJobsForChannelAsync(
-        Guid channelId,
+    Task PersistDecisionAsync(
+        AgentJobState job,
+        AgentJobLifecycleDecision decision,
         CancellationToken ct);
 
-    Task<IReadOnlyList<AgentJobDB>> ListJobsByActionPrefixAsync(
-        string actionKeyPrefix,
-        Guid? resourceId,
-        CancellationToken ct);
-
-    bool TryGetCachedJobLogResponses(
-        Guid jobId,
-        out IReadOnlyList<AgentJobLogResponse>? logs);
-
-    Task<IReadOnlyList<AgentJobLogEntryDB>> LoadJobLogEntriesAsync(
-        Guid jobId,
-        CancellationToken ct);
-
-    void CacheJobLogResponses(
-        Guid jobId,
-        IReadOnlyList<AgentJobLogResponse> logs);
-
-    Task SaveAsync(
-        IReadOnlyList<AgentJobLogEntryDB> logs,
+    Task PersistStatesAsync(
+        IReadOnlyList<AgentJobState> jobs,
         CancellationToken ct);
 }

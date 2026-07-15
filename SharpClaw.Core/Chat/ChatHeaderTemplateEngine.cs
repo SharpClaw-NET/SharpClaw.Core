@@ -1,12 +1,9 @@
+using SharpClaw.Core.State;
 using System.Collections.Concurrent;
 using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
 using SharpClaw.Contracts.Attributes;
-using SharpClaw.Contracts.Entities;
-using SharpClaw.Contracts.Entities.Core;
-using SharpClaw.Contracts.Entities.Core.Clearance;
-using SharpClaw.Contracts.Entities.Core.Context;
 using SharpClaw.Contracts.Modules;
 using SharpClaw.Contracts.Providers;
 using SharpClaw.Core.Clients;
@@ -174,7 +171,7 @@ public sealed partial class ChatHeaderTemplateEngine(
         return grants.Count > 0 ? string.Join(", ", grants) : "(none)";
     }
 
-    private string FormatGrants(PermissionSetDB? ps)
+    private string FormatGrants(PermissionSetState? ps)
     {
         if (ps is null)
             return "(none)";
@@ -301,13 +298,13 @@ public sealed partial class ChatHeaderTemplateEngine(
 /// Store-neutral facts used while expanding a chat header template.
 /// </summary>
 public sealed record ChatHeaderExpansionContext(
-    ChannelDB Channel,
-    AgentDB Agent,
+    ChannelState Channel,
+    AgentState Agent,
     string ClientType,
-    UserDB? User,
-    PermissionSetDB? UserPs,
-    RoleDB? AgentRole,
-    PermissionSetDB? AgentPs,
+    UserState? User,
+    PermissionSetState? UserPs,
+    RoleState? AgentRole,
+    PermissionSetState? AgentPs,
     CompletionParameters? CompletionParameters = null,
     string ProviderKey = "");
 
@@ -326,7 +323,7 @@ public interface IChatHeaderResourceTagResolver
     /// <summary>
     /// Loads entities for a resource tag, or returns null when the tag is unknown.
     /// </summary>
-    Task<IReadOnlyList<BaseEntity>?> LoadEntitiesAsync(
+    Task<IReadOnlyList<DomainState>?> LoadEntitiesAsync(
         string tagName,
         CancellationToken ct);
 }

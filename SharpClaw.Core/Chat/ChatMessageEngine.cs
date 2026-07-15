@@ -1,7 +1,6 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.Chat;
 using SharpClaw.Contracts.DTOs.Chat;
-using SharpClaw.Contracts.Entities.Core;
-using SharpClaw.Contracts.Entities.Core.Messages;
 using SharpClaw.Contracts.Enums;
 
 namespace SharpClaw.Core.Chat;
@@ -13,7 +12,7 @@ namespace SharpClaw.Core.Chat;
 public sealed class ChatMessageEngine
 {
     /// <summary>Creates the user message persisted before provider inference.</summary>
-    public ChatMessageDB CreateUserMessage(
+    public ChatMessageState CreateUserMessage(
         Guid channelId,
         Guid? threadId,
         ChatRequest request,
@@ -24,7 +23,7 @@ public sealed class ChatMessageEngine
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        return new ChatMessageDB
+        return new ChatMessageState
         {
             Role = ChatRoles.User,
             Origin = MessageOrigin.User,
@@ -40,11 +39,11 @@ public sealed class ChatMessageEngine
     }
 
     /// <summary>Creates an assistant message from a completed provider result.</summary>
-    public ChatMessageDB CreateAssistantMessage(
+    public ChatMessageState CreateAssistantMessage(
         Guid channelId,
         Guid? threadId,
         ChatRequest request,
-        AgentDB agent,
+        AgentState agent,
         string content,
         int? promptTokens,
         int? completionTokens,
@@ -53,7 +52,7 @@ public sealed class ChatMessageEngine
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(agent);
 
-        return new ChatMessageDB
+        return new ChatMessageState
         {
             Role = ChatRoles.Assistant,
             Origin = MessageOrigin.Assistant,
@@ -72,7 +71,7 @@ public sealed class ChatMessageEngine
     }
 
     /// <summary>Creates the visible system error message for failed chat sends.</summary>
-    public ChatMessageDB CreateSystemErrorMessage(
+    public ChatMessageState CreateSystemErrorMessage(
         Guid channelId,
         Guid? threadId,
         ChatRequest request,
@@ -80,7 +79,7 @@ public sealed class ChatMessageEngine
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        return new ChatMessageDB
+        return new ChatMessageState
         {
             Role = ChatRoles.System,
             Origin = MessageOrigin.System,
@@ -92,7 +91,7 @@ public sealed class ChatMessageEngine
     }
 
     /// <summary>Projects a persisted chat message into the public response shape.</summary>
-    public ChatMessageResponse ToResponse(ChatMessageDB message)
+    public ChatMessageResponse ToResponse(ChatMessageState message)
     {
         ArgumentNullException.ThrowIfNull(message);
 
@@ -109,7 +108,7 @@ public sealed class ChatMessageEngine
 
     /// <summary>Applies the stable history ordering used by SharpClaw clients.</summary>
     public IReadOnlyList<ChatMessageResponse> ToOrderedHistoryResponses(
-        IEnumerable<ChatMessageDB> messages)
+        IEnumerable<ChatMessageState> messages)
     {
         ArgumentNullException.ThrowIfNull(messages);
 

@@ -1,5 +1,5 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.DTOs.Tools;
-using SharpClaw.Contracts.Entities.Core;
 
 namespace SharpClaw.Core.Tools;
 
@@ -9,11 +9,11 @@ namespace SharpClaw.Core.Tools;
 public sealed class ToolAwarenessSetEngine
 {
     /// <summary>Creates a tool-awareness set entity from a request.</summary>
-    public ToolAwarenessSetDB Create(CreateToolAwarenessSetRequest request)
+    public ToolAwarenessSetState Create(CreateToolAwarenessSetRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        return new ToolAwarenessSetDB
+        return new ToolAwarenessSetState
         {
             Name = request.Name,
             Tools = request.Tools ?? []
@@ -22,7 +22,7 @@ public sealed class ToolAwarenessSetEngine
 
     /// <summary>Applies an update request to a loaded tool-awareness set.</summary>
     public void ApplyUpdate(
-        ToolAwarenessSetDB entity,
+        ToolAwarenessSetState entity,
         UpdateToolAwarenessSetRequest request)
     {
         ArgumentNullException.ThrowIfNull(entity);
@@ -36,7 +36,7 @@ public sealed class ToolAwarenessSetEngine
     }
 
     /// <summary>Projects a loaded entity to its response shape.</summary>
-    public ToolAwarenessSetResponse ToResponse(ToolAwarenessSetDB entity)
+    public ToolAwarenessSetResponse ToResponse(ToolAwarenessSetState entity)
     {
         ArgumentNullException.ThrowIfNull(entity);
 

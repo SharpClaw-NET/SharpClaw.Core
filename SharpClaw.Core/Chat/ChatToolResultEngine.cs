@@ -84,7 +84,7 @@ public sealed class ChatToolResultEngine
         var resultContent =
             $"status={job.Status}" +
             (textResult is not null ? $" result={textResult}" : "") +
-            (job.ErrorLog is not null ? $" error={job.ErrorLog}" : "");
+            (job.ErrorMessage is not null ? $" error={job.ErrorMessage}" : "");
 
         if (imageBase64 is not null && supportsVision)
         {

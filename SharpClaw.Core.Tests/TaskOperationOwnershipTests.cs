@@ -41,6 +41,9 @@ public sealed class TaskOperationOwnershipTests
         Assert.Equal(TaskInstanceStatus.Completed, outcome.Status);
         Assert.Null(outcome.Error);
         Assert.Contains(host.Logs, log => log.Message == "core log");
+        Assert.True(
+            host.Events.IndexOf("log:Task Completed.")
+            < host.Events.IndexOf("status:Completed"));
     }
 
     [Fact]
@@ -74,6 +77,9 @@ public sealed class TaskOperationOwnershipTests
         Assert.Contains("module or operation", error, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("missing or was not loaded", error);
         Assert.Equal(error, host.Failure);
+        Assert.True(
+            host.Events.FindIndex(entry => entry.StartsWith("log:Task Failed:"))
+            < host.Events.IndexOf("status:Failed"));
     }
 
     [Fact]
@@ -292,6 +298,7 @@ public sealed class TaskOperationOwnershipTests
     private sealed class TestExecutionHost : ITaskPlanExecutionHost
     {
         public List<(string Message, string Level)> Logs { get; } = [];
+        public List<string> Events { get; } = [];
         public string? Failure { get; private set; }
 
         public Task<Guid?> LoadInitialChannelIdAsync(
@@ -306,10 +313,9 @@ public sealed class TaskOperationOwnershipTests
             CancellationToken ct) =>
             Task.CompletedTask;
 
-        public Task PersistSharedDataSnapshotAsync(
+        public Task PersistSharedDataChangeAsync(
             Guid instanceId,
-            string? lightSnapshot,
-            string? bigSnapshotJson,
+            TaskSharedDataChange change,
             CancellationToken ct) =>
             Task.CompletedTask;
 
@@ -320,14 +326,18 @@ public sealed class TaskOperationOwnershipTests
             CancellationToken ct)
         {
             Logs.Add((message, level));
+            Events.Add($"log:{message}");
             return Task.CompletedTask;
         }
 
         public Task MarkTerminalStatusAsync(
             Guid instanceId,
             TaskInstanceStatus status,
-            CancellationToken ct) =>
-            Task.CompletedTask;
+            CancellationToken ct)
+        {
+            Events.Add($"status:{status}");
+            return Task.CompletedTask;
+        }
 
         public Task MarkFailedAsync(
             Guid instanceId,
@@ -335,6 +345,7 @@ public sealed class TaskOperationOwnershipTests
             CancellationToken ct)
         {
             Failure = error;
+            Events.Add("status:Failed");
             return Task.CompletedTask;
         }
     }

@@ -4,7 +4,6 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using SharpClaw.Contracts.DTOs.Tasks;
-using SharpClaw.Contracts.Entities.Core.Jobs;
 using SharpClaw.Contracts.Enums;
 using SharpClaw.Contracts.Tasks;
 using SharpClaw.Core.Tasks.Compilation;
@@ -79,15 +78,15 @@ public sealed class TaskPlanExecutionEngine
                 request.CancellationToken,
                 throwOnUnsupportedInvocation: false);
 
-            await request.Host.MarkTerminalStatusAsync(
-                request.InstanceId,
-                TaskInstanceStatus.Completed,
-                request.CancellationToken);
             await EmitRuntimeEventPlanAsync(
                 request.InstanceId,
                 _runtimeLifecycle.BuildTerminalPlan(TaskInstanceStatus.Completed),
                 request.Host,
                 request.Runtime,
+                request.CancellationToken);
+            await request.Host.MarkTerminalStatusAsync(
+                request.InstanceId,
+                TaskInstanceStatus.Completed,
                 request.CancellationToken);
 
             executionTiming.Stop();
@@ -102,15 +101,15 @@ public sealed class TaskPlanExecutionEngine
         }
         catch (OperationCanceledException)
         {
-            await request.Host.MarkTerminalStatusAsync(
-                request.InstanceId,
-                TaskInstanceStatus.Cancelled,
-                CancellationToken.None);
             await EmitRuntimeEventPlanAsync(
                 request.InstanceId,
                 _runtimeLifecycle.BuildTerminalPlan(TaskInstanceStatus.Cancelled),
                 request.Host,
                 request.Runtime,
+                CancellationToken.None);
+            await request.Host.MarkTerminalStatusAsync(
+                request.InstanceId,
+                TaskInstanceStatus.Cancelled,
                 CancellationToken.None);
 
             executionTiming.Stop();
@@ -125,15 +124,15 @@ public sealed class TaskPlanExecutionEngine
         }
         catch (Exception ex)
         {
-            await request.Host.MarkFailedAsync(
-                request.InstanceId,
-                ex.Message,
-                CancellationToken.None);
             await EmitRuntimeEventPlanAsync(
                 request.InstanceId,
                 _runtimeLifecycle.BuildFailurePlan(ex.Message),
                 request.Host,
                 request.Runtime,
+                CancellationToken.None);
+            await request.Host.MarkFailedAsync(
+                request.InstanceId,
+                ex.Message,
                 CancellationToken.None);
 
             executionTiming.Stop();
@@ -168,19 +167,16 @@ public sealed class TaskPlanExecutionEngine
         store.RegisterBuiltInTools();
         store.OnAgentOutput = async data =>
             await EmitOutputAsync(context, request.Host, data, context.CancellationToken);
-        store.OnSharedDataChanged = async (
-            description,
-            lightSnapshot,
-            bigSnapshotJson) =>
+        store.OnSharedDataChanged = async change =>
         {
-            await request.Host.PersistSharedDataSnapshotAsync(
+            await request.Host.PersistSharedDataChangeAsync(
                 request.InstanceId,
-                lightSnapshot,
-                bigSnapshotJson,
+                change,
                 context.CancellationToken);
             await EmitRuntimeEventPlanAsync(
                 request.InstanceId,
-                _runtimeLifecycle.BuildSharedDataChangedPlan(description),
+                _runtimeLifecycle.BuildSharedDataChangedPlan(
+                    change.Description),
                 request.Host,
                 request.Runtime,
                 context.CancellationToken);
@@ -796,12 +792,11 @@ public interface ITaskPlanExecutionHost
         CancellationToken ct);
 
     /// <summary>
-    /// Persists the current shared-data snapshots for an instance.
+    /// Persists one shared-data mutation for an instance.
     /// </summary>
-    Task PersistSharedDataSnapshotAsync(
+    Task PersistSharedDataChangeAsync(
         Guid instanceId,
-        string? lightSnapshot,
-        string? bigSnapshotJson,
+        TaskSharedDataChange change,
         CancellationToken ct);
 
     /// <summary>

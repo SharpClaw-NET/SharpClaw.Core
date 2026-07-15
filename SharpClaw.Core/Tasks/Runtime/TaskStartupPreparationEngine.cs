@@ -1,6 +1,6 @@
 using System.Text.Json;
-using SharpClaw.Contracts.Entities.Core.Tasks;
 using SharpClaw.Contracts.Enums;
+using SharpClaw.Core.Tasks.Administration;
 using SharpClaw.Core.Tasks.Compilation;
 
 namespace SharpClaw.Core.Tasks.Runtime;
@@ -14,11 +14,11 @@ namespace SharpClaw.Core.Tasks.Runtime;
 public sealed class TaskStartupPreparationEngine
 {
     public TaskStartupPreparation Prepare(
-        TaskInstanceDB instance,
-        TaskDefinitionDB definition)
+        TaskInstanceState instance,
+        string sourceText)
     {
         ArgumentNullException.ThrowIfNull(instance);
-        ArgumentNullException.ThrowIfNull(definition);
+        ArgumentException.ThrowIfNullOrWhiteSpace(sourceText);
 
         if (instance.Status != TaskInstanceStatus.Queued)
         {
@@ -34,7 +34,7 @@ public sealed class TaskStartupPreparationEngine
         }
 
         var compilation = TaskScriptEngine.ProcessScript(
-            definition.SourceText,
+            sourceText,
             parameterValues);
 
         if (compilation.Plan is null)

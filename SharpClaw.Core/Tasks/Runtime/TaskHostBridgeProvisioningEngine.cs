@@ -1,6 +1,4 @@
-using SharpClaw.Contracts.Entities.Core;
-using SharpClaw.Contracts.Entities.Core.Context;
-using SharpClaw.Contracts.Entities.Core.Tasks;
+using SharpClaw.Core.State;
 
 namespace SharpClaw.Core.Tasks.Runtime;
 
@@ -14,7 +12,7 @@ public sealed class TaskHostBridgeProvisioningEngine
     /// Creates a new task-scoped agent or updates the loaded matching agent.
     /// </summary>
     public AgentProvisioningResult ApplyAgentProvisioning(
-        AgentDB? existingAgent,
+        AgentState? existingAgent,
         string name,
         Guid modelId,
         string? systemPrompt,
@@ -23,7 +21,7 @@ public sealed class TaskHostBridgeProvisioningEngine
         if (existingAgent is null)
         {
             return new AgentProvisioningResult(
-                new AgentDB
+                new AgentState
                 {
                     Name = name,
                     ModelId = modelId,
@@ -44,7 +42,7 @@ public sealed class TaskHostBridgeProvisioningEngine
     /// exists by custom id or title.
     /// </summary>
     public void ApplyExistingChannelProvisioning(
-        ChannelDB channel,
+        ChannelState channel,
         string title,
         Guid agentId,
         string? customId,
@@ -65,7 +63,7 @@ public sealed class TaskHostBridgeProvisioningEngine
     /// <summary>
     /// Creates a task thread using the bridge's task-specific default name.
     /// </summary>
-    public ChatThreadDB CreateThread(
+    public ChatThreadState CreateThread(
         Guid channelId,
         string? threadName,
         DateTimeOffset now)
@@ -76,7 +74,7 @@ public sealed class TaskHostBridgeProvisioningEngine
         };
 
     /// <summary>Adds an allowed agent to a channel if it is not present.</summary>
-    public bool AddChannelAllowedAgent(ChannelDB channel, AgentDB agent)
+    public bool AddChannelAllowedAgent(ChannelState channel, AgentState agent)
     {
         ArgumentNullException.ThrowIfNull(channel);
         ArgumentNullException.ThrowIfNull(agent);
@@ -91,17 +89,6 @@ public sealed class TaskHostBridgeProvisioningEngine
     /// <summary>
     /// Links a task instance to its first bridge-created channel.
     /// </summary>
-    public bool AdoptInstanceChannel(TaskInstanceDB instance, Guid channelId)
-    {
-        ArgumentNullException.ThrowIfNull(instance);
-
-        if (instance.ChannelId is not null)
-            return false;
-
-        instance.ChannelId = channelId;
-        return true;
-    }
-
     /// <summary>
     /// Resolves a channel id or throws the canonical bridge error.
     /// </summary>
@@ -135,4 +122,4 @@ public sealed class TaskHostBridgeProvisioningEngine
 /// <summary>
 /// Result of task bridge agent provisioning.
 /// </summary>
-public sealed record AgentProvisioningResult(AgentDB Agent, bool Created);
+public sealed record AgentProvisioningResult(AgentState Agent, bool Created);

@@ -1,6 +1,6 @@
+using SharpClaw.Core.State;
 using System.Linq.Expressions;
 using SharpClaw.Contracts.DTOs.Models;
-using SharpClaw.Contracts.Entities.Core;
 using SharpClaw.Contracts.Providers;
 
 namespace SharpClaw.Core.Providers;
@@ -34,12 +34,12 @@ public sealed class ModelCatalogEngine
     }
 
     /// <summary>Creates a model entity from a request and loaded provider.</summary>
-    public ModelDB Create(CreateModelRequest request, ProviderDB provider)
+    public ModelState Create(CreateModelRequest request, ProviderState provider)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(provider);
 
-        return new ModelDB
+        return new ModelState
         {
             Name = request.Name,
             ProviderId = provider.Id,
@@ -51,7 +51,7 @@ public sealed class ModelCatalogEngine
 
     /// <summary>Applies an update request to an existing model entity.</summary>
     public void ApplyUpdate(
-        ModelDB model,
+        ModelState model,
         UpdateModelRequest request,
         bool enforceUniqueNames,
         bool nameExists)
@@ -79,7 +79,7 @@ public sealed class ModelCatalogEngine
     /// <see langword="true"/> when the persisted value changed.
     /// </summary>
     public bool RefreshCapabilityTags(
-        ModelDB model,
+        ModelState model,
         IModelCapabilityResolver resolver)
     {
         ArgumentNullException.ThrowIfNull(model);
@@ -98,7 +98,7 @@ public sealed class ModelCatalogEngine
     /// Builds model entities for provider model ids that do not already exist
     /// in the supplied provider-owned name set.
     /// </summary>
-    public IReadOnlyList<ModelDB> BuildMissingModels(
+    public IReadOnlyList<ModelState> BuildMissingModels(
         Guid providerId,
         IEnumerable<string> modelIds,
         ISet<string> existingNames,
@@ -110,7 +110,7 @@ public sealed class ModelCatalogEngine
 
         return modelIds
             .Where(id => !existingNames.Contains(id))
-            .Select(id => new ModelDB
+            .Select(id => new ModelState
             {
                 Name = id,
                 ProviderId = providerId,
@@ -121,7 +121,7 @@ public sealed class ModelCatalogEngine
     }
 
     /// <summary>Projects a loaded model entity into its public response.</summary>
-    public ModelResponse ToResponse(ModelDB model, ProviderDB? provider = null)
+    public ModelResponse ToResponse(ModelState model, ProviderState? provider = null)
     {
         ArgumentNullException.ThrowIfNull(model);
         provider ??= model.Provider;
@@ -136,7 +136,7 @@ public sealed class ModelCatalogEngine
     }
 
     /// <summary>Returns the EF-translatable model response projection.</summary>
-    public Expression<Func<ModelDB, ModelResponse>> ToResponseProjection() =>
+    public Expression<Func<ModelState, ModelResponse>> ToResponseProjection() =>
         model => new ModelResponse(
             model.Id,
             model.Name,

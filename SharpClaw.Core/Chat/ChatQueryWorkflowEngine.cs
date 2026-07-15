@@ -1,6 +1,6 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.Chat;
 using SharpClaw.Contracts.DTOs.Chat;
-using SharpClaw.Contracts.Entities.Core.Messages;
 using SharpClaw.Contracts.Providers;
 
 namespace SharpClaw.Core.Chat;
@@ -178,7 +178,7 @@ public sealed class ChatQueryWorkflowEngine(
 
 public interface IChatQueryHost
 {
-    Task<IReadOnlyList<ChatMessageDB>> ListHistoryMessagesAsync(
+    Task<IReadOnlyList<ChatMessageState>> ListHistoryMessagesAsync(
         Guid channelId,
         Guid? threadId,
         int limit,
@@ -193,7 +193,7 @@ public interface IChatQueryHost
         Func<CancellationToken, Task<ChatHistoryLimits>> loader,
         CancellationToken ct);
 
-    Task<IReadOnlyList<ChatMessageDB>> ListThreadHistoryMessagesAsync(
+    Task<IReadOnlyList<ChatMessageState>> ListThreadHistoryMessagesAsync(
         Guid threadId,
         int limit,
         CancellationToken ct);
@@ -214,7 +214,7 @@ public interface IChatQueryHost
         Func<CancellationToken, Task<AgentCostResponse?>> loader,
         CancellationToken ct);
 
-    Task<IReadOnlyList<ChatMessageDB>> ListChannelCostMessagesAsync(
+    Task<IReadOnlyList<ChatMessageState>> ListChannelCostMessagesAsync(
         Guid channelId,
         CancellationToken ct);
 
@@ -223,13 +223,13 @@ public interface IChatQueryHost
         Guid threadId,
         CancellationToken ct);
 
-    Task<IReadOnlyList<ChatMessageDB>> ListThreadCostMessagesAsync(
+    Task<IReadOnlyList<ChatMessageState>> ListThreadCostMessagesAsync(
         Guid threadId,
         CancellationToken ct);
 
     Task<string?> LoadAgentNameAsync(Guid agentId, CancellationToken ct);
 
-    Task<IReadOnlyList<ChatMessageDB>> ListAgentCostMessagesAsync(
+    Task<IReadOnlyList<ChatMessageState>> ListAgentCostMessagesAsync(
         Guid agentId,
         CancellationToken ct);
 }

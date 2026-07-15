@@ -1,6 +1,5 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.DTOs.Tasks;
-using SharpClaw.Contracts.Entities.Core;
-using SharpClaw.Contracts.Entities.Core.Context;
 using SharpClaw.Contracts.Providers;
 using SharpClaw.Core.Tasks.Runtime;
 
@@ -160,8 +159,8 @@ public interface IChatHeaderWorkflowHost
 
     Task<string> ExpandCustomHeaderAsync(
         string template,
-        ChannelDB channel,
-        AgentDB agent,
+        ChannelState channel,
+        AgentState agent,
         string clientType,
         Guid? sessionUserId,
         CompletionParameters? completionParameters,
@@ -179,8 +178,8 @@ public interface IChatHeaderWorkflowHost
 }
 
 public sealed record ChatHeaderWorkflowRequest(
-    ChannelDB Channel,
-    AgentDB Agent,
+    ChannelState Channel,
+    AgentState Agent,
     string ClientType,
     bool DisableDefaultHeaders,
     TaskChatContext? TaskContext,

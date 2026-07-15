@@ -1,3 +1,4 @@
+using SharpClaw.Core.State;
 using System.Text;
 using System.Text.Json;
 using SharpClaw.Contracts;
@@ -5,10 +6,6 @@ using SharpClaw.Contracts.DTOs.Chat;
 using SharpClaw.Contracts.DTOs.Channels;
 using SharpClaw.Contracts.DTOs.Roles;
 using SharpClaw.Contracts.DTOs.Tasks;
-using SharpClaw.Contracts.Entities.Core;
-using SharpClaw.Contracts.Entities.Core.Clearance;
-using SharpClaw.Contracts.Entities.Core.Context;
-using SharpClaw.Contracts.Entities.Core.Tasks;
 using SharpClaw.Contracts.Enums;
 using SharpClaw.Core.Permissions;
 
@@ -326,11 +323,7 @@ public sealed class TaskHostBridgeWorkflowEngine(
                 ct);
         }
 
-        if (await host.LoadTaskInstanceAsync(instanceId, ct) is { } instance
-            && provisioning.AdoptInstanceChannel(instance, channelId))
-        {
-            await host.SaveAsync(ct);
-        }
+        await host.TryAdoptInstanceChannelAsync(instanceId, channelId, ct);
 
         await host.AppendTaskLogAsync(
             instanceId,
@@ -445,41 +438,41 @@ public interface ITaskHostBridgeWorkflowHost
         string search,
         CancellationToken ct);
 
-    Task<AgentDB?> LoadLatestAgentByCustomIdAsync(
+    Task<AgentState?> LoadLatestAgentByCustomIdAsync(
         string customId,
         CancellationToken ct);
 
-    void TrackAgent(AgentDB agent);
+    void TrackAgent(AgentState agent);
 
-    Task<ChannelDB?> LoadChannelWithAllowedAgentsAsync(
+    Task<ChannelState?> LoadChannelWithAllowedAgentsAsync(
         Guid channelId,
         CancellationToken ct);
 
-    void TrackThread(ChatThreadDB thread);
+    void TrackThread(ChatThreadState thread);
 
-    Task<RoleDB?> LoadRoleByNameAsync(string roleName, CancellationToken ct);
+    Task<RoleState?> LoadRoleByNameAsync(string roleName, CancellationToken ct);
 
     Task<Guid> CreateRoleAsync(string roleName, CancellationToken ct);
 
-    Task<RoleDB?> LoadRoleWithPermissionSetAsync(Guid roleId, CancellationToken ct);
+    Task<RoleState?> LoadRoleWithPermissionSetAsync(Guid roleId, CancellationToken ct);
 
-    Task<PermissionSetDB> EnsureRolePermissionSetAsync(
-        RoleDB role,
+    Task<PermissionSetState> EnsureRolePermissionSetAsync(
+        RoleState role,
         CancellationToken ct);
 
     Task LoadPermissionSetCollectionsAsync(
-        PermissionSetDB permissionSet,
+        PermissionSetState permissionSet,
         CancellationToken ct);
 
-    Task<AgentDB?> LoadAgentAsync(Guid agentId, CancellationToken ct);
+    Task<AgentState?> LoadAgentAsync(Guid agentId, CancellationToken ct);
 
     Task<bool> RoleExistsAsync(Guid roleId, CancellationToken ct);
 
-    Task<ChannelDB?> LoadChannelByCustomIdAsync(
+    Task<ChannelState?> LoadChannelByCustomIdAsync(
         string customId,
         CancellationToken ct);
 
-    Task<ChannelDB?> LoadChannelByTitleAsync(
+    Task<ChannelState?> LoadChannelByTitleAsync(
         string title,
         CancellationToken ct);
 
@@ -487,8 +480,9 @@ public interface ITaskHostBridgeWorkflowHost
         CreateChannelRequest request,
         CancellationToken ct);
 
-    Task<TaskInstanceDB?> LoadTaskInstanceAsync(
+    Task<bool> TryAdoptInstanceChannelAsync(
         Guid instanceId,
+        Guid channelId,
         CancellationToken ct);
 
     Task SaveAsync(CancellationToken ct);

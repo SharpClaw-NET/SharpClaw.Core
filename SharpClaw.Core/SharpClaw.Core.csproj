@@ -25,6 +25,7 @@
     <Compile Include="Permissions\**\*.cs" />
     <Compile Include="Providers\**\*.cs" />
     <Compile Include="Resources\**\*.cs" />
+    <Compile Include="State\**\*.cs" />
     <Compile Include="Tasks\**\*.cs" />
     <Compile Include="Threads\**\*.cs" />
     <Compile Include="Tools\**\*.cs" />
@@ -45,6 +46,6 @@
     <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.8" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.8" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.8" />
-    <PackageReference Include="SharpClaw.Contracts" Version="0.3.16" />
+    <PackageReference Include="SharpClaw.Contracts" Version="0.5.0-alpha.1" />
   </ItemGroup>
 </Project>

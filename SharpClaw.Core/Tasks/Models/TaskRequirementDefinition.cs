@@ -1,3 +1,4 @@
+using SharpClaw.Core.State;
 namespace SharpClaw.Core.Tasks.Models;
 
 /// <summary>
@@ -5,7 +6,7 @@ namespace SharpClaw.Core.Tasks.Models;
 /// requirement attribute such as <c>[RequiresProvider]</c>, <c>[RequiresModule]</c>,
 /// <c>[ModelId]</c>, etc.
 /// Produced by <see cref="Parsing.TaskScriptParser"/> and stored as JSON in
-/// <c>TaskDefinitionDB.RequirementsJson</c> so the preflight checker and UI
+/// <c>TaskDefinitionState.RequirementsJson</c> so the preflight checker and UI
 /// can act on them without re-parsing the source.
 /// </summary>
 public sealed record TaskRequirementDefinition

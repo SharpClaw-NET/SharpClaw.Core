@@ -1,8 +1,7 @@
+using SharpClaw.Core.State;
 using System.Linq.Expressions;
 using SharpClaw.Contracts;
 using SharpClaw.Contracts.DTOs.Roles;
-using SharpClaw.Contracts.Entities.Core.Access;
-using SharpClaw.Contracts.Entities.Core.Clearance;
 using SharpClaw.Contracts.Enums;
 
 namespace SharpClaw.Core.Permissions;
@@ -15,23 +14,23 @@ public sealed class RolePermissionAdministrationEngine
     /// <summary>
     /// Creates a role with an empty permission set attached.
     /// </summary>
-    public RoleDB CreateRole(string name)
+    public RoleState CreateRole(string name)
     {
-        return new RoleDB
+        return new RoleState
         {
             Name = NormalizeRoleName(name),
-            PermissionSet = new PermissionSetDB()
+            PermissionSet = new PermissionSetState()
         };
     }
 
     /// <summary>
     /// Creates and attaches a permission set for a role that has none.
     /// </summary>
-    public PermissionSetDB CreatePermissionSetForRole(RoleDB role)
+    public PermissionSetState CreatePermissionSetForRole(RoleState role)
     {
         ArgumentNullException.ThrowIfNull(role);
 
-        var permissionSet = new PermissionSetDB();
+        var permissionSet = new PermissionSetState();
         role.PermissionSet = permissionSet;
         return permissionSet;
     }
@@ -39,7 +38,7 @@ public sealed class RolePermissionAdministrationEngine
     /// <summary>
     /// Applies a validated role rename.
     /// </summary>
-    public void RenameRole(RoleDB role, string newName)
+    public void RenameRole(RoleState role, string newName)
     {
         ArgumentNullException.ThrowIfNull(role);
 
@@ -49,12 +48,15 @@ public sealed class RolePermissionAdministrationEngine
     /// <summary>
     /// Plans deletion for a role and detaches assigned users.
     /// </summary>
-    public RoleDeletionPlan PlanDeleteRole(RoleDB role)
+    public RoleDeletionPlan PlanDeleteRole(RoleState role)
     {
         ArgumentNullException.ThrowIfNull(role);
 
         foreach (var user in role.Users)
+        {
             user.RoleId = null;
+            user.Role = null;
+        }
 
         var permissionSet = role.PermissionSet;
         return new RoleDeletionPlan(
@@ -67,7 +69,7 @@ public sealed class RolePermissionAdministrationEngine
     /// <summary>
     /// Projects a role entity to its public response shape.
     /// </summary>
-    public RoleResponse ToResponse(RoleDB role)
+    public RoleResponse ToResponse(RoleState role)
     {
         ArgumentNullException.ThrowIfNull(role);
 
@@ -77,15 +79,15 @@ public sealed class RolePermissionAdministrationEngine
     /// <summary>
     /// Projects roles to their public response shape.
     /// </summary>
-    public Expression<Func<RoleDB, RoleResponse>> ToResponseProjection() =>
+    public Expression<Func<RoleState, RoleResponse>> ToResponseProjection() =>
         role => new RoleResponse(role.Id, role.Name, role.PermissionSetId);
 
     /// <summary>
     /// Projects a role and permission set to a full permissions response.
     /// </summary>
     public RolePermissionsResponse ToPermissionsResponse(
-        RoleDB role,
-        PermissionSetDB? permissionSet)
+        RoleState role,
+        PermissionSetState? permissionSet)
     {
         ArgumentNullException.ThrowIfNull(role);
 
@@ -113,7 +115,7 @@ public sealed class RolePermissionAdministrationEngine
     /// </summary>
     public void ValidateRequestedGrants(
         SetRolePermissionsRequest request,
-        PermissionSetDB? callerPermissions)
+        PermissionSetState? callerPermissions)
     {
         ArgumentNullException.ThrowIfNull(request);
 
@@ -125,7 +127,7 @@ public sealed class RolePermissionAdministrationEngine
     /// Reconciles a target permission set with the requested role state.
     /// </summary>
     public void ReconcilePermissionSet(
-        PermissionSetDB permissionSet,
+        PermissionSetState permissionSet,
         SetRolePermissionsRequest request)
     {
         ArgumentNullException.ThrowIfNull(permissionSet);
@@ -161,7 +163,7 @@ public sealed class RolePermissionAdministrationEngine
 
     private static void ValidateGlobalFlags(
         SetRolePermissionsRequest request,
-        PermissionSetDB? callerPermissions)
+        PermissionSetState? callerPermissions)
     {
         if (request.GlobalFlags is null or { Count: 0 })
             return;
@@ -180,7 +182,7 @@ public sealed class RolePermissionAdministrationEngine
 
     private static void ValidateResourceGrants(
         SetRolePermissionsRequest request,
-        PermissionSetDB? callerPermissions)
+        PermissionSetState? callerPermissions)
     {
         if (request.ResourceGrants is null or { Count: 0 })
             return;
@@ -193,7 +195,7 @@ public sealed class RolePermissionAdministrationEngine
         string name,
         string resourceType,
         IReadOnlyList<ResourceGrant>? requested,
-        PermissionSetDB? callerPermissions)
+        PermissionSetState? callerPermissions)
     {
         if (requested is null or { Count: 0 })
             return;
@@ -222,7 +224,7 @@ public sealed class RolePermissionAdministrationEngine
     }
 
     private static void ReconcileGlobalFlags(
-        PermissionSetDB permissionSet,
+        PermissionSetState permissionSet,
         IReadOnlyDictionary<string, PermissionClearance>? requested)
     {
         var requestedMap = requested ?? new Dictionary<string, PermissionClearance>();
@@ -243,7 +245,7 @@ public sealed class RolePermissionAdministrationEngine
         {
             if (!existingKeys.Contains(key))
             {
-                permissionSet.GlobalFlags.Add(new GlobalFlagDB
+                permissionSet.GlobalFlags.Add(new GlobalFlagState
                 {
                     FlagKey = key,
                     Clearance = clearance
@@ -253,7 +255,7 @@ public sealed class RolePermissionAdministrationEngine
     }
 
     private static void ReconcileResourceAccesses(
-        PermissionSetDB permissionSet,
+        PermissionSetState permissionSet,
         IReadOnlyDictionary<string, IReadOnlyList<ResourceGrant>>? requested)
     {
         var requestedMap = requested?
@@ -292,7 +294,7 @@ public sealed class RolePermissionAdministrationEngine
             {
                 if (!existingKeys.Contains((resourceType, grant.ResourceId)))
                 {
-                    permissionSet.ResourceAccesses.Add(new ResourceAccessDB
+                    permissionSet.ResourceAccesses.Add(new ResourceAccessState
                     {
                         ResourceType = resourceType,
                         ResourceId = grant.ResourceId,
@@ -322,7 +324,7 @@ public sealed class RolePermissionAdministrationEngine
 /// <param name="GlobalFlags">Global flag rows owned by the permission set.</param>
 /// <param name="ResourceAccesses">Resource grant rows owned by the permission set.</param>
 public sealed record RoleDeletionPlan(
-    RoleDB Role,
-    PermissionSetDB? PermissionSet,
-    IReadOnlyList<GlobalFlagDB> GlobalFlags,
-    IReadOnlyList<ResourceAccessDB> ResourceAccesses);
+    RoleState Role,
+    PermissionSetState? PermissionSet,
+    IReadOnlyList<GlobalFlagState> GlobalFlags,
+    IReadOnlyList<ResourceAccessState> ResourceAccesses);

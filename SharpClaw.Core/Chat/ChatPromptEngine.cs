@@ -1,4 +1,4 @@
-using SharpClaw.Contracts.Entities.Core;
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.Providers;
 
 namespace SharpClaw.Core.Chat;
@@ -50,7 +50,7 @@ public sealed class ChatPromptEngine
     /// Maps an agent's provider-tuning fields into completion parameters.
     /// </summary>
     public CompletionParameters BuildCompletionParameters(
-        AgentDB agent,
+        AgentState agent,
         Guid modelId,
         Guid? threadId)
     {

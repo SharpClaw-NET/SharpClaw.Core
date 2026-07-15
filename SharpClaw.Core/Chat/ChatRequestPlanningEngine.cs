@@ -1,6 +1,5 @@
+using SharpClaw.Core.State;
 using System.Text.Json;
-using SharpClaw.Contracts.Entities.Core;
-using SharpClaw.Contracts.Entities.Core.Context;
 using SharpClaw.Contracts.Models;
 using SharpClaw.Contracts.Providers;
 using SharpClaw.Core.Clients;
@@ -17,8 +16,8 @@ public sealed class ChatRequestPlanningEngine(
     /// Builds the provider-call plan for a non-streaming chat request.
     /// </summary>
     public ChatRequestPlan BuildBufferedPlan(
-        ChannelDB channel,
-        AgentDB agent,
+        ChannelState channel,
+        AgentState agent,
         Guid? threadId,
         bool disableDefaultSystemPrompt,
         bool disableCustomProviderParameters,
@@ -69,8 +68,8 @@ public sealed class ChatRequestPlanningEngine(
     /// Builds the provider-call plan for a streaming chat request.
     /// </summary>
     public ChatRequestPlan BuildStreamingPlan(
-        ChannelDB channel,
-        AgentDB agent,
+        ChannelState channel,
+        AgentState agent,
         Guid? threadId,
         bool disableDefaultSystemPrompt,
         bool disableCustomProviderParameters,
@@ -117,9 +116,9 @@ public sealed class ChatRequestPlanningEngine(
     }
 
     private CompletionParameters BuildAndValidateCompletionParameters(
-        AgentDB agent,
-        ModelDB model,
-        ProviderDB provider,
+        AgentState agent,
+        ModelState model,
+        ProviderState provider,
         Guid? threadId,
         ICompletionParameterSpec completionParameterSpec)
     {
@@ -144,7 +143,7 @@ public sealed class ChatRequestPlanningEngine(
                 "Provider does not have an API key configured.");
     }
 
-    private static ChatRequestFacts ResolveFacts(AgentDB agent)
+    private static ChatRequestFacts ResolveFacts(AgentState agent)
     {
         ArgumentNullException.ThrowIfNull(agent);
 
@@ -159,7 +158,7 @@ public sealed class ChatRequestPlanningEngine(
         return new ChatRequestFacts(model, provider);
     }
 
-    private sealed record ChatRequestFacts(ModelDB Model, ProviderDB Provider);
+    private sealed record ChatRequestFacts(ModelState Model, ProviderState Provider);
 }
 
 /// <summary>

@@ -1,5 +1,5 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.DTOs.Tools;
-using SharpClaw.Contracts.Entities.Core;
 using SharpClaw.Core.Chat;
 
 namespace SharpClaw.Core.Tools;
@@ -100,17 +100,17 @@ public sealed class ToolAwarenessAdministrationEngine(
 
 public interface IToolAwarenessAdministrationHost
 {
-    Task<ToolAwarenessSetDB?> LoadToolAwarenessSetAsync(
+    Task<ToolAwarenessSetState?> LoadToolAwarenessSetAsync(
         Guid id,
         CancellationToken ct);
 
     /// <summary>Loads all tool-awareness sets for public projection.</summary>
-    Task<IReadOnlyList<ToolAwarenessSetDB>> ListToolAwarenessSetsAsync(
+    Task<IReadOnlyList<ToolAwarenessSetState>> ListToolAwarenessSetsAsync(
         CancellationToken ct);
 
-    void TrackToolAwarenessSet(ToolAwarenessSetDB entity);
+    void TrackToolAwarenessSet(ToolAwarenessSetState entity);
 
-    void RemoveToolAwarenessSet(ToolAwarenessSetDB entity);
+    void RemoveToolAwarenessSet(ToolAwarenessSetState entity);
 
     Task SaveAsync(
         Func<ChatRuntimeInvalidationPlan?>? buildInvalidationPlan,

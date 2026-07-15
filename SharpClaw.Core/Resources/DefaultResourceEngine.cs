@@ -1,5 +1,5 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.DTOs.DefaultResources;
-using SharpClaw.Contracts.Entities.Core.Context;
 using SharpClaw.Core.Permissions;
 
 namespace SharpClaw.Core.Resources;
@@ -123,9 +123,9 @@ public sealed class DefaultResourceEngine
     /// value removes the matching entry; missing keys are left unchanged.
     /// </summary>
     public static void Apply(
-        DefaultResourceSetDB defaultResourceSet,
+        DefaultResourceSetState defaultResourceSet,
         SetDefaultResourcesRequest request,
-        Action<DefaultResourceEntryDB>? removeEntry = null)
+        Action<DefaultResourceEntryState>? removeEntry = null)
     {
         ArgumentNullException.ThrowIfNull(defaultResourceSet);
         ArgumentNullException.ThrowIfNull(request);
@@ -139,10 +139,10 @@ public sealed class DefaultResourceEngine
     /// Existing keys are matched case-insensitively and stored normalized.
     /// </summary>
     public static void ApplyKey(
-        DefaultResourceSetDB defaultResourceSet,
+        DefaultResourceSetState defaultResourceSet,
         string key,
         Guid? value,
-        Action<DefaultResourceEntryDB>? removeEntry = null)
+        Action<DefaultResourceEntryState>? removeEntry = null)
     {
         ArgumentNullException.ThrowIfNull(defaultResourceSet);
 
@@ -170,7 +170,7 @@ public sealed class DefaultResourceEngine
         }
         else
         {
-            defaultResourceSet.Entries.Add(new DefaultResourceEntryDB
+            defaultResourceSet.Entries.Add(new DefaultResourceEntryState
             {
                 DefaultResourceSetId = defaultResourceSet.Id,
                 ResourceKey = normalised,

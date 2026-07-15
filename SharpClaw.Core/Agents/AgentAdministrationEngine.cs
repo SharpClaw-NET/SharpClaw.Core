@@ -1,9 +1,7 @@
+using SharpClaw.Core.State;
 using System.Linq.Expressions;
 using SharpClaw.Contracts;
 using SharpClaw.Contracts.DTOs.Agents;
-using SharpClaw.Contracts.Entities.Core;
-using SharpClaw.Contracts.Entities.Core.Access;
-using SharpClaw.Contracts.Entities.Core.Clearance;
 using SharpClaw.Contracts.Enums;
 using SharpClaw.Contracts.Providers;
 using SharpClaw.Core.Clients;
@@ -44,9 +42,9 @@ public sealed class AgentAdministrationEngine
     }
 
     /// <summary>Creates an agent entity from a validated create request.</summary>
-    public AgentDB Create(
+    public AgentState Create(
         CreateAgentRequest request,
-        ModelDB model,
+        ModelState model,
         ICompletionParameterSpec parameterSpec)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -58,7 +56,7 @@ public sealed class AgentAdministrationEngine
             parameterSpec,
             model.Provider.ProviderKey);
 
-        return new AgentDB
+        return new AgentState
         {
             Name = request.Name,
             SystemPrompt = request.SystemPrompt,
@@ -83,9 +81,9 @@ public sealed class AgentAdministrationEngine
 
     /// <summary>Applies an update request to an existing agent entity.</summary>
     public void ApplyUpdate(
-        AgentDB agent,
+        AgentState agent,
         UpdateAgentRequest request,
-        ModelDB? replacementModel,
+        ModelState? replacementModel,
         ICompletionParameterSpec parameterSpec,
         bool enforceUniqueNames,
         IEnumerable<string> existingAgentNames)
@@ -162,12 +160,12 @@ public sealed class AgentAdministrationEngine
 
     /// <summary>Assigns or removes a role on an agent.</summary>
     public void AssignRole(
-        AgentDB agent,
+        AgentState agent,
         Guid roleId,
-        RoleDB? role,
+        RoleState? role,
         Guid? callerRoleId,
-        PermissionSetDB? callerPermissionSet,
-        PermissionSetDB? targetPermissionSet,
+        PermissionSetState? callerPermissionSet,
+        PermissionSetState? targetPermissionSet,
         IEnumerable<string> registeredResourceTypes)
     {
         ArgumentNullException.ThrowIfNull(agent);
@@ -198,11 +196,11 @@ public sealed class AgentAdministrationEngine
 
     /// <summary>Assigns or removes a role on a user.</summary>
     public void AssignUserRole(
-        UserDB user,
+        UserState user,
         Guid roleId,
-        RoleDB? role,
-        PermissionSetDB? callerPermissionSet,
-        PermissionSetDB? targetPermissionSet,
+        RoleState? role,
+        PermissionSetState? callerPermissionSet,
+        PermissionSetState? targetPermissionSet,
         IEnumerable<string> registeredResourceTypes)
     {
         ArgumentNullException.ThrowIfNull(user);
@@ -240,8 +238,8 @@ public sealed class AgentAdministrationEngine
     /// <summary>
     /// Creates a default agent when the synthesized name is not already known.
     /// </summary>
-    public AgentDB? CreateDefaultAgentIfMissing(
-        ModelDB model,
+    public AgentState? CreateDefaultAgentIfMissing(
+        ModelState model,
         string providerSuffix,
         ISet<string> knownAgentNames)
     {
@@ -253,7 +251,7 @@ public sealed class AgentAdministrationEngine
             return null;
 
         knownAgentNames.Add(agentName);
-        return new AgentDB
+        return new AgentState
         {
             Name = agentName,
             ModelId = model.Id,
@@ -262,7 +260,7 @@ public sealed class AgentAdministrationEngine
     }
 
     /// <summary>Projects an agent entity into its public response shape.</summary>
-    public AgentResponse ToResponse(AgentDB agent, ModelDB? model = null)
+    public AgentResponse ToResponse(AgentState agent, ModelState? model = null)
     {
         ArgumentNullException.ThrowIfNull(agent);
         model ??= agent.Model;
@@ -297,7 +295,7 @@ public sealed class AgentAdministrationEngine
     /// Returns an EF-translatable projection for list/read paths that should
     /// avoid materializing full relation graphs.
     /// </summary>
-    public Expression<Func<AgentDB, AgentResponse>> ToResponseProjection() =>
+    public Expression<Func<AgentState, AgentResponse>> ToResponseProjection() =>
         agent => new AgentResponse(
             agent.Id,
             agent.Name,
@@ -324,7 +322,7 @@ public sealed class AgentAdministrationEngine
             agent.DisableToolSchemas);
 
     /// <summary>Projects an agent entity into its compact summary shape.</summary>
-    public AgentSummary ToSummary(AgentDB agent, ModelDB? model = null)
+    public AgentSummary ToSummary(AgentState agent, ModelState? model = null)
     {
         ArgumentNullException.ThrowIfNull(agent);
         model ??= agent.Model;
@@ -359,8 +357,8 @@ public sealed class AgentAdministrationEngine
     /// same or higher clearance level.
     /// </summary>
     public void ValidateCallerCoversTargetRole(
-        PermissionSetDB? callerPermissionSet,
-        PermissionSetDB? targetPermissionSet,
+        PermissionSetState? callerPermissionSet,
+        PermissionSetState? targetPermissionSet,
         string roleName,
         IEnumerable<string> registeredResourceTypes)
     {
@@ -416,7 +414,7 @@ public sealed class AgentAdministrationEngine
             ReasoningEffort = request.ReasoningEffort,
         };
 
-    private static CompletionParameters ToCompletionParameters(AgentDB agent) =>
+    private static CompletionParameters ToCompletionParameters(AgentState agent) =>
         new()
         {
             Temperature = agent.Temperature,
@@ -433,8 +431,8 @@ public sealed class AgentAdministrationEngine
     private static void ValidateResourceCoverage(
         string roleName,
         string resourceType,
-        ICollection<ResourceAccessDB> targetAccesses,
-        ICollection<ResourceAccessDB> callerAccesses)
+        ICollection<ResourceAccessState> targetAccesses,
+        ICollection<ResourceAccessState> callerAccesses)
     {
         var targetFiltered = targetAccesses
             .Where(a => a.ResourceType == resourceType)

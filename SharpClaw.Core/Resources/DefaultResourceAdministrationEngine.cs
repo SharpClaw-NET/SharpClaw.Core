@@ -1,5 +1,5 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.DTOs.DefaultResources;
-using SharpClaw.Contracts.Entities.Core.Context;
 using SharpClaw.Core.Chat;
 
 namespace SharpClaw.Core.Resources;
@@ -228,44 +228,44 @@ public sealed class DefaultResourceAdministrationEngine(
             ct);
     }
 
-    private static DefaultResourceSetDB EnsureChannelDefaultResourceSet(
-        ChannelDB channel,
+    private static DefaultResourceSetState EnsureChannelDefaultResourceSet(
+        ChannelState channel,
         IDefaultResourceAdministrationHost host)
     {
         if (channel.DefaultResourceSet is not null)
             return channel.DefaultResourceSet;
 
-        var set = new DefaultResourceSetDB();
+        var set = new DefaultResourceSetState();
         channel.DefaultResourceSet = set;
         host.TrackDefaultResourceSet(set);
         return set;
     }
 
-    private static DefaultResourceSetDB EnsureContextDefaultResourceSet(
-        ChannelContextDB context,
+    private static DefaultResourceSetState EnsureContextDefaultResourceSet(
+        ChannelContextState context,
         IDefaultResourceAdministrationHost host)
     {
         if (context.DefaultResourceSet is not null)
             return context.DefaultResourceSet;
 
-        var set = new DefaultResourceSetDB();
+        var set = new DefaultResourceSetState();
         context.DefaultResourceSet = set;
         host.TrackDefaultResourceSet(set);
         return set;
     }
 
     private static DefaultResourceSetSnapshot? Snapshot(
-        DefaultResourceSetDB? set) =>
+        DefaultResourceSetState? set) =>
         set is null ? null : DefaultResourceSetSnapshot.FromDefaultResourceSet(set);
 }
 
 public interface IDefaultResourceAdministrationHost
 {
-    Task<ChannelDB?> LoadChannelWithDefaultResourcesAsync(
+    Task<ChannelState?> LoadChannelWithDefaultResourcesAsync(
         Guid channelId,
         CancellationToken ct);
 
-    Task<ChannelContextDB?> LoadContextWithDefaultResourcesAsync(
+    Task<ChannelContextState?> LoadContextWithDefaultResourcesAsync(
         Guid contextId,
         CancellationToken ct);
 
@@ -273,9 +273,9 @@ public interface IDefaultResourceAdministrationHost
         Guid contextId,
         CancellationToken ct);
 
-    void TrackDefaultResourceSet(DefaultResourceSetDB defaultResourceSet);
+    void TrackDefaultResourceSet(DefaultResourceSetState defaultResourceSet);
 
-    void RemoveDefaultResourceEntry(DefaultResourceEntryDB entry);
+    void RemoveDefaultResourceEntry(DefaultResourceEntryState entry);
 
     Task SaveAsync(
         Func<ChatRuntimeInvalidationPlan?>? buildInvalidationPlan,

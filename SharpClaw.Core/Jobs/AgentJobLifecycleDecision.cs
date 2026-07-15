@@ -8,6 +8,9 @@ namespace SharpClaw.Core.Jobs;
 /// </summary>
 public sealed record AgentJobLifecycleDecision
 {
+    /// <summary>Stable identity used by hosts for idempotent persistence.</summary>
+    public Guid DecisionId { get; init; } = Guid.NewGuid();
+
     /// <summary>The status to assign, or null when status should not change.</summary>
     public AgentJobStatus? Status { get; init; }
 
@@ -23,17 +26,23 @@ public sealed record AgentJobLifecycleDecision
     /// <summary>The CompletedAt value to assign when <see cref="UpdateCompletedAt"/> is true.</summary>
     public DateTimeOffset? CompletedAt { get; init; }
 
-    /// <summary>Whether the persisted ResultData field should be assigned.</summary>
-    public bool UpdateResultData { get; init; }
+    /// <summary>Whether this decision supplies a new execution result.</summary>
+    public bool UpdateResult { get; init; }
 
-    /// <summary>The ResultData value to assign when <see cref="UpdateResultData"/> is true.</summary>
-    public string? ResultData { get; init; }
+    /// <summary>The transient execution result supplied by this decision.</summary>
+    public string? Result { get; init; }
 
-    /// <summary>Whether the persisted ErrorLog field should be assigned.</summary>
-    public bool UpdateErrorLog { get; init; }
+    /// <summary>Whether this decision supplies new failure diagnostics.</summary>
+    public bool UpdateFailure { get; init; }
 
-    /// <summary>The ErrorLog value to assign when <see cref="UpdateErrorLog"/> is true.</summary>
-    public string? ErrorLog { get; init; }
+    /// <summary>Stable machine-readable failure category.</summary>
+    public string? ErrorCode { get; init; }
+
+    /// <summary>Boundable human-readable failure summary.</summary>
+    public string? ErrorMessage { get; init; }
+
+    /// <summary>Full diagnostic detail for the host diagnostic store.</summary>
+    public string? ErrorDetails { get; init; }
 
     /// <summary>Whether the host should dispatch job execution after applying this decision.</summary>
     public bool ShouldExecute { get; init; }
@@ -46,8 +55,8 @@ public sealed record AgentJobLifecycleDecision
         Status is not null
         || UpdateStartedAt
         || UpdateCompletedAt
-        || UpdateResultData
-        || UpdateErrorLog
+        || UpdateResult
+        || UpdateFailure
         || Logs.Count > 0;
 }
 

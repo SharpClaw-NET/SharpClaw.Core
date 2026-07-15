@@ -1,7 +1,6 @@
+using SharpClaw.Core.State;
 using System.Globalization;
 using System.Text;
-using SharpClaw.Contracts.Entities.Core;
-using SharpClaw.Contracts.Entities.Core.Context;
 using SharpClaw.Contracts.Providers;
 using SharpClaw.Core.Clients;
 
@@ -15,7 +14,7 @@ public sealed class ChatDefaultHeaderEngine(ProviderApiClientFactory clientFacto
     /// <summary>
     /// Returns whether channel or context configuration suppresses all headers.
     /// </summary>
-    public bool IsHeaderDisabled(ChannelDB channel)
+    public bool IsHeaderDisabled(ChannelState channel)
     {
         ArgumentNullException.ThrowIfNull(channel);
         return channel.DisableChatHeader
@@ -25,7 +24,7 @@ public sealed class ChatDefaultHeaderEngine(ProviderApiClientFactory clientFacto
     /// <summary>
     /// Resolves the custom header template using channel-over-agent precedence.
     /// </summary>
-    public string? ResolveCustomTemplate(ChannelDB channel, AgentDB agent)
+    public string? ResolveCustomTemplate(ChannelState channel, AgentState agent)
     {
         ArgumentNullException.ThrowIfNull(channel);
         ArgumentNullException.ThrowIfNull(agent);

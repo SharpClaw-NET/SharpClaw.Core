@@ -1,9 +1,8 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.DTOs.Agents;
 using SharpClaw.Contracts.DTOs.Channels;
 using SharpClaw.Contracts.DTOs.Contexts;
 using SharpClaw.Contracts.DTOs.Threads;
-using SharpClaw.Contracts.Entities.Core;
-using SharpClaw.Contracts.Entities.Core.Context;
 
 namespace SharpClaw.Core.Conversation;
 
@@ -44,11 +43,11 @@ public sealed class ConversationTopologyEngine
     }
 
     /// <summary>Creates a channel entity from a request and loaded references.</summary>
-    public ChannelDB CreateChannel(
+    public ChannelState CreateChannel(
         CreateChannelRequest request,
-        AgentDB? agent,
-        ChannelContextDB? context,
-        IEnumerable<AgentDB>? allowedAgents,
+        AgentState? agent,
+        ChannelContextState? context,
+        IEnumerable<AgentState>? allowedAgents,
         DateTimeOffset now)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -57,7 +56,7 @@ public sealed class ConversationTopologyEngine
             throw new ArgumentException(
                 "Either an AgentId or a ContextId (with an agent) is required.");
 
-        var channel = new ChannelDB
+        var channel = new ChannelState
         {
             Title = request.Title ?? BuildDefaultChannelTitle(now),
             AgentId = agent?.Id,
@@ -77,10 +76,10 @@ public sealed class ConversationTopologyEngine
 
     /// <summary>Applies an update request to a loaded channel entity.</summary>
     public void ApplyChannelUpdate(
-        ChannelDB channel,
+        ChannelState channel,
         UpdateChannelRequest request,
-        ChannelContextDB? context,
-        IEnumerable<AgentDB>? replacementAllowedAgents)
+        ChannelContextState? context,
+        IEnumerable<AgentState>? replacementAllowedAgents)
     {
         ArgumentNullException.ThrowIfNull(channel);
         ArgumentNullException.ThrowIfNull(request);
@@ -135,7 +134,7 @@ public sealed class ConversationTopologyEngine
     }
 
     /// <summary>Sets the default agent for a channel.</summary>
-    public void SetChannelAgent(ChannelDB channel, AgentDB agent)
+    public void SetChannelAgent(ChannelState channel, AgentState agent)
     {
         ArgumentNullException.ThrowIfNull(channel);
         ArgumentNullException.ThrowIfNull(agent);
@@ -147,8 +146,8 @@ public sealed class ConversationTopologyEngine
     /// <summary>
     /// Resolves the agent for a channel operation with an optional override.
     /// </summary>
-    public AgentDB ResolveRequestedAgent(
-        ChannelDB channel,
+    public AgentState ResolveRequestedAgent(
+        ChannelState channel,
         Guid? requestedAgentId)
     {
         ArgumentNullException.ThrowIfNull(channel);
@@ -170,7 +169,7 @@ public sealed class ConversationTopologyEngine
     }
 
     /// <summary>Adds an allowed agent if it is not already present.</summary>
-    public bool AddChannelAllowedAgent(ChannelDB channel, AgentDB agent)
+    public bool AddChannelAllowedAgent(ChannelState channel, AgentState agent)
     {
         ArgumentNullException.ThrowIfNull(channel);
         ArgumentNullException.ThrowIfNull(agent);
@@ -183,7 +182,7 @@ public sealed class ConversationTopologyEngine
     }
 
     /// <summary>Removes a channel allowed agent when present.</summary>
-    public bool RemoveChannelAllowedAgent(ChannelDB channel, Guid agentId)
+    public bool RemoveChannelAllowedAgent(ChannelState channel, Guid agentId)
     {
         ArgumentNullException.ThrowIfNull(channel);
 
@@ -196,7 +195,7 @@ public sealed class ConversationTopologyEngine
     }
 
     /// <summary>Projects a loaded channel entity to its response shape.</summary>
-    public ChannelResponse ToChannelResponse(ChannelDB channel)
+    public ChannelResponse ToChannelResponse(ChannelState channel)
     {
         ArgumentNullException.ThrowIfNull(channel);
 
@@ -222,7 +221,7 @@ public sealed class ConversationTopologyEngine
     }
 
     /// <summary>Projects channel allowed-agent state to its response shape.</summary>
-    public ChannelAllowedAgentsResponse ToChannelAllowedAgentsResponse(ChannelDB channel)
+    public ChannelAllowedAgentsResponse ToChannelAllowedAgentsResponse(ChannelState channel)
     {
         ArgumentNullException.ThrowIfNull(channel);
 
@@ -236,16 +235,16 @@ public sealed class ConversationTopologyEngine
     }
 
     /// <summary>Creates a context entity from a request and loaded references.</summary>
-    public ChannelContextDB CreateContext(
+    public ChannelContextState CreateContext(
         CreateContextRequest request,
-        AgentDB agent,
-        IEnumerable<AgentDB>? allowedAgents,
+        AgentState agent,
+        IEnumerable<AgentState>? allowedAgents,
         DateTimeOffset now)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(agent);
 
-        var context = new ChannelContextDB
+        var context = new ChannelContextState
         {
             Name = request.Name ?? BuildDefaultContextName(now),
             AgentId = agent.Id,
@@ -260,9 +259,9 @@ public sealed class ConversationTopologyEngine
 
     /// <summary>Applies an update request to a loaded context entity.</summary>
     public void ApplyContextUpdate(
-        ChannelContextDB context,
+        ChannelContextState context,
         UpdateContextRequest request,
-        IEnumerable<AgentDB>? replacementAllowedAgents)
+        IEnumerable<AgentState>? replacementAllowedAgents)
     {
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(request);
@@ -283,7 +282,7 @@ public sealed class ConversationTopologyEngine
     }
 
     /// <summary>Adds an allowed agent to a context if not already present.</summary>
-    public bool AddContextAllowedAgent(ChannelContextDB context, AgentDB agent)
+    public bool AddContextAllowedAgent(ChannelContextState context, AgentState agent)
     {
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(agent);
@@ -296,7 +295,7 @@ public sealed class ConversationTopologyEngine
     }
 
     /// <summary>Removes a context allowed agent when present.</summary>
-    public bool RemoveContextAllowedAgent(ChannelContextDB context, Guid agentId)
+    public bool RemoveContextAllowedAgent(ChannelContextState context, Guid agentId)
     {
         ArgumentNullException.ThrowIfNull(context);
 
@@ -309,7 +308,7 @@ public sealed class ConversationTopologyEngine
     }
 
     /// <summary>Projects a loaded context entity to its response shape.</summary>
-    public ContextResponse ToContextResponse(ChannelContextDB context)
+    public ContextResponse ToContextResponse(ChannelContextState context)
     {
         ArgumentNullException.ThrowIfNull(context);
 
@@ -326,7 +325,7 @@ public sealed class ConversationTopologyEngine
 
     /// <summary>Projects context allowed-agent state to its response shape.</summary>
     public ContextAllowedAgentsResponse ToContextAllowedAgentsResponse(
-        ChannelContextDB context)
+        ChannelContextState context)
     {
         ArgumentNullException.ThrowIfNull(context);
 
@@ -337,14 +336,14 @@ public sealed class ConversationTopologyEngine
     }
 
     /// <summary>Creates a thread entity from a request and loaded channel id.</summary>
-    public ChatThreadDB CreateThread(
+    public ChatThreadState CreateThread(
         Guid channelId,
         CreateThreadRequest request,
         DateTimeOffset now)
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        return new ChatThreadDB
+        return new ChatThreadState
         {
             Name = request.Name ?? BuildDefaultThreadName(now),
             MaxMessages = request.MaxMessages,
@@ -355,7 +354,7 @@ public sealed class ConversationTopologyEngine
     }
 
     /// <summary>Applies an update request to a loaded thread entity.</summary>
-    public void ApplyThreadUpdate(ChatThreadDB thread, UpdateThreadRequest request)
+    public void ApplyThreadUpdate(ChatThreadState thread, UpdateThreadRequest request)
     {
         ArgumentNullException.ThrowIfNull(thread);
         ArgumentNullException.ThrowIfNull(request);
@@ -378,7 +377,7 @@ public sealed class ConversationTopologyEngine
     }
 
     /// <summary>Projects a loaded thread entity to its response shape.</summary>
-    public ThreadResponse ToThreadResponse(ChatThreadDB thread)
+    public ThreadResponse ToThreadResponse(ChatThreadState thread)
     {
         ArgumentNullException.ThrowIfNull(thread);
 
@@ -394,7 +393,7 @@ public sealed class ConversationTopologyEngine
     }
 
     /// <summary>Projects a loaded agent entity to its compact response shape.</summary>
-    public AgentSummary ToAgentSummary(AgentDB agent)
+    public AgentSummary ToAgentSummary(AgentState agent)
     {
         ArgumentNullException.ThrowIfNull(agent);
 
@@ -435,14 +434,14 @@ public sealed class ConversationTopologyEngine
     public static string BuildDefaultThreadName(DateTimeOffset now) =>
         $"Thread {now:yyyy-MM-dd HH:mm}";
 
-    private static Guid? ResolveEffectivePermissionSetId(ChannelDB channel) =>
+    private static Guid? ResolveEffectivePermissionSetId(ChannelState channel) =>
         channel.PermissionSetId ?? channel.AgentContext?.PermissionSetId;
 
-    private static AgentDB? ResolveEffectiveAgent(ChannelDB channel) =>
+    private static AgentState? ResolveEffectiveAgent(ChannelState channel) =>
         channel.Agent ?? channel.AgentContext?.Agent;
 
-    private static IEnumerable<AgentDB> ResolveEffectiveAllowedAgents(
-        ChannelDB channel)
+    private static IEnumerable<AgentState> ResolveEffectiveAllowedAgents(
+        ChannelState channel)
     {
         return channel.AllowedAgents.Count > 0
             ? channel.AllowedAgents
@@ -450,8 +449,8 @@ public sealed class ConversationTopologyEngine
     }
 
     private static void ReplaceAllowedAgents(
-        ICollection<AgentDB> target,
-        IEnumerable<AgentDB>? replacement)
+        ICollection<AgentState> target,
+        IEnumerable<AgentState>? replacement)
     {
         target.Clear();
 

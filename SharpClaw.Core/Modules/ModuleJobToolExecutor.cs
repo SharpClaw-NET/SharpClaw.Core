@@ -2,8 +2,8 @@ using System.Diagnostics;
 using System.Text;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using SharpClaw.Contracts.Entities.Core.Jobs;
 using SharpClaw.Contracts.Modules;
+using SharpClaw.Core.Jobs;
 
 namespace SharpClaw.Core.Modules;
 
@@ -251,7 +251,7 @@ public sealed class ModuleJobToolExecutor(
 /// Inputs required by Core to execute one module job-pipeline tool.
 /// </summary>
 public sealed record ModuleJobToolExecutionRequest(
-    AgentJobDB Job,
+    AgentJobState Job,
     ModuleToolExecutionPlan Plan,
     ModuleRegistry ModuleRegistry,
     Func<IServiceScope> CreateHostScope,

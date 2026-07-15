@@ -1,5 +1,5 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.DTOs.Tasks;
-using SharpClaw.Contracts.Entities.Core.Tasks;
 using SharpClaw.Contracts.Tasks;
 using SharpClaw.Core.Tasks.Models;
 using SharpClaw.Core.Tasks.Preflight;
@@ -200,7 +200,7 @@ public sealed class TaskAdministrationWorkflowEngine(
         return bindings.Count;
     }
 
-    public async Task<TaskInstanceResponse> CreateInstanceAsync(
+    public async Task<TaskInstanceState> CreateInstanceAsync(
         StartTaskInstanceRequest request,
         Guid? callerUserId,
         Guid? callerAgentId,
@@ -237,7 +237,7 @@ public sealed class TaskAdministrationWorkflowEngine(
         host.TrackInstance(instance);
         await host.SaveAsync(ct);
 
-        return tasks.ToInstanceResponse(instance, definition.Name);
+        return instance;
     }
 
     public async Task<bool> PauseInstanceAsync(
@@ -284,51 +284,6 @@ public sealed class TaskAdministrationWorkflowEngine(
         return await MutateInstanceAsync(id, tasks.TryCancelInstance, host, ct);
     }
 
-    public async Task<TaskInstanceResponse?> GetInstanceAsync(
-        Guid id,
-        ITaskAdministrationHost host,
-        CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(host);
-
-        var instance = await host.LoadInstanceWithLogsAsync(id, ct);
-        if (instance is null)
-            return null;
-
-        var definition = await host.LoadDefinitionAsync(
-            instance.TaskDefinitionId,
-            ct);
-        return tasks.ToInstanceResponse(
-            instance,
-            definition?.Name ?? "(unknown)");
-    }
-
-    public async Task<IReadOnlyList<TaskInstanceSummaryResponse>> ListInstancesAsync(
-        Guid? taskDefinitionId,
-        ITaskAdministrationHost host,
-        CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(host);
-
-        var instances = await host.ListInstancesAsync(taskDefinitionId, ct);
-        var definitionIds = instances
-            .Select(instance => instance.TaskDefinitionId)
-            .Distinct()
-            .ToList();
-        var definitionNames = await host.LoadDefinitionNamesAsync(
-            definitionIds,
-            ct);
-
-        return instances
-            .OrderByDescending(instance => instance.CreatedAt)
-            .Select(instance => tasks.ToSummaryResponse(
-                instance,
-                definitionNames.GetValueOrDefault(
-                    instance.TaskDefinitionId,
-                    "(unknown)")))
-            .ToList();
-    }
-
     public async Task AppendLogAsync(
         Guid instanceId,
         string message,
@@ -338,28 +293,74 @@ public sealed class TaskAdministrationWorkflowEngine(
     {
         ArgumentNullException.ThrowIfNull(host);
 
-        host.TrackLog(tasks.AddLog(null, instanceId, message, level));
-        await host.SaveAsync(ct);
+        await host.AppendLogAsync(
+            tasks.CreateLog(instanceId, message, level),
+            ct);
     }
 
-    public async Task<IReadOnlyList<TaskOutputEntryResponse>> GetOutputsAsync(
-        Guid instanceId,
-        DateTimeOffset? since,
+    public Task<bool> ApplyCompilationFailureAsync(
+        Guid id,
+        string errors,
+        ITaskAdministrationHost host,
+        CancellationToken ct = default) =>
+        MutateInstanceAsync(
+            id,
+            instance =>
+            {
+                tasks.ApplyCompilationFailure(instance, errors);
+                return true;
+            },
+            host,
+            ct);
+
+    public Task<bool> ApplyTerminalStatusAsync(
+        Guid id,
+        SharpClaw.Contracts.Enums.TaskInstanceStatus status,
+        ITaskAdministrationHost host,
+        CancellationToken ct = default) =>
+        MutateInstanceAsync(
+            id,
+            instance =>
+            {
+                tasks.ApplyTerminalStatus(instance, status);
+                return true;
+            },
+            host,
+            ct);
+
+    public Task<bool> ApplyFailureAsync(
+        Guid id,
+        string error,
+        ITaskAdministrationHost host,
+        CancellationToken ct = default) =>
+        MutateInstanceAsync(
+            id,
+            instance =>
+            {
+                tasks.ApplyFailure(instance, error);
+                return true;
+            },
+            host,
+            ct);
+
+    public async Task<TaskRestartRecoveryPlan?> ApplyRestartRecoveryAsync(
+        Guid id,
         ITaskAdministrationHost host,
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(host);
+        var instance = await host.LoadInstanceAsync(id, ct);
+        if (instance is null)
+            return null;
 
-        var outputs = await host.ListOutputsAsync(instanceId, since, ct);
-        return outputs
-            .OrderBy(output => output.Sequence)
-            .Select(tasks.ToOutputResponse)
-            .ToList();
+        var plan = tasks.ApplyRestartRecovery(instance);
+        await host.PersistInstanceAsync(instance, ct);
+        return plan;
     }
 
     private async Task<bool> MutateInstanceAsync(
         Guid id,
-        Func<TaskInstanceDB, bool> mutate,
+        Func<TaskInstanceState, bool> mutate,
         ITaskAdministrationHost host,
         CancellationToken ct)
     {
@@ -370,12 +371,12 @@ public sealed class TaskAdministrationWorkflowEngine(
         if (instance is null || !mutate(instance))
             return false;
 
-        await host.SaveAsync(ct);
+        await host.PersistInstanceAsync(instance, ct);
         return true;
     }
 
     private TaskDefinitionResponse ToDefinitionResponse(
-        TaskDefinitionDB entity,
+        TaskDefinitionState entity,
         IReadOnlyList<TaskParameterDefinition> parameters,
         IReadOnlyList<TaskRequirementDefinition> requirements,
         IReadOnlyList<TaskTriggerDefinition> triggers,
@@ -397,21 +398,21 @@ public interface ITaskAdministrationHost
         string name,
         CancellationToken ct);
 
-    Task<TaskDefinitionDB?> LoadDefinitionAsync(Guid id, CancellationToken ct);
+    Task<TaskDefinitionState?> LoadDefinitionAsync(Guid id, CancellationToken ct);
 
-    Task<IReadOnlyList<TaskDefinitionDB>> ListDefinitionsAsync(
+    Task<IReadOnlyList<TaskDefinitionState>> ListDefinitionsAsync(
         CancellationToken ct);
 
-    void TrackDefinition(TaskDefinitionDB definition);
+    void TrackDefinition(TaskDefinitionState definition);
 
-    void RemoveDefinition(TaskDefinitionDB definition);
+    void RemoveDefinition(TaskDefinitionState definition);
 
-    Task<IReadOnlyList<TaskTriggerBindingDB>> LoadTriggerBindingsAsync(
+    Task<IReadOnlyList<TaskTriggerBindingState>> LoadTriggerBindingsAsync(
         Guid taskDefinitionId,
         CancellationToken ct);
 
     Task<bool> SyncTriggersAsync(
-        TaskDefinitionDB definition,
+        TaskDefinitionState definition,
         IReadOnlyList<TaskTriggerDefinition> triggers,
         CancellationToken ct);
 
@@ -429,28 +430,15 @@ public interface ITaskAdministrationHost
         Guid? callerAgentId,
         CancellationToken ct);
 
-    void TrackInstance(TaskInstanceDB instance);
+    void TrackInstance(TaskInstanceState instance);
 
-    Task<TaskInstanceDB?> LoadInstanceAsync(Guid id, CancellationToken ct);
+    Task<TaskInstanceState?> LoadInstanceAsync(Guid id, CancellationToken ct);
 
-    Task<TaskInstanceDB?> LoadInstanceWithLogsAsync(
-        Guid id,
+    Task PersistInstanceAsync(
+        TaskInstanceState instance,
         CancellationToken ct);
 
-    Task<IReadOnlyList<TaskInstanceDB>> ListInstancesAsync(
-        Guid? taskDefinitionId,
-        CancellationToken ct);
-
-    Task<IReadOnlyDictionary<Guid, string>> LoadDefinitionNamesAsync(
-        IReadOnlyCollection<Guid> definitionIds,
-        CancellationToken ct);
-
-    void TrackLog(TaskExecutionLogDB log);
-
-    Task<IReadOnlyList<TaskOutputEntryDB>> ListOutputsAsync(
-        Guid instanceId,
-        DateTimeOffset? since,
-        CancellationToken ct);
+    Task AppendLogAsync(TaskExecutionLog log, CancellationToken ct);
 
     Task SaveAsync(CancellationToken ct);
 }

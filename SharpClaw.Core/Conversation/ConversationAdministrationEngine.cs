@@ -1,8 +1,7 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.DTOs.Channels;
 using SharpClaw.Contracts.DTOs.Contexts;
 using SharpClaw.Contracts.DTOs.Threads;
-using SharpClaw.Contracts.Entities.Core;
-using SharpClaw.Contracts.Entities.Core.Context;
 using SharpClaw.Core.Chat;
 
 namespace SharpClaw.Core.Conversation;
@@ -50,7 +49,7 @@ public sealed class ConversationAdministrationEngine(
     {
         ArgumentNullException.ThrowIfNull(host);
 
-        ChannelDB? channel = null;
+        ChannelState? channel = null;
         var latestChannelId = await host.LoadLatestMessageChannelIdAsync(ct);
         if (latestChannelId is not null)
             channel = await host.LoadChannelAsync(latestChannelId.Value, ct);
@@ -82,12 +81,12 @@ public sealed class ConversationAdministrationEngine(
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(host);
 
-        AgentDB? agent = null;
+        AgentState? agent = null;
         if (request.AgentId is { } agentId)
             agent = await host.LoadAgentAsync(agentId, ct)
                 ?? throw new ArgumentException($"Agent {agentId} not found.");
 
-        ChannelContextDB? context = null;
+        ChannelContextState? context = null;
         if (request.ContextId is { } contextId)
             context = await host.LoadContextAsync(contextId, ct)
                 ?? throw new ArgumentException($"Context {contextId} not found.");
@@ -138,7 +137,7 @@ public sealed class ConversationAdministrationEngine(
             await EnsureChannelTitleUniqueAsync(request.Title, channelId, host, ct);
         }
 
-        ChannelContextDB? context = null;
+        ChannelContextState? context = null;
         if (request.ContextId is not null && request.ContextId != Guid.Empty)
             context = await host.LoadContextAsync(request.ContextId.Value, ct)
                 ?? throw new ArgumentException(
@@ -528,7 +527,7 @@ public sealed class ConversationAdministrationEngine(
         conversation.EnsureContextNameAvailable(name, names);
     }
 
-    private static async Task<IReadOnlyList<AgentDB>?> LoadOptionalAgentsAsync(
+    private static async Task<IReadOnlyList<AgentState>?> LoadOptionalAgentsAsync(
         IReadOnlyList<Guid>? agentIds,
         IConversationAdministrationHost host,
         CancellationToken ct)
@@ -551,36 +550,36 @@ public interface IConversationAdministrationHost
 
     bool UniqueContextNamesEnforced { get; }
 
-    Task<AgentDB?> LoadAgentAsync(Guid agentId, CancellationToken ct);
+    Task<AgentState?> LoadAgentAsync(Guid agentId, CancellationToken ct);
 
-    Task<IReadOnlyList<AgentDB>> LoadAgentsAsync(
+    Task<IReadOnlyList<AgentState>> LoadAgentsAsync(
         IReadOnlyCollection<Guid> agentIds,
         CancellationToken ct);
 
-    Task<ChannelDB?> LoadChannelAsync(Guid channelId, CancellationToken ct);
+    Task<ChannelState?> LoadChannelAsync(Guid channelId, CancellationToken ct);
 
-    Task<ChannelContextDB?> LoadContextAsync(
+    Task<ChannelContextState?> LoadContextAsync(
         Guid contextId,
         CancellationToken ct);
 
-    Task<ChatThreadDB?> LoadThreadAsync(Guid threadId, CancellationToken ct);
+    Task<ChatThreadState?> LoadThreadAsync(Guid threadId, CancellationToken ct);
 
     Task<bool> ChannelExistsAsync(Guid channelId, CancellationToken ct);
 
-    Task<IReadOnlyList<ChannelDB>> ListChannelsAsync(
+    Task<IReadOnlyList<ChannelState>> ListChannelsAsync(
         Guid? agentId,
         Guid? contextId,
         CancellationToken ct);
 
     Task<Guid?> LoadLatestMessageChannelIdAsync(CancellationToken ct);
 
-    Task<ChannelDB?> LoadMostRecentlyCreatedChannelAsync(CancellationToken ct);
+    Task<ChannelState?> LoadMostRecentlyCreatedChannelAsync(CancellationToken ct);
 
-    Task<IReadOnlyList<ChannelContextDB>> ListContextsAsync(
+    Task<IReadOnlyList<ChannelContextState>> ListContextsAsync(
         Guid? agentId,
         CancellationToken ct);
 
-    Task<IReadOnlyList<ChatThreadDB>> ListThreadsAsync(
+    Task<IReadOnlyList<ChatThreadState>> ListThreadsAsync(
         Guid channelId,
         CancellationToken ct);
 
@@ -596,17 +595,17 @@ public interface IConversationAdministrationHost
         Guid contextId,
         CancellationToken ct);
 
-    void TrackChannel(ChannelDB channel);
+    void TrackChannel(ChannelState channel);
 
-    void TrackContext(ChannelContextDB context);
+    void TrackContext(ChannelContextState context);
 
-    void TrackThread(ChatThreadDB thread);
+    void TrackThread(ChatThreadState thread);
 
-    void RemoveChannel(ChannelDB channel);
+    void RemoveChannel(ChannelState channel);
 
-    void RemoveContext(ChannelContextDB context);
+    void RemoveContext(ChannelContextState context);
 
-    void RemoveThread(ChatThreadDB thread);
+    void RemoveThread(ChatThreadState thread);
 
     Task SaveAsync(
         Func<ChatRuntimeInvalidationPlan?>? buildInvalidationPlan,

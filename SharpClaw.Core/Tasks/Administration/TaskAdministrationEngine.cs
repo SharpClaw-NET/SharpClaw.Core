@@ -1,8 +1,7 @@
+using SharpClaw.Core.State;
 using System.Text.Json;
 using SharpClaw.Contracts;
 using SharpClaw.Contracts.DTOs.Tasks;
-using SharpClaw.Contracts.Entities.Core.Jobs;
-using SharpClaw.Contracts.Entities.Core.Tasks;
 using SharpClaw.Contracts.Enums;
 using SharpClaw.Contracts.Tasks;
 using SharpClaw.Core.Tasks.Models;
@@ -58,7 +57,7 @@ public sealed class TaskAdministrationEngine
 
         var definition = ParseAndValidateDefinition(request.SourceText);
 
-        var entity = new TaskDefinitionDB
+        var entity = new TaskDefinitionState
         {
             Name = definition.Name,
             Description = definition.Description,
@@ -88,7 +87,7 @@ public sealed class TaskAdministrationEngine
     /// Applies source and active-state updates to an existing task definition.
     /// </summary>
     public TaskDefinitionUpdatePreparation ApplyDefinitionUpdate(
-        TaskDefinitionDB entity,
+        TaskDefinitionState entity,
         UpdateTaskDefinitionRequest request)
     {
         ArgumentNullException.ThrowIfNull(entity);
@@ -128,8 +127,8 @@ public sealed class TaskAdministrationEngine
     /// <summary>
     /// Creates a queued task instance row from a validated start request.
     /// </summary>
-    public TaskInstanceDB CreateInstance(
-        TaskDefinitionDB definition,
+    public TaskInstanceState CreateInstance(
+        TaskDefinitionState definition,
         StartTaskInstanceRequest request,
         Guid? callerUserId,
         Guid? callerAgentId)
@@ -143,8 +142,10 @@ public sealed class TaskAdministrationEngine
                 $"Task definition '{definition.Name}' is not active.");
         }
 
-        return new TaskInstanceDB
+        return new TaskInstanceState
         {
+            Id = Guid.NewGuid(),
+            CreatedAt = _timeProvider.GetUtcNow(),
             TaskDefinitionId = definition.Id,
             Status = TaskInstanceStatus.Queued,
             ParameterValuesJson = SerializeParameterValues(request.ParameterValues),
@@ -172,7 +173,7 @@ public sealed class TaskAdministrationEngine
     /// <summary>
     /// Moves a running instance to paused.
     /// </summary>
-    public bool TryPauseInstance(TaskInstanceDB instance)
+    public bool TryPauseInstance(TaskInstanceState instance)
     {
         ArgumentNullException.ThrowIfNull(instance);
 
@@ -186,7 +187,7 @@ public sealed class TaskAdministrationEngine
     /// <summary>
     /// Moves a paused instance back to running.
     /// </summary>
-    public bool TryResumeInstance(TaskInstanceDB instance)
+    public bool TryResumeInstance(TaskInstanceState instance)
     {
         ArgumentNullException.ThrowIfNull(instance);
 
@@ -200,7 +201,7 @@ public sealed class TaskAdministrationEngine
     /// <summary>
     /// Moves a queued instance to running and clears terminal fields.
     /// </summary>
-    public bool TryMarkInstanceRunning(TaskInstanceDB instance)
+    public bool TryMarkInstanceRunning(TaskInstanceState instance)
     {
         ArgumentNullException.ThrowIfNull(instance);
 
@@ -217,7 +218,7 @@ public sealed class TaskAdministrationEngine
     /// <summary>
     /// Cancels a running or paused instance after a graceful stop request.
     /// </summary>
-    public bool TryStopInstance(TaskInstanceDB instance)
+    public bool TryStopInstance(TaskInstanceState instance)
     {
         ArgumentNullException.ThrowIfNull(instance);
 
@@ -232,7 +233,7 @@ public sealed class TaskAdministrationEngine
     /// <summary>
     /// Cancels a queued, running, or paused instance.
     /// </summary>
-    public bool TryCancelInstance(TaskInstanceDB instance)
+    public bool TryCancelInstance(TaskInstanceState instance)
     {
         ArgumentNullException.ThrowIfNull(instance);
 
@@ -247,7 +248,7 @@ public sealed class TaskAdministrationEngine
     /// <summary>
     /// Marks a task instance failed because its script could not compile.
     /// </summary>
-    public void ApplyCompilationFailure(TaskInstanceDB instance, string errors)
+    public void ApplyCompilationFailure(TaskInstanceState instance, string errors)
     {
         ArgumentNullException.ThrowIfNull(instance);
 
@@ -259,7 +260,7 @@ public sealed class TaskAdministrationEngine
     /// <summary>
     /// Marks a task instance completed or cancelled.
     /// </summary>
-    public void ApplyTerminalStatus(TaskInstanceDB instance, TaskInstanceStatus status)
+    public void ApplyTerminalStatus(TaskInstanceState instance, TaskInstanceStatus status)
     {
         ArgumentNullException.ThrowIfNull(instance);
 
@@ -270,7 +271,7 @@ public sealed class TaskAdministrationEngine
     /// <summary>
     /// Marks a task instance failed with the supplied error message.
     /// </summary>
-    public void ApplyFailure(TaskInstanceDB instance, string error)
+    public void ApplyFailure(TaskInstanceState instance, string error)
     {
         ArgumentNullException.ThrowIfNull(instance);
 
@@ -283,7 +284,7 @@ public sealed class TaskAdministrationEngine
     /// Marks an instance from a previous process lifetime as failed because
     /// SharpClaw task side effects cannot be safely replayed.
     /// </summary>
-    public TaskRestartRecoveryPlan ApplyRestartRecovery(TaskInstanceDB instance)
+    public TaskRestartRecoveryPlan ApplyRestartRecovery(TaskInstanceState instance)
     {
         ArgumentNullException.ThrowIfNull(instance);
 
@@ -299,50 +300,39 @@ public sealed class TaskAdministrationEngine
             $"Recovery: instance was {previous} at startup \u2014 marked Failed.");
     }
 
-    /// <summary>
-    /// Updates the latest output snapshot and creates the output history row.
-    /// </summary>
-    public TaskOutputEntryDB ApplyOutput(
-        TaskInstanceDB instance,
+    /// <summary>Creates a storage-neutral task output event.</summary>
+    public TaskOutputEmission CreateOutput(
+        Guid instanceId,
         long sequence,
         string? outputJson)
     {
-        ArgumentNullException.ThrowIfNull(instance);
-
-        instance.OutputSnapshotJson = outputJson;
-        return new TaskOutputEntryDB
-        {
-            TaskInstanceId = instance.Id,
-            Sequence = sequence,
-            Data = outputJson,
-        };
+        return new TaskOutputEmission(
+            Guid.NewGuid(),
+            instanceId,
+            sequence,
+            outputJson,
+            _timeProvider.GetUtcNow());
     }
 
-    /// <summary>
-    /// Creates and attaches a task execution log row.
-    /// </summary>
-    public TaskExecutionLogDB AddLog(
-        TaskInstanceDB? instance,
+    /// <summary>Creates a storage-neutral task diagnostic event.</summary>
+    public TaskExecutionLog CreateLog(
         Guid instanceId,
         string message,
         string level = JobLogLevels.Info)
     {
-        var entry = new TaskExecutionLogDB
-        {
-            TaskInstanceId = instanceId,
-            Message = message,
-            Level = level,
-        };
-
-        instance?.LogEntries.Add(entry);
-        return entry;
+        return new TaskExecutionLog(
+            Guid.NewGuid(),
+            instanceId,
+            message,
+            level,
+            _timeProvider.GetUtcNow());
     }
 
     /// <summary>
     /// Projects a persisted task definition into its public response.
     /// </summary>
     public TaskDefinitionResponse ToDefinitionResponse(
-        TaskDefinitionDB entity,
+        TaskDefinitionState entity,
         IReadOnlyList<TaskParameterDefinition> parameters,
         IReadOnlyList<TaskRequirementDefinition> requirements,
         IReadOnlyList<TaskTriggerDefinition> triggers,
@@ -373,34 +363,10 @@ public sealed class TaskAdministrationEngine
     }
 
     /// <summary>
-    /// Projects a task instance and its logs into the public response.
-    /// </summary>
-    public TaskInstanceResponse ToInstanceResponse(
-        TaskInstanceDB instance,
-        string taskName)
-    {
-        ArgumentNullException.ThrowIfNull(instance);
-
-        return new TaskInstanceResponse(
-            instance.Id,
-            instance.TaskDefinitionId,
-            taskName,
-            instance.Status,
-            instance.OutputSnapshotJson,
-            instance.ErrorMessage,
-            ToLogResponses(instance.LogEntries),
-            instance.CreatedAt,
-            instance.StartedAt,
-            instance.CompletedAt,
-            instance.ChannelId,
-            ContextId: instance.ContextId);
-    }
-
-    /// <summary>
     /// Projects a task instance into the list-summary response.
     /// </summary>
     public TaskInstanceSummaryResponse ToSummaryResponse(
-        TaskInstanceDB instance,
+        TaskInstanceState instance,
         string taskName)
     {
         ArgumentNullException.ThrowIfNull(instance);
@@ -413,28 +379,6 @@ public sealed class TaskAdministrationEngine
             instance.CreatedAt,
             instance.StartedAt,
             instance.CompletedAt);
-    }
-
-    /// <summary>
-    /// Projects persisted log rows into public log responses.
-    /// </summary>
-    public IReadOnlyList<TaskExecutionLogResponse> ToLogResponses(
-        IEnumerable<TaskExecutionLogDB> logs)
-    {
-        ArgumentNullException.ThrowIfNull(logs);
-
-        return logs
-            .Select(log => new TaskExecutionLogResponse(log.Message, log.Level, log.CreatedAt))
-            .ToArray();
-    }
-
-    /// <summary>
-    /// Projects a persisted output row into its public response.
-    /// </summary>
-    public TaskOutputEntryResponse ToOutputResponse(TaskOutputEntryDB output)
-    {
-        ArgumentNullException.ThrowIfNull(output);
-        return new TaskOutputEntryResponse(output.Id, output.Sequence, output.Data, output.CreatedAt);
     }
 
     /// <summary>
@@ -609,7 +553,7 @@ public sealed class TaskAdministrationEngine
 /// Parsed metadata produced while preparing a new task definition.
 /// </summary>
 public sealed record TaskDefinitionPreparation(
-    TaskDefinitionDB Entity,
+    TaskDefinitionState Entity,
     TaskScriptDefinition Definition);
 
 /// <summary>

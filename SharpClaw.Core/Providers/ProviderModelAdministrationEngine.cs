@@ -1,6 +1,6 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.DTOs.Models;
 using SharpClaw.Contracts.DTOs.Providers;
-using SharpClaw.Contracts.Entities.Core;
 using SharpClaw.Contracts.Providers;
 
 namespace SharpClaw.Core.Providers;
@@ -72,7 +72,7 @@ public sealed class ProviderModelAdministrationEngine(
             host.UniqueProviderNamesEnforced,
             await host.ListProviderNamesAsync(null, ct));
 
-        var provider = new ProviderDB
+        var provider = new ProviderState
         {
             Name = plan.Name,
             ProviderKey = plan.ProviderKey,
@@ -380,7 +380,7 @@ public sealed class ProviderModelAdministrationEngine(
         return true;
     }
 
-    private static ProviderResponse ToProviderResponse(ProviderDB provider)
+    private static ProviderResponse ToProviderResponse(ProviderState provider)
     {
         ArgumentNullException.ThrowIfNull(provider);
         return new ProviderResponse(
@@ -409,23 +409,23 @@ public interface IProviderModelAdministrationHost
 
     string UnprotectProviderSecret(string protectedSecret);
 
-    Task<ProviderDB?> LoadProviderAsync(Guid providerId, CancellationToken ct);
+    Task<ProviderState?> LoadProviderAsync(Guid providerId, CancellationToken ct);
 
-    Task<ProviderDB?> LoadProviderWithModelsAsync(
+    Task<ProviderState?> LoadProviderWithModelsAsync(
         Guid providerId,
         CancellationToken ct);
 
-    Task<ModelDB?> LoadModelAsync(Guid modelId, CancellationToken ct);
+    Task<ModelState?> LoadModelAsync(Guid modelId, CancellationToken ct);
 
     /// <summary>Loads all configured providers for catalog projection.</summary>
-    Task<IReadOnlyList<ProviderDB>> ListProvidersAsync(CancellationToken ct);
+    Task<IReadOnlyList<ProviderState>> ListProvidersAsync(CancellationToken ct);
 
     /// <summary>Loads configured models for catalog projection.</summary>
-    Task<IReadOnlyList<ModelDB>> ListModelsAsync(
+    Task<IReadOnlyList<ModelState>> ListModelsAsync(
         Guid? providerId,
         CancellationToken ct);
 
-    Task<IReadOnlyList<ModelDB>> ListModelsForProviderAsync(
+    Task<IReadOnlyList<ModelState>> ListModelsForProviderAsync(
         Guid providerId,
         CancellationToken ct);
 
@@ -439,7 +439,7 @@ public interface IProviderModelAdministrationHost
         CancellationToken ct);
 
     Task<IReadOnlyList<string>> ListProviderModelIdsAsync(
-        ProviderDB provider,
+        ProviderState provider,
         IProviderPlugin plugin,
         CancellationToken ct);
 
@@ -452,15 +452,15 @@ public interface IProviderModelAdministrationHost
         DeviceCodeSession session,
         CancellationToken ct);
 
-    void TrackProvider(ProviderDB provider);
+    void TrackProvider(ProviderState provider);
 
-    void TrackModel(ModelDB model);
+    void TrackModel(ModelState model);
 
-    void TrackModels(IReadOnlyList<ModelDB> models);
+    void TrackModels(IReadOnlyList<ModelState> models);
 
-    void RemoveProvider(ProviderDB provider);
+    void RemoveProvider(ProviderState provider);
 
-    void RemoveModel(ModelDB model);
+    void RemoveModel(ModelState model);
 
     Task SaveAsync(CancellationToken ct);
 }

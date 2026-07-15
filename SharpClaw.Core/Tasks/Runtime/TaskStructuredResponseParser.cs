@@ -22,13 +22,13 @@ public sealed class TaskStructuredResponseParser
 
         var jsonText = ExtractJsonObject(text)
             ?? throw new InvalidOperationException(
-                "Structured response parsing expected a JSON object in the source text.");
+                "ParseResponse expected a JSON object in the source text.");
 
         using var doc = JsonDocument.Parse(jsonText);
         if (doc.RootElement.ValueKind != JsonValueKind.Object)
         {
             throw new InvalidOperationException(
-                "Structured response parsing expected a JSON object payload.");
+                "ParseResponse expected a JSON object payload.");
         }
 
         if (!string.IsNullOrWhiteSpace(typeName) && dataTypes is not null)
@@ -71,7 +71,7 @@ public sealed class TaskStructuredResponseParser
             if (!element.TryGetProperty(property.Name, out var propertyElement))
             {
                 throw new InvalidOperationException(
-                    $"Structured response '{dataType.Name}' missing property '{property.Name}'.");
+                    $"ParseResponse<{dataType.Name}> missing property '{property.Name}'.");
             }
 
             if (property.IsCollection)

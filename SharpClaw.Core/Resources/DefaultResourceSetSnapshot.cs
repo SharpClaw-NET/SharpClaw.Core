@@ -1,4 +1,4 @@
-using SharpClaw.Contracts.Entities.Core.Context;
+using SharpClaw.Core.State;
 
 namespace SharpClaw.Core.Resources;
 
@@ -11,7 +11,7 @@ public sealed record DefaultResourceSetSnapshot(
 {
     /// <summary>Creates a snapshot from the shared contracts entity shape.</summary>
     public static DefaultResourceSetSnapshot FromDefaultResourceSet(
-        DefaultResourceSetDB defaultResourceSet)
+        DefaultResourceSetState defaultResourceSet)
     {
         ArgumentNullException.ThrowIfNull(defaultResourceSet);
 

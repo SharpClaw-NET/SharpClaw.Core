@@ -1,5 +1,4 @@
 using SharpClaw.Contracts.DTOs.Tasks;
-using SharpClaw.Contracts.Entities.Core.Jobs;
 using SharpClaw.Contracts.Enums;
 
 namespace SharpClaw.Core.Tasks.Runtime;

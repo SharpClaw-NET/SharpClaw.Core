@@ -1,5 +1,5 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.DTOs.Roles;
-using SharpClaw.Contracts.Entities.Core.Clearance;
 using SharpClaw.Core.Chat;
 
 namespace SharpClaw.Core.Permissions;
@@ -108,7 +108,7 @@ public sealed class RoleAdministrationEngine(
             rolePermissions.ValidateRequestedGrants(request, callerPermissionSet);
         }
 
-        PermissionSetDB permissionSet;
+        PermissionSetState permissionSet;
         if (role.PermissionSetId is { } existingPermissionSetId)
         {
             permissionSet = await host.LoadFullPermissionSetAsync(
@@ -177,22 +177,22 @@ public interface IRoleAdministrationHost
 {
     bool UniqueRoleNamesEnforced { get; }
 
-    Task<RoleDB?> LoadRoleAsync(Guid roleId, CancellationToken ct);
+    Task<RoleState?> LoadRoleAsync(Guid roleId, CancellationToken ct);
 
     /// <summary>Loads all roles for public catalog projection.</summary>
-    Task<IReadOnlyList<RoleDB>> ListRolesAsync(CancellationToken ct);
+    Task<IReadOnlyList<RoleState>> ListRolesAsync(CancellationToken ct);
 
-    Task<RoleDB?> LoadRoleWithPermissionReferenceAsync(
+    Task<RoleState?> LoadRoleWithPermissionReferenceAsync(
         Guid roleId,
         CancellationToken ct);
 
-    Task<RoleDB?> LoadRoleForDeleteAsync(Guid roleId, CancellationToken ct);
+    Task<RoleState?> LoadRoleForDeleteAsync(Guid roleId, CancellationToken ct);
 
-    Task<PermissionSetDB?> LoadFullPermissionSetAsync(
+    Task<PermissionSetState?> LoadFullPermissionSetAsync(
         Guid permissionSetId,
         CancellationToken ct);
 
-    Task<PermissionSetDB?> LoadCallerPermissionSetAsync(
+    Task<PermissionSetState?> LoadCallerPermissionSetAsync(
         Guid userId,
         CancellationToken ct);
 
@@ -202,9 +202,9 @@ public interface IRoleAdministrationHost
         Guid? excludeId,
         CancellationToken ct);
 
-    void TrackRole(RoleDB role);
+    void TrackRole(RoleState role);
 
-    void TrackPermissionSet(PermissionSetDB permissionSet);
+    void TrackPermissionSet(PermissionSetState permissionSet);
 
     void ApplyRoleDeletion(RoleDeletionPlan deletion);
 

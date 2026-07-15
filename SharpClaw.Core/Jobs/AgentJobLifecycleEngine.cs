@@ -1,5 +1,4 @@
 using SharpClaw.Contracts.DTOs.AgentActions;
-using SharpClaw.Contracts.Entities.Core.Jobs;
 using SharpClaw.Contracts.Enums;
 using SharpClaw.Contracts.Modules;
 
@@ -227,8 +226,8 @@ public sealed class AgentJobLifecycleEngine
                 Status = AgentJobStatus.Executing,
                 UpdateCompletedAt = true,
                 CompletedAt = null,
-                UpdateResultData = true,
-                ResultData = resultData,
+                UpdateResult = true,
+                Result = resultData,
                 Logs =
                 [
                     Info(
@@ -243,8 +242,8 @@ public sealed class AgentJobLifecycleEngine
             Status = AgentJobStatus.Completed,
             UpdateCompletedAt = true,
             CompletedAt = now,
-            UpdateResultData = true,
-            ResultData = resultData,
+            UpdateResult = true,
+            Result = resultData,
             Logs = [Info("Job completed successfully.")]
         };
     }
@@ -259,8 +258,10 @@ public sealed class AgentJobLifecycleEngine
             Status = AgentJobStatus.Failed,
             UpdateCompletedAt = true,
             CompletedAt = now,
-            UpdateErrorLog = true,
-            ErrorLog = errorLog,
+            UpdateFailure = true,
+            ErrorCode = "job_execution_failed",
+            ErrorMessage = message,
+            ErrorDetails = errorLog,
             Logs = [Error($"Job failed: {message}")]
         };
 
@@ -298,8 +299,8 @@ public sealed class AgentJobLifecycleEngine
             Status = AgentJobStatus.Completed,
             UpdateCompletedAt = true,
             CompletedAt = now,
-            UpdateResultData = resultData is not null,
-            ResultData = resultData,
+            UpdateResult = resultData is not null,
+            Result = resultData,
             Logs =
             [
                 Info(

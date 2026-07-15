@@ -1,4 +1,4 @@
-using SharpClaw.Contracts.Entities.Core.Clearance;
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.Enums;
 
 namespace SharpClaw.Core.Permissions;
@@ -21,10 +21,9 @@ public sealed record PermissionSetSnapshot(
         new HashSet<Guid>());
 
     /// <summary>
-    /// Creates a snapshot from the shared contracts entity shape without
-    /// retaining any dependency on an EF change tracker.
+    /// Creates an immutable evaluation snapshot from neutral Core state.
     /// </summary>
-    public static PermissionSetSnapshot FromPermissionSet(PermissionSetDB permissionSet)
+    public static PermissionSetSnapshot FromPermissionSet(PermissionSetState permissionSet)
     {
         ArgumentNullException.ThrowIfNull(permissionSet);
 
@@ -41,12 +40,8 @@ public sealed record PermissionSetSnapshot(
                     access.AccessLevel,
                     access.IsDefault))
                 .ToList(),
-            permissionSet.ClearanceUserWhitelist
-                .Select(entry => entry.UserId)
-                .ToHashSet(),
-            permissionSet.ClearanceAgentWhitelist
-                .Select(entry => entry.AgentId)
-                .ToHashSet());
+            permissionSet.ClearanceUserWhitelist.ToHashSet(),
+            permissionSet.ClearanceAgentWhitelist.ToHashSet());
     }
 }
 

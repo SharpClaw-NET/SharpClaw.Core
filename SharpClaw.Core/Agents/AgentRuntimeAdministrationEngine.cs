@@ -1,8 +1,7 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts;
 using SharpClaw.Contracts.DTOs.Agents;
 using SharpClaw.Contracts.DTOs.Auth;
-using SharpClaw.Contracts.Entities.Core;
-using SharpClaw.Contracts.Entities.Core.Clearance;
 using SharpClaw.Contracts.Providers;
 using SharpClaw.Core.Chat;
 using SharpClaw.Core.Clients;
@@ -56,7 +55,7 @@ public sealed class AgentRuntimeAdministrationEngine(
         if (agent is null)
             return null;
 
-        ModelDB? replacementModel = null;
+        ModelState? replacementModel = null;
         if (request.ModelId is { } modelId)
             replacementModel = await host.LoadModelAsync(modelId, ct)
                 ?? throw new ArgumentException($"Model {modelId} not found.");
@@ -92,10 +91,10 @@ public sealed class AgentRuntimeAdministrationEngine(
         if (agent is null)
             return null;
 
-        RoleDB? role = null;
+        RoleState? role = null;
         Guid? callerRoleId = null;
-        PermissionSetDB? callerPermissions = null;
-        PermissionSetDB? targetPermissions = null;
+        PermissionSetState? callerPermissions = null;
+        PermissionSetState? targetPermissions = null;
 
         if (roleId != Guid.Empty)
         {
@@ -150,9 +149,9 @@ public sealed class AgentRuntimeAdministrationEngine(
         if (user is null)
             return null;
 
-        RoleDB? role = null;
-        PermissionSetDB? callerPermissions = null;
-        PermissionSetDB? targetPermissions = null;
+        RoleState? role = null;
+        PermissionSetState? callerPermissions = null;
+        PermissionSetState? targetPermissions = null;
 
         if (roleId != Guid.Empty)
         {
@@ -276,28 +275,28 @@ public interface IAgentAdministrationHost
 
     IProviderPlugin? GetProviderPlugin(string providerKey);
 
-    Task<ModelDB?> LoadModelAsync(Guid modelId, CancellationToken ct);
+    Task<ModelState?> LoadModelAsync(Guid modelId, CancellationToken ct);
 
-    Task<AgentDB?> LoadAgentAsync(Guid agentId, CancellationToken ct);
+    Task<AgentState?> LoadAgentAsync(Guid agentId, CancellationToken ct);
 
-    Task<RoleDB?> LoadRoleAsync(Guid roleId, CancellationToken ct);
+    Task<RoleState?> LoadRoleAsync(Guid roleId, CancellationToken ct);
 
-    Task<UserDB?> LoadUserAsync(Guid userId, CancellationToken ct);
+    Task<UserState?> LoadUserAsync(Guid userId, CancellationToken ct);
 
-    Task<PermissionSetDB?> LoadFullPermissionSetAsync(
+    Task<PermissionSetState?> LoadFullPermissionSetAsync(
         Guid permissionSetId,
         CancellationToken ct);
 
-    Task<IReadOnlyList<ModelDB>> LoadChatCapableModelsAsync(
+    Task<IReadOnlyList<ModelState>> LoadChatCapableModelsAsync(
         CancellationToken ct);
 
     Task<IReadOnlyList<string>> ListAgentNamesAsync(
         Guid? excludeId,
         CancellationToken ct);
 
-    void TrackAgent(AgentDB agent);
+    void TrackAgent(AgentState agent);
 
-    void RemoveAgent(AgentDB agent);
+    void RemoveAgent(AgentState agent);
 
     Task SaveAsync(
         Func<ChatRuntimeInvalidationPlan?>? buildInvalidationPlan,

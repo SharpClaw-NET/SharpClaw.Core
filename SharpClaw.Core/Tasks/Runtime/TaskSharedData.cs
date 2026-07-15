@@ -42,26 +42,10 @@ public sealed class TaskSharedDataStore
 
     /// <summary>
     /// Callback invoked after every shared data mutation (light or big).
-    /// The orchestrator wires this to persist snapshots and log changes.
-    /// Parameters: (<c>changeDescription</c>, <c>lightSnapshot</c>,
-    /// <c>bigSnapshotJson</c>).
+    /// The orchestrator wires this to persist the specific mutation and log
+    /// the change without serializing unrelated large entries.
     /// </summary>
-    public Func<string, string?, string?, Task>? OnSharedDataChanged { get; set; }
-
-    /// <summary>
-    /// Builds a JSON snapshot of all big-data entries for persistence.
-    /// </summary>
-    public string? BuildBigDataSnapshotJson()
-    {
-        if (_bigData.IsEmpty) return null;
-        return JsonSerializer.Serialize(_bigData.Values.Select(e => new
-        {
-            e.Id,
-            e.Title,
-            e.Content,
-            e.CreatedAt
-        }));
-    }
+    public Func<TaskSharedDataChange, Task>? OnSharedDataChanged { get; set; }
 
     // ═══════════════════════════════════════════════════════════════
     // Light shared data  — fully visible in the chat header
@@ -69,6 +53,9 @@ public sealed class TaskSharedDataStore
 
     /// <summary>Max total words for the light-data text.</summary>
     public const int MaxLightDataWords = 500;
+
+    /// <summary>Max total characters for the light-data text.</summary>
+    public const int MaxLightDataCharacters = 32_768;
 
     private readonly Lock _lightLock = new();
     private string? _lightData;
@@ -85,17 +72,24 @@ public sealed class TaskSharedDataStore
     /// </summary>
     public bool TrySetLight(string text)
     {
-        if (CountWords(text) > MaxLightDataWords)
+        if (text.Length > MaxLightDataCharacters
+            || CountWords(text) > MaxLightDataWords)
             return false;
 
         lock (_lightLock) _lightData = text;
         return true;
     }
 
-    /// <summary>Clear the light-data text.</summary>
-    public void ClearLight()
+    /// <summary>Clear light data and publish the neutral change event.</summary>
+    public async Task ClearLightAsync()
     {
         lock (_lightLock) _lightData = null;
+        if (OnSharedDataChanged is not null)
+        {
+            await OnSharedDataChanged(new TaskSharedDataChange(
+                TaskSharedDataChangeKind.LightDataReplaced,
+                "Light data cleared"));
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -107,11 +101,17 @@ public sealed class TaskSharedDataStore
     /// <summary>Snapshot of big-data entry metadata (keys only).</summary>
     public IReadOnlyDictionary<string, BigDataEntry> BigData => _bigData;
 
-    /// <summary>
-    /// Add or overwrite a big-data entry.  Returns the ID (same as
-    /// <paramref name="id"/> when non-null, otherwise auto-generated).
-    /// </summary>
+    /// <summary>Max characters in one big-data content value.</summary>
     public const int MaxBigDataCharacters = 200_000;
+
+    /// <summary>Max big-data entries retained by one task.</summary>
+    public const int MaxBigDataEntries = 1000;
+
+    /// <summary>Max characters in a big-data identifier.</summary>
+    public const int MaxBigDataIdCharacters = 128;
+
+    /// <summary>Max characters in a big-data title.</summary>
+    public const int MaxBigDataTitleCharacters = 512;
 
     /// <summary>
     /// Add or overwrite a big-data entry. Returns <c>false</c> when the
@@ -120,7 +120,11 @@ public sealed class TaskSharedDataStore
     public bool TryWriteBig(string? id, string title, string content, out string resultId)
     {
         resultId = id ?? Guid.NewGuid().ToString("N")[..8];
-        if (content.Length > MaxBigDataCharacters)
+        if (resultId.Length is 0 or > MaxBigDataIdCharacters
+            || title.Length > MaxBigDataTitleCharacters
+            || content.Length > MaxBigDataCharacters
+            || (!_bigData.ContainsKey(resultId)
+                && _bigData.Count >= MaxBigDataEntries))
             return false;
 
         _bigData[resultId] = new BigDataEntry(resultId, title, content, DateTimeOffset.UtcNow);
@@ -135,9 +139,20 @@ public sealed class TaskSharedDataStore
     public IReadOnlyList<(string Id, string Title)> ListBig() =>
         _bigData.Values.Select(e => (e.Id, e.Title)).ToList();
 
-    /// <summary>Remove a big-data entry.</summary>
-    public bool RemoveBig(string id) =>
-        _bigData.TryRemove(id, out _);
+    /// <summary>Remove a big-data entry and publish the neutral change event.</summary>
+    public async Task<bool> RemoveBigAsync(string id)
+    {
+        if (!_bigData.TryRemove(id, out _))
+            return false;
+        if (OnSharedDataChanged is not null)
+        {
+            await OnSharedDataChanged(new TaskSharedDataChange(
+                TaskSharedDataChangeKind.BigDataRemoved,
+                $"Big data '{id}' removed",
+                BigDataId: id));
+        }
+        return true;
+    }
 
     // ═══════════════════════════════════════════════════════════════
     // Agent output
@@ -224,9 +239,10 @@ public sealed class TaskSharedDataStore
                 var ok = TrySetLight(text);
                 if (ok && OnSharedDataChanged is not null)
                     await OnSharedDataChanged(
-                        $"Light data written ({CountWords(text)} words)",
-                        LightData,
-                        BuildBigDataSnapshotJson()).ConfigureAwait(false);
+                        new TaskSharedDataChange(
+                            TaskSharedDataChangeKind.LightDataReplaced,
+                            $"Light data written ({CountWords(text)} words)",
+                            LightData)).ConfigureAwait(false);
                 return ok
                     ? "OK: light shared data written."
                     : $"Error: text exceeds the {lightWordLimit}-word limit for light shared data.";
@@ -270,9 +286,10 @@ public sealed class TaskSharedDataStore
 
                 if (OnSharedDataChanged is not null)
                     await OnSharedDataChanged(
-                        $"Big data '{resultId}' written (title: {title}, {content.Length} chars)",
-                        LightData,
-                        BuildBigDataSnapshotJson()).ConfigureAwait(false);
+                        new TaskSharedDataChange(
+                            TaskSharedDataChangeKind.BigDataUpserted,
+                            $"Big data '{resultId}' written (title: {title}, {content.Length} chars)",
+                            BigData: GetBig(resultId))).ConfigureAwait(false);
 
                 return $"OK: big-data entry '{resultId}' written (title: {title}, {content.Length} chars).";
             }));

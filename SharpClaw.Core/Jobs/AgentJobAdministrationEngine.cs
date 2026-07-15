@@ -1,11 +1,7 @@
-using System.Linq.Expressions;
+using SharpClaw.Core.State;
 using SharpClaw.Contracts;
 using SharpClaw.Contracts.DTOs.AgentActions;
 using SharpClaw.Contracts.DTOs.Chat;
-using SharpClaw.Contracts.Entities.Core;
-using SharpClaw.Contracts.Entities.Core.Context;
-using SharpClaw.Contracts.Entities.Core.Clearance;
-using SharpClaw.Contracts.Entities.Core.Jobs;
 using SharpClaw.Contracts.Enums;
 using SharpClaw.Core.Modules;
 using SharpClaw.Core.Permissions;
@@ -15,7 +11,7 @@ namespace SharpClaw.Core.Jobs;
 /// <summary>
 /// Store-neutral job administration rules used by SharpClaw runtimes.
 /// Hosts own persistence, module dispatch, and cache writes; Core owns job
-/// entity construction, effective-agent checks, projection, log mutation,
+/// state construction, effective-agent checks, projection, lifecycle mutation,
 /// channel-preauthorization gates, and token allocation.
 /// </summary>
 public sealed class AgentJobAdministrationEngine
@@ -24,24 +20,20 @@ public sealed class AgentJobAdministrationEngine
     /// Resolves the agent that should execute a submitted job for a channel.
     /// </summary>
     public Guid ResolveSubmissionAgent(
-        ChannelDB channel,
+        AgentJobChannelContext channel,
         Guid channelId,
         Guid? requestedAgentId)
     {
         ArgumentNullException.ThrowIfNull(channel);
 
-        var agentId = channel.AgentId ?? channel.AgentContext?.AgentId
+        var agentId = channel.AgentId ?? channel.ContextAgentId
             ?? throw new InvalidOperationException(
                 $"Channel {channelId} has no agent and no context agent.");
 
         if (requestedAgentId is not { } requestedAgent || requestedAgent == agentId)
             return agentId;
 
-        var effectiveAllowed = channel.AllowedAgents.Count > 0
-            ? channel.AllowedAgents
-            : (IEnumerable<AgentDB>)(channel.AgentContext?.AllowedAgents ?? []);
-
-        if (!effectiveAllowed.Any(agent => agent.Id == requestedAgent))
+        if (!channel.AllowedAgentIds.Contains(requestedAgent))
             throw new InvalidOperationException(
                 $"Agent {requestedAgent} is not allowed on channel {channelId}. " +
                 "Add it to the channel's or context's allowed agents first.");
@@ -49,8 +41,8 @@ public sealed class AgentJobAdministrationEngine
         return requestedAgent;
     }
 
-    /// <summary>Creates the persisted job row for a submitted action.</summary>
-    public AgentJobDB CreateSubmissionJob(
+    /// <summary>Creates host-independent state for a submitted action.</summary>
+    public AgentJobState CreateSubmissionState(
         Guid channelId,
         Guid agentId,
         SubmitAgentJobRequest request,
@@ -59,8 +51,10 @@ public sealed class AgentJobAdministrationEngine
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        return new AgentJobDB
+        return new AgentJobState
         {
+            Id = Guid.NewGuid(),
+            CreatedAt = DateTimeOffset.UtcNow,
             AgentId = agentId,
             ChannelId = channelId,
             CallerUserId = callerUserId,
@@ -113,7 +107,7 @@ public sealed class AgentJobAdministrationEngine
     /// </summary>
     public bool HasMatchingGrant(
         ModuleRegistry moduleRegistry,
-        PermissionSetDB permissionSet,
+        PermissionSetState permissionSet,
         Guid? resourceId,
         string? actionKey)
     {
@@ -134,7 +128,7 @@ public sealed class AgentJobAdministrationEngine
     /// </summary>
     public bool HasGrantByDelegateName(
         ModuleRegistry moduleRegistry,
-        PermissionSetDB permissionSet,
+        PermissionSetState permissionSet,
         string delegateName,
         Guid? resourceId)
     {
@@ -152,22 +146,6 @@ public sealed class AgentJobAdministrationEngine
     }
 
     /// <summary>
-    /// Builds the standard action-prefix predicate used by job lookup APIs.
-    /// </summary>
-    public Expression<Func<AgentJobDB, bool>> BuildActionPrefixPredicate(
-        string actionKeyPrefix,
-        Guid? resourceId = null)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(actionKeyPrefix);
-
-        return job => job.ActionKey != null
-            && job.ActionKey.StartsWith(
-                actionKeyPrefix,
-                StringComparison.OrdinalIgnoreCase)
-            && (resourceId == null || job.ResourceId == resourceId);
-    }
-
-    /// <summary>
     /// Validates the module stale-job action prefix with the historical host
     /// callback exception text.
     /// </summary>
@@ -181,7 +159,7 @@ public sealed class AgentJobAdministrationEngine
 
     /// <summary>Returns whether a job action key matches a prefix.</summary>
     public bool JobMatchesActionPrefix(
-        AgentJobDB? job,
+        AgentJobState? job,
         string actionKeyPrefix)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(actionKeyPrefix);
@@ -190,17 +168,12 @@ public sealed class AgentJobAdministrationEngine
             StringComparison.OrdinalIgnoreCase) == true;
     }
 
-    /// <summary>Orders jobs by newest creation timestamp first.</summary>
-    public IReadOnlyList<AgentJobDB> OrderMostRecent(
-        IEnumerable<AgentJobDB> jobs)
-    {
-        ArgumentNullException.ThrowIfNull(jobs);
-        return jobs.OrderByDescending(static job => job.CreatedAt).ToArray();
-    }
-
-    /// <summary>Applies a lifecycle decision and creates persisted log rows.</summary>
-    public IReadOnlyList<AgentJobLogEntryDB> ApplyLifecycleDecision(
-        AgentJobDB job,
+    /// <summary>
+    /// Applies only compact lifecycle state to the in-memory job. Result,
+    /// failure, and log payloads remain on the decision for the host port.
+    /// </summary>
+    public void ApplyLifecycleState(
+        AgentJobState job,
         AgentJobLifecycleDecision decision)
     {
         ArgumentNullException.ThrowIfNull(job);
@@ -212,35 +185,6 @@ public sealed class AgentJobAdministrationEngine
             job.StartedAt = decision.StartedAt;
         if (decision.UpdateCompletedAt)
             job.CompletedAt = decision.CompletedAt;
-        if (decision.UpdateResultData)
-            job.ResultData = decision.ResultData;
-        if (decision.UpdateErrorLog)
-            job.ErrorLog = decision.ErrorLog;
-
-        var entries = new List<AgentJobLogEntryDB>(decision.Logs.Count);
-        foreach (var log in decision.Logs)
-            entries.Add(AddLog(job, log.Message, log.Level));
-
-        return entries;
-    }
-
-    /// <summary>Creates and attaches a job log row.</summary>
-    public AgentJobLogEntryDB AddLog(
-        AgentJobDB job,
-        string message,
-        string level = JobLogLevels.Info)
-    {
-        ArgumentNullException.ThrowIfNull(job);
-
-        var entry = new AgentJobLogEntryDB
-        {
-            AgentJobId = job.Id,
-            Message = message,
-            Level = level
-        };
-
-        job.LogEntries.Add(entry);
-        return entry;
     }
 
     /// <summary>
@@ -314,19 +258,12 @@ public sealed class AgentJobAdministrationEngine
             RequiresCallerGrant: requiresCallerGrant);
     }
 
-    /// <summary>Projects a job and its log rows into the public response.</summary>
-    public AgentJobResponse ToResponse(AgentJobDB job)
-    {
-        return ToResponse(job, ToLogResponses(job.LogEntries));
-    }
-
-    /// <summary>Projects a job and supplied log DTOs into the public response.</summary>
+    /// <summary>Projects compact state and a transient outcome for its caller.</summary>
     public AgentJobResponse ToResponse(
-        AgentJobDB job,
-        IReadOnlyList<AgentJobLogResponse> logs)
+        AgentJobState job,
+        AgentJobExecutionOutcome? outcome = null)
     {
         ArgumentNullException.ThrowIfNull(job);
-        ArgumentNullException.ThrowIfNull(logs);
 
         var jobCost = job.PromptTokens is not null || job.CompletionTokens is not null
             ? new TokenUsageResponse(
@@ -343,9 +280,9 @@ public sealed class AgentJobAdministrationEngine
             ResourceId: job.ResourceId,
             Status: job.Status,
             EffectiveClearance: job.EffectiveClearance,
-            ResultData: job.ResultData,
-            ErrorLog: job.ErrorLog,
-            Logs: logs,
+            ResultData: outcome?.ResultData,
+            ErrorCode: outcome?.ErrorCode,
+            ErrorMessage: outcome?.ErrorMessage,
             CreatedAt: job.CreatedAt,
             StartedAt: job.StartedAt,
             CompletedAt: job.CompletedAt,
@@ -355,7 +292,7 @@ public sealed class AgentJobAdministrationEngine
     }
 
     /// <summary>Projects a job into the lightweight summary response.</summary>
-    public AgentJobSummaryResponse ToSummaryResponse(AgentJobDB job)
+    public AgentJobSummaryResponse ToSummaryResponse(AgentJobState job)
     {
         ArgumentNullException.ThrowIfNull(job);
 
@@ -371,31 +308,12 @@ public sealed class AgentJobAdministrationEngine
             job.CompletedAt);
     }
 
-    /// <summary>Projects persisted log rows into ordered log DTOs.</summary>
-    public IReadOnlyList<AgentJobLogResponse> ToLogResponses(
-        IEnumerable<AgentJobLogEntryDB> logs)
-    {
-        ArgumentNullException.ThrowIfNull(logs);
-
-        return logs
-            .OrderBy(static log => log.CreatedAt)
-            .Select(ToLogResponse)
-            .ToArray();
-    }
-
-    /// <summary>Projects a single persisted log row into its DTO.</summary>
-    public AgentJobLogResponse ToLogResponse(AgentJobLogEntryDB log)
-    {
-        ArgumentNullException.ThrowIfNull(log);
-        return new AgentJobLogResponse(log.Message, log.Level, log.CreatedAt);
-    }
-
     /// <summary>
     /// Splits one LLM round's token usage across the jobs that participated
     /// in that round. Any remainder is assigned to the first job.
     /// </summary>
     public void ApplyTokenUsage(
-        IReadOnlyList<AgentJobDB> jobs,
+        IReadOnlyList<AgentJobState> jobs,
         int promptTokens,
         int completionTokens)
     {

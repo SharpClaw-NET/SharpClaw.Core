@@ -1,5 +1,5 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.DTOs.Chat;
-using SharpClaw.Contracts.Entities.Core.Messages;
 
 namespace SharpClaw.Core.Chat;
 
@@ -13,7 +13,7 @@ public sealed class ChatCostEngine
     /// <summary>Builds aggregate token usage for one channel.</summary>
     public ChannelCostResponse BuildChannelCost(
         Guid channelId,
-        IEnumerable<ChatMessageDB> messages)
+        IEnumerable<ChatMessageState> messages)
     {
         ArgumentNullException.ThrowIfNull(messages);
 
@@ -33,7 +33,7 @@ public sealed class ChatCostEngine
     public ThreadCostResponse BuildThreadCost(
         Guid channelId,
         Guid threadId,
-        IEnumerable<ChatMessageDB> messages)
+        IEnumerable<ChatMessageState> messages)
     {
         ArgumentNullException.ThrowIfNull(messages);
 
@@ -56,7 +56,7 @@ public sealed class ChatCostEngine
     public AgentCostResponse BuildAgentCost(
         Guid agentId,
         string agentName,
-        IEnumerable<ChatMessageDB> messages)
+        IEnumerable<ChatMessageState> messages)
     {
         ArgumentNullException.ThrowIfNull(agentName);
         ArgumentNullException.ThrowIfNull(messages);
@@ -97,7 +97,7 @@ public sealed class ChatCostEngine
     /// Builds per-agent token usage for channel and thread aggregates.
     /// </summary>
     public List<AgentTokenBreakdown> BuildAgentBreakdown(
-        IEnumerable<ChatMessageDB> messages)
+        IEnumerable<ChatMessageState> messages)
     {
         ArgumentNullException.ThrowIfNull(messages);
 

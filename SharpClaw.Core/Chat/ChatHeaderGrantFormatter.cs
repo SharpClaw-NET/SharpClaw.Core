@@ -1,5 +1,5 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts;
-using SharpClaw.Contracts.Entities.Core.Clearance;
 using SharpClaw.Core.Modules;
 
 namespace SharpClaw.Core.Chat;
@@ -12,7 +12,7 @@ public sealed class ChatHeaderGrantFormatter(ModuleRegistry moduleRegistry)
     /// <summary>
     /// Formats global and per-resource grant names without expanding resource IDs.
     /// </summary>
-    public IReadOnlyList<string> FormatGrantNames(PermissionSetDB permissionSet)
+    public IReadOnlyList<string> FormatGrantNames(PermissionSetState permissionSet)
     {
         ArgumentNullException.ThrowIfNull(permissionSet);
 
@@ -38,7 +38,7 @@ public sealed class ChatHeaderGrantFormatter(ModuleRegistry moduleRegistry)
     /// Formats grant names and expands wildcard resource grants into concrete IDs.
     /// </summary>
     public async Task<IReadOnlyList<string>> FormatGrantNamesWithResourcesAsync(
-        PermissionSetDB permissionSet,
+        PermissionSetState permissionSet,
         IServiceProvider serviceProvider,
         CancellationToken ct)
     {

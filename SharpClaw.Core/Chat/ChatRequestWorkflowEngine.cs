@@ -1,9 +1,7 @@
+using SharpClaw.Core.State;
 using SharpClaw.Contracts.Chat;
 using SharpClaw.Contracts.DTOs.AgentActions;
 using SharpClaw.Contracts.DTOs.Chat;
-using SharpClaw.Contracts.Entities.Core;
-using SharpClaw.Contracts.Entities.Core.Context;
-using SharpClaw.Contracts.Entities.Core.Messages;
 using SharpClaw.Contracts.Providers;
 
 namespace SharpClaw.Core.Chat;
@@ -271,7 +269,7 @@ public sealed class ChatRequestWorkflowEngine(ChatMessageEngine messages)
     {
         try
         {
-            var toPersist = new List<ChatMessageDB>(
+            var toPersist = new List<ChatMessageState>(
                 userMessageAlreadyPersisted ? 1 : 2);
 
             if (!userMessageAlreadyPersisted)
@@ -299,7 +297,7 @@ public sealed class ChatRequestWorkflowEngine(ChatMessageEngine messages)
         }
     }
 
-    private async Task<ChatMessageDB> CreateUserMessageAsync(
+    private async Task<ChatMessageState> CreateUserMessageAsync(
         Guid channelId,
         Guid? threadId,
         ChatRequest request,
@@ -336,8 +334,8 @@ public interface IChatRequestWorkflowHost
         CancellationToken ct);
 
     Task<string?> BuildChatHeaderAsync(
-        ChannelDB channel,
-        AgentDB agent,
+        ChannelState channel,
+        AgentState agent,
         ChatRequest request,
         ChatRequestPlan plan,
         CancellationToken ct);
@@ -351,7 +349,7 @@ public interface IChatRequestWorkflowHost
         CancellationToken ct);
 
     Task PersistChatMessagesAsync(
-        IReadOnlyList<ChatMessageDB> messages,
+        IReadOnlyList<ChatMessageState> messages,
         CancellationToken ct);
 
     Task<bool> HasUserMessageAsync(
@@ -386,8 +384,8 @@ public interface IChatRequestWorkflowHost
 public sealed record ChatPreparedRequest(
     Guid ChannelId,
     Guid? ThreadId,
-    ChannelDB Channel,
-    AgentDB Agent,
+    ChannelState Channel,
+    AgentState Agent,
     ChatRequestPlan Plan,
     ChatRequest ChatRequest);
 
@@ -398,11 +396,11 @@ public sealed class ChatPreparedRequestState : IDisposable
     public ChatPreparedRequestState(
         Guid channelId,
         Guid? threadId,
-        ChannelDB channel,
-        AgentDB agent,
+        ChannelState channel,
+        AgentState agent,
         ChatRequestPlan plan,
         List<ChatCompletionMessage> history,
-        ChatMessageDB userMessage,
+        ChatMessageState userMessage,
         int? maxHistoryMessages,
         int? maxHistoryCharacters,
         IDisposable? threadProcessing)
@@ -422,11 +420,11 @@ public sealed class ChatPreparedRequestState : IDisposable
 
     public Guid ChannelId { get; }
     public Guid? ThreadId { get; }
-    public ChannelDB Channel { get; }
-    public AgentDB Agent { get; }
+    public ChannelState Channel { get; }
+    public AgentState Agent { get; }
     public ChatRequestPlan Plan { get; }
     public List<ChatCompletionMessage> History { get; }
-    public ChatMessageDB UserMessage { get; }
+    public ChatMessageState UserMessage { get; }
     public int? MaxHistoryMessages { get; }
     public int? MaxHistoryCharacters { get; }
 
@@ -437,8 +435,8 @@ public sealed record ChatCompletedExchange(
     Guid ChannelId,
     Guid? ThreadId,
     ChatRequest ChatRequest,
-    AgentDB Agent,
-    ChatMessageDB UserMessage,
+    AgentState Agent,
+    ChatMessageState UserMessage,
     string AssistantContent,
     IReadOnlyList<AgentJobResponse> JobResults,
     int TotalPromptTokens,
@@ -447,14 +445,14 @@ public sealed record ChatCompletedExchange(
 
 public sealed record ChatExchangePersistenceResult(
     ChatResponse Response,
-    ChatMessageDB AssistantMessage,
+    ChatMessageState AssistantMessage,
     ChatResponseCostResult Costs);
 
 public sealed record ChatPartialAssistantPersistenceRequest(
     Guid ChannelId,
     Guid? ThreadId,
     ChatRequest ChatRequest,
-    AgentDB Agent,
+    AgentState Agent,
     string Content,
     int? TotalPromptTokens,
     int? TotalCompletionTokens,
@@ -480,10 +478,10 @@ public sealed record ChatSenderSnapshot(
 
 public sealed record ChatMessagePersistenceResult(
     bool Succeeded,
-    ChatMessageDB? Message,
+    ChatMessageState? Message,
     Exception? Exception);
 
 public sealed record ChatMessagesPersistenceResult(
     bool Succeeded,
-    IReadOnlyList<ChatMessageDB> Messages,
+    IReadOnlyList<ChatMessageState> Messages,
     Exception? Exception);
