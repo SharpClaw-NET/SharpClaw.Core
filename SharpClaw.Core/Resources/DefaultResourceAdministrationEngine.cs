@@ -237,6 +237,7 @@ public sealed class DefaultResourceAdministrationEngine(
 
         var set = new DefaultResourceSetState();
         channel.DefaultResourceSet = set;
+        channel.DefaultResourceSetId = set.Id;
         host.TrackDefaultResourceSet(set);
         return set;
     }
@@ -250,6 +251,7 @@ public sealed class DefaultResourceAdministrationEngine(
 
         var set = new DefaultResourceSetState();
         context.DefaultResourceSet = set;
+        context.DefaultResourceSetId = set.Id;
         host.TrackDefaultResourceSet(set);
         return set;
     }
