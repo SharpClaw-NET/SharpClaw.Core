@@ -201,26 +201,3 @@ public sealed class DefaultResourceEntryState : DomainState
     public string ResourceKey { get; set; } = string.Empty;
     public Guid ResourceId { get; set; }
 }
-
-public sealed class TaskDefinitionState : DomainState
-{
-    public required string Name { get; set; }
-    public string? Description { get; set; }
-    public required string SourceText { get; set; }
-    public string? OutputTypeName { get; set; }
-    public string? ParametersJson { get; set; }
-    public string? RequirementsJson { get; set; }
-    public string? TriggersJson { get; set; }
-    public bool IsActive { get; set; } = true;
-    public ICollection<TaskTriggerBindingState> TriggerBindings { get; set; } = [];
-}
-
-public sealed class TaskTriggerBindingState : DomainState
-{
-    public Guid TaskDefinitionId { get; set; }
-    public required string Kind { get; set; }
-    public string? TriggerValue { get; set; }
-    public string? Filter { get; set; }
-    public required string DefinitionJson { get; set; }
-    public bool IsEnabled { get; set; } = true;
-}

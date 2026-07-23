@@ -18,7 +18,7 @@ through its NuGet package dependency, not through a project reference, so the
 package boundary is the same during local development and after publishing.
 
 Contracts distinguishes pipeline-only modules from application runtime modules.
-An `ISharpClawCoreModule` can add providers, tools, transcription, task parser
+An `ISharpClawCoreModule` can add providers, tools, and transcription
 hooks, resources, permissions, storage contracts, and other pure pipeline
 behavior. An `ISharpClawRuntimeModule` extends that same core module contract
 and can also publish CLI commands, API endpoints, gateway routes, and frontend
@@ -27,7 +27,7 @@ is a superset; runtime modules can make core pipeline additions, but core
 modules cannot publish application surfaces.
 
 The Core package now owns the host-independent parts of the runtime pipeline.
-It contains task script parsing, validation, compilation, and step registration;
+It contains the host-agnostic business pipeline, state, module, and provider infrastructure;
 the module registry and its capability, storage-contract, protocol-contract,
 CLI-command, resource, flag, header-tag, runtime-host, and initialization-order
 state machines; provider plugin selection and completion parameter validation;

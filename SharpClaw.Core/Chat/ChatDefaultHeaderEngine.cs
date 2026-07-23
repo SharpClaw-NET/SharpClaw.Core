@@ -37,34 +37,6 @@ public sealed class ChatDefaultHeaderEngine(ProviderApiClientFactory clientFacto
     public bool ShouldBuildDefaultHeader(bool disableDefaultHeaders) =>
         !disableDefaultHeaders;
 
-    /// <summary>Builds the default header for automated task messages.</summary>
-    public string BuildTaskHeader(
-        ChatTaskHeaderFacts facts,
-        string? agentSuffix,
-        DateTimeOffset now)
-    {
-        ArgumentNullException.ThrowIfNull(facts);
-
-        var sb = Begin(now);
-        sb.Append(" | source: automated task");
-        sb.Append(" | task: ").Append(facts.TaskName);
-
-        if (facts.SharedData is not null)
-            sb.Append(" | shared-data: ").Append(facts.SharedData);
-
-        if (facts.BigDataReferences.Count > 0)
-        {
-            sb.Append(" | big-data-ids: [");
-            sb.Append(string.Join(
-                ", ",
-                facts.BigDataReferences.Select(e => $"{e.Id}:\"{e.Title}\"")));
-            sb.Append(']');
-        }
-
-        AppendSuffix(sb, agentSuffix);
-        return sb.ToString();
-    }
-
     /// <summary>Builds the default header for externally forwarded users.</summary>
     public string BuildExternalUserHeader(
         ChatExternalUserHeaderFacts facts,
@@ -167,15 +139,6 @@ public sealed class ChatDefaultHeaderEngine(ProviderApiClientFactory clientFacto
         sb.Append(agentSuffix ?? "]");
     }
 }
-
-/// <summary>Facts used to build a task-sourced chat header.</summary>
-public sealed record ChatTaskHeaderFacts(
-    string TaskName,
-    string? SharedData,
-    IReadOnlyList<ChatTaskBigDataReference> BigDataReferences);
-
-/// <summary>Task big-data metadata exposed in the default chat header.</summary>
-public sealed record ChatTaskBigDataReference(string Id, string Title);
 
 /// <summary>Facts used to build an external forwarded-user chat header.</summary>
 public sealed record ChatExternalUserHeaderFacts(

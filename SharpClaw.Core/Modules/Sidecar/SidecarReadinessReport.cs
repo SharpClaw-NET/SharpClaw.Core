@@ -47,14 +47,12 @@ public sealed record ModuleContributionInventory(
     bool OverridesSeedData,
     bool OverridesHealthCheck,
     bool OverridesStreamingTools,
-    bool OverridesJobCompletionBehavior,
-    bool IsTaskParserAware);
+    bool OverridesJobCompletionBehavior);
 
 public sealed record ModuleServiceInventory(
     IReadOnlyList<ModuleServiceRegistration> Registrations,
     IReadOnlyList<string> ModuleStorageRegistrationTypes,
     IReadOnlyList<string> ProviderPluginRegistrations,
-    IReadOnlyList<string> TaskRuntimeServiceRegistrations,
     IReadOnlyList<string> EventSinkRegistrations,
     IReadOnlyList<string> FactoryBackedServiceRegistrations,
     string? RegistrationCollectionError = null);

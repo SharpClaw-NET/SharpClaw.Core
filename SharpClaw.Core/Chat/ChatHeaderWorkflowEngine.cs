@@ -1,7 +1,5 @@
 using SharpClaw.Core.State;
-using SharpClaw.Contracts.DTOs.Tasks;
 using SharpClaw.Contracts.Providers;
-using SharpClaw.Core.Tasks.Runtime;
 
 namespace SharpClaw.Core.Chat;
 
@@ -51,15 +49,6 @@ public sealed class ChatHeaderWorkflowEngine(
 
         if (!_headers.ShouldBuildDefaultHeader(request.DisableDefaultHeaders))
             return null;
-
-        if (request.TaskContext is { } taskContext)
-        {
-            var suffix = await LoadAgentSuffixAsync(request, host, ct);
-            return _headers.BuildTaskHeader(
-                BuildTaskHeaderFacts(taskContext),
-                suffix,
-                request.Now);
-        }
 
         if (sessionUserId is null && request.ExternalUsername is not null)
         {
@@ -123,28 +112,6 @@ public sealed class ChatHeaderWorkflowEngine(
             ChatCache.EstimateString,
             ct);
 
-    private static ChatTaskHeaderFacts BuildTaskHeaderFacts(
-        TaskChatContext taskContext)
-    {
-        var store = TaskSharedData.Get(taskContext.InstanceId);
-        string? lightText = null;
-        IReadOnlyList<ChatTaskBigDataReference> bigEntries = [];
-        if (store is not null)
-        {
-            lightText = store.LightData;
-            bigEntries = store.ListBig()
-                .Select(static entry => new ChatTaskBigDataReference(
-                    entry.Id,
-                    entry.Title))
-                .ToArray();
-        }
-
-        return new ChatTaskHeaderFacts(
-            taskContext.TaskName,
-            lightText,
-            bigEntries);
-    }
-
     private static long EstimateUserHeaderState(ChatHeaderUserState state)
         => 128
            + ChatCache.EstimateString(state.Username)
@@ -182,7 +149,6 @@ public sealed record ChatHeaderWorkflowRequest(
     AgentState Agent,
     string ClientType,
     bool DisableDefaultHeaders,
-    TaskChatContext? TaskContext,
     string? ExternalUsername,
     string? ExternalDisplayName,
     CompletionParameters? CompletionParameters,

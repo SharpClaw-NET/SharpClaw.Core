@@ -1,7 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using SharpClaw.Contracts.DTOs.AgentActions;
-using SharpClaw.Contracts.DTOs.Tasks;
 using SharpClaw.Contracts.Providers;
 
 namespace SharpClaw.Core.Chat;
@@ -34,7 +33,6 @@ public sealed class ChatProviderExecutionWorkflowEngine(
         {
             var effectiveTools = await _tools.GetEffectiveToolsAsync(
                 new ChatEffectiveToolRequest(
-                    request.TaskContext,
                     request.ToolAwareness,
                     request.AgentId),
                 request.CancellationToken);
@@ -55,7 +53,6 @@ public sealed class ChatProviderExecutionWorkflowEngine(
                     request.NativeToolHost,
                     request.CancellationToken,
                     request.ApprovalCallback,
-                    request.TaskContext,
                     request.ToolAwareness,
                     request.ThreadId,
                     request.TimingRequestId,
@@ -106,7 +103,6 @@ public sealed class ChatProviderExecutionWorkflowEngine(
         var effectiveTools = request.EnableTools
             ? await _tools.GetEffectiveToolsAsync(
                 new ChatEffectiveToolRequest(
-                    request.TaskContext,
                     request.ToolAwareness,
                     request.AgentId),
                 cancellationToken)
@@ -128,7 +124,6 @@ public sealed class ChatProviderExecutionWorkflowEngine(
                 request.NativeToolHost,
                 cancellationToken,
                 request.ApprovalCallback,
-                request.TaskContext,
                 request.ToolAwareness,
                 request.ThreadId,
                 request.TimingRequestId,
@@ -156,7 +151,6 @@ public sealed record ChatBufferedProviderExecutionRequest(
     IChatNativeToolLoopHost NativeToolHost,
     CancellationToken CancellationToken,
     Func<AgentJobResponse, CancellationToken, Task<bool>>? ApprovalCallback = null,
-    TaskChatContext? TaskContext = null,
     Dictionary<string, bool>? ToolAwareness = null,
     Guid? ThreadId = null,
     string? TimingRequestId = null,
@@ -185,7 +179,6 @@ public sealed record ChatStreamingProviderExecutionRequest(
     IChatNativeToolLoopHost NativeToolHost,
     CancellationToken CancellationToken,
     Func<AgentJobResponse, CancellationToken, Task<bool>>? ApprovalCallback = null,
-    TaskChatContext? TaskContext = null,
     Dictionary<string, bool>? ToolAwareness = null,
     Guid? ThreadId = null,
     string? TimingRequestId = null,

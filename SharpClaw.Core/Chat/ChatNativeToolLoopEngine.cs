@@ -7,7 +7,6 @@ using Microsoft.Extensions.Logging.Abstractions;
 using SharpClaw.Contracts;
 using SharpClaw.Contracts.DTOs.AgentActions;
 using SharpClaw.Contracts.DTOs.Chat;
-using SharpClaw.Contracts.DTOs.Tasks;
 using SharpClaw.Contracts.Models;
 using SharpClaw.Contracts.Providers;
 using SharpClaw.Core.Tools;
@@ -157,21 +156,6 @@ public sealed class ChatNativeToolLoopEngine(
 
             foreach (var toolCall in result.ToolCalls)
             {
-                var (handled, taskResult) =
-                    await request.Host.TryHandleTaskToolAsync(
-                        toolCall,
-                        request.TaskContext,
-                        request.CancellationToken);
-                if (handled)
-                {
-                    messages.Add(ToolAwareMessage.ToolResult(
-                        toolCall.Id,
-                        taskResult ?? ""));
-                    toolNotation.Append(
-                        ToolNotationFormatter.ForTaskTool(toolCall.Name));
-                    continue;
-                }
-
                 if (request.Host.IsInlineTool(toolCall.Name))
                 {
                     var inlineResult =
@@ -432,24 +416,6 @@ public sealed class ChatNativeToolLoopEngine(
 
             foreach (var toolCall in roundResult.ToolCalls)
             {
-                var (handled, taskResult) =
-                    await request.Host.TryHandleTaskToolAsync(
-                        toolCall,
-                        request.TaskContext,
-                        cancellationToken);
-                if (handled)
-                {
-                    messages.Add(ToolAwareMessage.ToolResult(
-                        toolCall.Id,
-                        taskResult ?? ""));
-                    var taskNotation =
-                        ToolNotationFormatter.ForTaskTool(toolCall.Name);
-                    fullContent.Append(taskNotation);
-                    yield return ChatNativeToolStreamingLoopEvent.TextDelta(
-                        taskNotation);
-                    continue;
-                }
-
                 if (request.Host.IsInlineTool(toolCall.Name))
                 {
                     var inlineResult =
@@ -562,7 +528,6 @@ public sealed record ChatNativeToolLoopRequest(
     IChatNativeToolLoopHost Host,
     CancellationToken CancellationToken,
     Func<AgentJobResponse, CancellationToken, Task<bool>>? ApprovalCallback = null,
-    TaskChatContext? TaskContext = null,
     Dictionary<string, bool>? ToolAwareness = null,
     Guid? ThreadId = null,
     string? TimingRequestId = null,
@@ -576,14 +541,6 @@ public interface IChatNativeToolLoopHost
 {
     /// <summary>Returns true when a tool name is an inline module tool.</summary>
     bool IsInlineTool(string toolName);
-
-    /// <summary>
-    /// Gives task-scoped tools a chance to handle one provider tool call.
-    /// </summary>
-    Task<(bool Handled, string? Result)> TryHandleTaskToolAsync(
-        ChatToolCall toolCall,
-        TaskChatContext? taskContext,
-        CancellationToken ct);
 
     /// <summary>Executes one inline module tool call.</summary>
     Task<string> ExecuteInlineToolAsync(

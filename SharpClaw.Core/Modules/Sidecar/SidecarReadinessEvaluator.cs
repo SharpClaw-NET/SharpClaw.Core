@@ -64,19 +64,6 @@ public sealed class SidecarReadinessEvaluator
 
         AddCovered(
             findings,
-            contributions.IsTaskParserAware ? 1 : 0,
-            "tasks.parser_extension",
-            "Task parser extensions are covered by the current foreign protocol.");
-
-        AddCovered(
-            findings,
-            services.TaskRuntimeServiceRegistrations.Count,
-            "tasks.runtime_services",
-            "Task runtime services are covered by the current foreign protocol: "
-            + string.Join(", ", services.TaskRuntimeServiceRegistrations));
-
-        AddCovered(
-            findings,
             services.EventSinkRegistrations.Count,
             "events.sinks",
             "Host event sinks are covered by the current foreign protocol: "
