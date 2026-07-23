@@ -45,7 +45,7 @@ public sealed class DefaultResourceAdministrationEngineTests
     private static SetDefaultResourcesRequest Request() =>
         new(new Dictionary<string, Guid?>
         {
-            ["task"] = Guid.NewGuid()
+            ["sample-resource"] = Guid.NewGuid()
         });
 
     private sealed class TestHost : IDefaultResourceAdministrationHost
