@@ -11,11 +11,11 @@ module bundle, or UI. A host application embeds SharpClaw.Core and supplies
 stores, module invokers, provider clients, clocks, metrics, event sinks, and
 configuration.
 
-The repository publishes two packages. `SharpClaw.Contracts` is the MIT
-licensed module and provider contract package. `SharpClaw.Core` remains
-AGPL-3.0 and is the host-agnostic behavior package. Core consumes Contracts
-through its NuGet package dependency, not through a project reference, so the
-package boundary is the same during local development and after publishing.
+`SharpClaw.Contracts` is the MIT-licensed module and provider contract package.
+`SharpClaw.Core` is the AGPL-3.0 host-agnostic behavior package. Core consumes
+Contracts through its NuGet package dependency, not through a project reference,
+so the package boundary is the same during local development and after
+publishing.
 
 Contracts distinguishes pipeline-only modules from application runtime modules.
 An `ISharpClawCoreModule` can add providers, tools, and transcription
@@ -27,7 +27,8 @@ is a superset; runtime modules can make core pipeline additions, but core
 modules cannot publish application surfaces.
 
 The Core package now owns the host-independent parts of the runtime pipeline.
-It contains the host-agnostic business pipeline, state, module, and provider infrastructure;
+It contains the host-agnostic business pipeline, state, module, and provider
+infrastructure; the module registry and its capability, storage-contract,
 the module registry and its capability, storage-contract, protocol-contract,
 CLI-command, resource, flag, header-tag, runtime-host, and initialization-order
 state machines; provider plugin selection and completion parameter validation;
