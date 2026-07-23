@@ -29,9 +29,9 @@ modules cannot publish application surfaces.
 The Core package now owns the host-independent parts of the runtime pipeline.
 It contains the host-agnostic business pipeline, state, module, and provider
 infrastructure; the module registry and its capability, storage-contract,
-the module registry and its capability, storage-contract, protocol-contract,
-CLI-command, resource, flag, header-tag, runtime-host, and initialization-order
-state machines; provider plugin selection and completion parameter validation;
+protocol-contract, CLI-command, resource, flag, header-tag, runtime-host, and
+initialization-order state machines; provider plugin selection and completion
+parameter validation;
 default resource keys; event sink dispatch; module metrics; and sidecar
 capability telemetry contracts. These pieces can run in any host that supplies
 the actual stores, process boundaries, provider HTTP clients, clocks, logging,
