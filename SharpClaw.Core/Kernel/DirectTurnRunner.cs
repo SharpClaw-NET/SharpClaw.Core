@@ -40,6 +40,19 @@ public sealed class DirectTurnRunner
     {
         ArgumentNullException.ThrowIfNull(input);
         var snapshot = _graph.ChatSnapshot;
+        return await RunStageAsync(
+            SharpClawActions.Chat.Turn,
+            input,
+            ct => RunCoreAsync(input, snapshot, ct),
+            snapshot.Actions,
+            cancellationToken);
+    }
+
+    private async ValueTask<ChatTurnResult> RunCoreAsync(
+        ChatTurnInput input,
+        ChatPipelineSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
         var conversation = await RunStageAsync(
             SharpClawActions.Chat.ResolveConversation,
             input,
@@ -67,11 +80,17 @@ public sealed class DirectTurnRunner
                 ct),
             snapshot.Actions,
             cancellationToken);
+        var selectedTools = await RunInputStageAsync(
+            SharpClawActions.Chat.SelectTools,
+            snapshot.Tools,
+            (tools, _) => ValueTask.FromResult<IReadOnlyList<ToolDescriptor>>(tools),
+            snapshot.Actions,
+            cancellationToken);
         var request = new ProviderTurnRequest(
             turn,
             profile,
             context,
-            snapshot.Tools);
+            selectedTools);
         var completion = await RunStageAsync(
             SharpClawActions.Chat.ProviderRound,
             request,
@@ -90,8 +109,8 @@ public sealed class DirectTurnRunner
             snapshot.Actions,
             cancellationToken);
         return new ChatTurnResult(
-            conversation.ConversationId,
             turn.TurnId,
+            conversation.ConversationId,
             completion,
             context.Features);
     }
@@ -103,6 +122,42 @@ public sealed class DirectTurnRunner
         ActionPipelineSnapshot snapshot,
         CancellationToken cancellationToken) =>
         RunStageCoreAsync(key, input, operation, snapshot, cancellationToken);
+
+    private ValueTask<TResult> RunInputStageAsync<TInput, TResult>(
+        SharpClawActionKey key,
+        TInput input,
+        Func<TInput, CancellationToken, ValueTask<TResult>> operation,
+        ActionPipelineSnapshot snapshot,
+        CancellationToken cancellationToken) =>
+        RunInputStageCoreAsync(key, input, operation, snapshot, cancellationToken);
+
+    private async ValueTask<TResult> RunInputStageCoreAsync<TInput, TResult>(
+        SharpClawActionKey key,
+        TInput input,
+        Func<TInput, CancellationToken, ValueTask<TResult>> operation,
+        ActionPipelineSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
+        var descriptor = _graph.GetStandardAction(key);
+        var result = await _dispatcher.RunRequiredAsync(
+            descriptor,
+            new KernelActionEnvelope(key, input),
+            async (envelope, ct) =>
+            {
+                var effectiveInput = envelope.Payload is TInput typed ? typed : input;
+                var value = await operation(effectiveInput, ct);
+                return value is null
+                    ? throw new KernelActionExecutionException($"Action '{key.Value}' returned no value.")
+                    : (object)value;
+            },
+            snapshot,
+            cancellationToken);
+        return result is TResult typed
+            ? typed
+            : throw new KernelActionExecutionException(
+                $"Action '{key.Value}' returned '{result?.GetType().FullName ?? "null"}' " +
+                $"instead of '{typeof(TResult).FullName}'.");
+    }
 
     private async ValueTask<TResult> RunStageCoreAsync<TInput, TResult>(
         SharpClawActionKey key,
@@ -147,7 +202,9 @@ public sealed class KernelChatContextAssembler : IChatContextAssembler
         CancellationToken cancellationToken)
     {
         var systemPromptSegments = new List<SystemPromptSegment>();
-        var messages = new List<ChatCompletionMessage>();
+        var messages = new List<ChatCompletionMessage>(request.History);
+        if (!string.IsNullOrWhiteSpace(request.Profile.SystemPrompt))
+            systemPromptSegments.Add(new SystemPromptSegment("profile.system", request.Profile.SystemPrompt));
         var features = new List<ExtensionFeature>();
         foreach (var contributor in _contributors)
         {

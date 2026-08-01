@@ -50,6 +50,9 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         if (outcome.Kind == ActionOutcomeKind.Completed)
             return outcome.Result!;
 
+        if (outcome.Kind == ActionOutcomeKind.Uncertain && outcome.Uncertainty is not null)
+            throw new ActionOutcomeUncertainException(outcome.Uncertainty);
+
         throw new KernelActionExecutionException(
             $"Action '{descriptor.Key.Value}' did not complete. " +
             $"Kind={outcome.Kind}, Error={outcome.Error?.Code ?? "none"}. " +
@@ -62,9 +65,9 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         private readonly Func<TAction, CancellationToken, ValueTask<TResult>> _terminal;
         private readonly ActionPipelineSnapshot _snapshot;
         private readonly IActionContinuationHost _continuationHost;
-        private readonly CancellationToken _rootCancellationToken;
         private readonly Guid _traceId = Guid.NewGuid();
         private readonly Guid _idempotencyKey = Guid.NewGuid();
+        private readonly DateTimeOffset _deadline;
 
         public KernelActionInvocation(
             CompiledActionDefinition<TAction, TResult> definition,
@@ -77,10 +80,10 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             _terminal = terminal;
             _snapshot = snapshot;
             _continuationHost = continuationHost;
-            _rootCancellationToken = rootCancellationToken;
+            _deadline = DateTimeOffset.UtcNow + definition.Descriptor.DefaultTimeout;
         }
 
-        public ValueTask<IActionOutcome<TResult>> InvokeAsync(
+        public async ValueTask<IActionOutcome<TResult>> InvokeAsync(
             TAction action,
             int index,
             int depth,
@@ -89,22 +92,23 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             Guid? parentInvocationId = null)
         {
             if (depth > _snapshot.MaximumActionDepth)
-            {
-                return ValueTask.FromResult<IActionOutcome<TResult>>(KernelActionOutcome<TResult>.Failed(
+                return KernelActionOutcome<TResult>.Failed(
                     "ACTION_DEPTH_EXCEEDED",
-                    "The action graph exceeded its maximum recursion depth."));
-            }
+                    "The action graph exceeded its maximum recursion depth.");
+            if (DateTimeOffset.UtcNow >= _deadline)
+                return KernelActionOutcome<TResult>.Failed(
+                    "ACTION_DEADLINE_EXCEEDED",
+                    "The action deadline expired before this action path completed.");
 
             var invocationId = Guid.NewGuid();
-            var deadline = DateTimeOffset.UtcNow + _definition.Descriptor.DefaultTimeout;
             var context = new ActionContext<TAction>(
                 invocationId,
                 parentInvocationId,
                 _traceId,
                 _idempotencyKey,
-                attempt,
                 depth,
-                deadline,
+                attempt,
+                _deadline,
                 _definition.Descriptor.Key,
                 _definition.OwnerModuleId,
                 RequestPrincipal.Anonymous,
@@ -113,80 +117,59 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                 _snapshot);
 
             if (index >= _definition.Frames.Count)
-                return InvokeTerminalAsync(action, invocationId, cancellationToken);
+                return await InvokeTerminalAsync(action, invocationId, cancellationToken);
 
             var frame = _definition.Frames[index];
             if (frame is TypedActionFrame<TAction, TResult> typed)
-            {
-                var control = new TypedActionControl(
-                    this,
-                    context,
-                    action,
-                    index,
-                    depth,
-                    attempt,
-                    invocationId);
-                return InvokeTypedAsync(typed.Interceptor, context, control, cancellationToken);
-            }
+                return await InvokeTypedAsync(typed, context, cancellationToken);
 
             if (frame is AnyActionFrame<TAction, TResult> any)
-            {
-                var descriptor = new UntypedActionDescriptor(
-                    _definition.Descriptor.Key,
-                    _definition.Descriptor.Version,
-                    _definition.Descriptor.Category,
-                    _definition.Descriptor.Capabilities,
-                    new JsonSchemaReference("core.action.input", 1, string.Empty),
-                    new JsonSchemaReference("core.action.result", 1, string.Empty),
-                    _definition.Descriptor.ContainsSensitiveData);
-                var untypedContext = new UntypedActionContext(
-                    context.InvocationId,
-                    context.ParentInvocationId,
-                    context.TraceId,
-                    context.IdempotencyKey,
-                    context.Attempt,
-                    context.Depth,
-                    context.Deadline,
-                    context.OwnerModuleId,
-                    context.Caller,
-                    context.Features,
-                    context.Snapshot.ContractHash,
-                    descriptor,
-                    KernelJson.Serialize(action));
-                var control = new UntypedActionControl(
-                    this,
-                    context,
-                    action,
-                    index,
-                    depth,
-                    attempt,
-                    invocationId);
-                return InvokeUntypedAsync(any.Interceptor, untypedContext, control, cancellationToken);
-            }
+                return await InvokeUntypedAsync(any, context, cancellationToken);
 
-            throw new KernelActionExecutionException("The compiled action graph contains an unknown frame.");
+            return KernelActionOutcome<TResult>.Failed(
+                "ACTION_FRAME_INVALID",
+                "The compiled action graph contains an unknown frame.");
         }
 
         private async ValueTask<IActionOutcome<TResult>> InvokeTypedAsync(
-            IActionInterceptor<TAction, TResult> interceptor,
+            TypedActionFrame<TAction, TResult> frame,
             ActionContext<TAction> context,
-            TypedActionControl control,
             CancellationToken cancellationToken)
         {
+            var control = new TypedActionControl(this, context, frame, context.Action);
             try
             {
-                var outcome = await interceptor.InvokeAsync(context, control, cancellationToken);
-                return outcome ?? KernelActionOutcome<TResult>.Failed(
-                    "ACTION_NULL_OUTCOME",
-                    "An action interceptor returned no outcome.");
+                var outcome = await InvokeHookAsync(
+                    token => frame.Interceptor.InvokeAsync(context, control, token),
+                    frame.Ordering,
+                    cancellationToken);
+                return ValidateOutcome(outcome, control.Authority);
             }
             catch (ActionOutcomeUncertainException exception)
             {
-                return await RecordUncertaintyAsync(context, exception.Uncertainty, cancellationToken);
+                return await RecordUncertaintyAsync(context, exception.Uncertainty, control.Authority, cancellationToken);
             }
             catch (KernelCapabilityException exception)
             {
                 return KernelActionOutcome<TResult>.Failed("ACTION_CAPABILITY_DENIED", exception.Message);
+            }
+            catch (KernelControlException exception)
+            {
+                return KernelActionOutcome<TResult>.Failed("ACTION_CONTROL_CONSUMED", exception.Message);
+            }
+            catch (TimeoutException) when (frame.Ordering.FailurePolicy == HookFailurePolicy.BestEffort)
+            {
+                return await InvokeAsync(context.Action, FrameIndex(frame) + 1,
+                    context.Depth, cancellationToken, context.Attempt, context.InvocationId);
+            }
+            catch (Exception) when (frame.Ordering.FailurePolicy == HookFailurePolicy.BestEffort)
+            {
+                return await InvokeAsync(context.Action, FrameIndex(frame) + 1,
+                    context.Depth, cancellationToken, context.Attempt, context.InvocationId);
+            }
+            catch (TimeoutException exception)
+            {
+                return KernelActionOutcome<TResult>.Failed("ACTION_HOOK_TIMEOUT", exception.Message);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -199,39 +182,75 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         }
 
         private async ValueTask<IActionOutcome<TResult>> InvokeUntypedAsync(
-            IAnyActionInterceptor interceptor,
-            UntypedActionContext context,
-            UntypedActionControl control,
+            AnyActionFrame<TAction, TResult> frame,
+            ActionContext<TAction> context,
             CancellationToken cancellationToken)
         {
+            var descriptor = new UntypedActionDescriptor(
+                _definition.Descriptor.Key,
+                _definition.Descriptor.Version,
+                _definition.Descriptor.Category,
+                _definition.EffectiveCapabilities,
+                new JsonSchemaReference("core.action.input", 1, string.Empty),
+                new JsonSchemaReference("core.action.result", 1, string.Empty),
+                _definition.Descriptor.ContainsSensitiveData);
+            var untypedContext = new UntypedActionContext(
+                context.InvocationId,
+                context.ParentInvocationId,
+                context.TraceId,
+                context.IdempotencyKey,
+                context.Depth,
+                context.Attempt,
+                context.Deadline,
+                context.OwnerModuleId,
+                context.Caller,
+                context.Features,
+                context.Snapshot.ContractHash,
+                descriptor,
+                KernelJson.Serialize(context.Action));
+            var control = new UntypedActionControl(
+                this,
+                context,
+                frame,
+                context.Action);
             try
             {
-                var outcome = await interceptor.InvokeAsync(context, control, cancellationToken);
-                return outcome is null
-                    ? KernelActionOutcome<TResult>.Failed("ACTION_NULL_OUTCOME", "An action interceptor returned no outcome.")
-                    : ConvertOutcome(outcome);
+                var outcome = await InvokeHookAsync(
+                    token => frame.Interceptor.InvokeAsync(untypedContext, control, token),
+                    frame.Ordering,
+                    cancellationToken);
+                if (outcome is not KernelUntypedActionOutcome trusted ||
+                    !ReferenceEquals(trusted.Authority, control.Authority))
+                    return KernelActionOutcome<TResult>.Failed(
+                        "ACTION_FORGED_OUTCOME",
+                        "The action interceptor returned an outcome that this control did not issue.");
+                return ConvertOutcome(trusted, control.Authority);
             }
             catch (ActionOutcomeUncertainException exception)
             {
-                var typedContext = new ActionContext<TAction>(
-                    context.InvocationId,
-                    context.ParentInvocationId,
-                    context.TraceId,
-                    context.IdempotencyKey,
-                    context.Attempt,
-                    context.Depth,
-                    context.Deadline,
-                    context.Descriptor.Key,
-                    context.OwnerModuleId,
-                    context.Caller,
-                    KernelJson.Deserialize<TAction>(context.Input),
-                    context.Features,
-                    _snapshot);
-                return await RecordUncertaintyAsync(typedContext, exception.Uncertainty, cancellationToken);
+                return await RecordUncertaintyAsync(context, exception.Uncertainty, control.Authority, cancellationToken);
             }
             catch (KernelCapabilityException exception)
             {
                 return KernelActionOutcome<TResult>.Failed("ACTION_CAPABILITY_DENIED", exception.Message);
+            }
+            catch (KernelControlException exception)
+            {
+                return KernelActionOutcome<TResult>.Failed("ACTION_CONTROL_CONSUMED", exception.Message);
+            }
+            catch (TimeoutException) when (frame.Ordering.FailurePolicy == HookFailurePolicy.BestEffort)
+            {
+                return await InvokeAsync(context.Action, FrameIndex(frame) + 1,
+                    context.Depth, cancellationToken, context.Attempt, context.InvocationId);
+            }
+            catch (Exception) when (frame.Ordering.FailurePolicy == HookFailurePolicy.BestEffort)
+            {
+                return await InvokeAsync(context.Action, FrameIndex(frame) + 1,
+                    context.Depth, cancellationToken, context.Attempt, context.InvocationId);
+            }
+            catch (TimeoutException exception)
+            {
+                return KernelActionOutcome<TResult>.Failed("ACTION_HOOK_TIMEOUT", exception.Message);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -250,24 +269,27 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         {
             try
             {
-                var result = await _terminal(action, cancellationToken);
+                var result = await InvokeBoundedAsync(
+                    token => _terminal(action, token),
+                    null,
+                    cancellationToken);
                 return KernelActionOutcome<TResult>.Completed(result);
             }
             catch (ActionOutcomeUncertainException exception)
             {
-                var uncertainty = await _continuationHost.RecordUncertaintyAsync(
-                    new KernelUncertaintyRequest(
-                        invocationId,
-                        _definition.Descriptor.Key,
-                        _definition.Descriptor.Version,
-                        _idempotencyKey,
-                        exception.Uncertainty.Stage,
-                        exception.Uncertainty.Code,
-                        exception.Uncertainty.Message,
-                        exception.Uncertainty.ReceiptReference,
-                        _snapshot.ContractHash),
+                if (RequiresDurableAuthority && !_continuationHost.SupportsDurableState)
+                    return KernelActionOutcome<TResult>.Failed(
+                        "ACTION_CONTINUATION_DENIED",
+                        "An uncertain durable action requires a durable continuation host.");
+                var uncertainty = await RecordUncertaintyAsync(
+                    invocationId,
+                    exception.Uncertainty,
                     cancellationToken);
                 return KernelActionOutcome<TResult>.Uncertain(uncertainty);
+            }
+            catch (TimeoutException exception)
+            {
+                return KernelActionOutcome<TResult>.Failed("ACTION_DEADLINE_EXCEEDED", exception.Message);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -282,90 +304,159 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         private async ValueTask<IActionOutcome<TResult>> RecordUncertaintyAsync(
             ActionContext<TAction> context,
             ActionUncertainty supplied,
+            object authority,
+            CancellationToken cancellationToken)
+        {
+            if (RequiresDurableAuthority && !_continuationHost.SupportsDurableState)
+                return KernelActionOutcome<TResult>.FailedBy(
+                    new ExecutionError(
+                        "ACTION_CONTINUATION_DENIED",
+                        "An uncertain durable action requires a durable continuation host."),
+                    authority);
+            var result = await RecordUncertaintyAsync(context.InvocationId, supplied, cancellationToken);
+            return KernelActionOutcome<TResult>.UncertainBy(result, authority);
+        }
+
+        private async ValueTask<ActionUncertainty> RecordUncertaintyAsync(
+            Guid invocationId,
+            ActionUncertainty supplied,
             CancellationToken cancellationToken)
         {
             var uncertainty = await _continuationHost.RecordUncertaintyAsync(
                 new KernelUncertaintyRequest(
-                    context.InvocationId,
-                    context.ActionKey,
+                    invocationId,
+                    _definition.Descriptor.Key,
                     _definition.Descriptor.Version,
-                    context.IdempotencyKey,
+                    _idempotencyKey,
                     supplied.Stage,
                     supplied.Code,
                     supplied.Message,
                     supplied.ReceiptReference,
-                    context.Snapshot.ContractHash),
+                    _snapshot.ContractHash),
                 cancellationToken);
-            return KernelActionOutcome<TResult>.Uncertain(uncertainty);
+            return uncertainty;
         }
 
-        private IActionOutcome<TResult> ConvertOutcome(IUntypedActionOutcome outcome)
+        private bool RequiresDurableAuthority =>
+            _definition.Descriptor.ContinuationPolicy?.Durable == true;
+
+        private async ValueTask<T> InvokeHookAsync<T>(
+            Func<CancellationToken, ValueTask<T>> operation,
+            HookOrdering ordering,
+            CancellationToken cancellationToken) =>
+            await InvokeBoundedAsync(operation, ordering.Timeout, cancellationToken);
+
+        private async ValueTask<T> InvokeBoundedAsync<T>(
+            Func<CancellationToken, ValueTask<T>> operation,
+            TimeSpan? configuredTimeout,
+            CancellationToken cancellationToken)
+        {
+            var remaining = _deadline - DateTimeOffset.UtcNow;
+            if (configuredTimeout is { } timeout)
+                remaining = remaining < timeout ? remaining : timeout;
+            if (remaining <= TimeSpan.Zero)
+                throw new TimeoutException("The action deadline expired.");
+
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            linked.CancelAfter(remaining);
+            try
+            {
+                return await operation(linked.Token).AsTask().WaitAsync(remaining, cancellationToken);
+            }
+            catch (TimeoutException)
+            {
+                throw new TimeoutException("The action hook or terminal exceeded its deadline.");
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException("The action hook or terminal exceeded its deadline.");
+            }
+        }
+
+        private IActionOutcome<TResult> ValidateOutcome(
+            IActionOutcome<TResult>? outcome,
+            object authority) => outcome switch
+            {
+                KernelActionOutcome<TResult> trusted when ReferenceEquals(trusted.Authority, authority) => trusted,
+                null => KernelActionOutcome<TResult>.Failed("ACTION_NULL_OUTCOME", "An action interceptor returned no outcome."),
+                _ => KernelActionOutcome<TResult>.Failed(
+                    "ACTION_FORGED_OUTCOME",
+                    "The action interceptor returned an outcome that this control did not issue.")
+            };
+
+        private IActionOutcome<TResult> ConvertOutcome(
+            KernelUntypedActionOutcome outcome,
+            object authority)
         {
             var result = outcome.Result is { } value
                 ? KernelJson.Deserialize<TResult>(value)
                 : default!;
-            return new KernelActionOutcome<TResult>(
+            return KernelActionOutcome<TResult>.FromAuthority(
                 outcome.Kind,
                 result,
                 outcome.Error,
                 outcome.Continuation,
-                outcome.Uncertainty);
+                outcome.Uncertainty,
+                authority);
         }
 
         private sealed class TypedActionControl(
             KernelActionInvocation<TAction, TResult> owner,
             ActionContext<TAction> context,
-            TAction action,
-            int index,
-            int depth,
-            int attempt,
-            Guid invocationId) : IActionControl<TAction, TResult>
+            IActionFrame<TAction, TResult> frame,
+            TAction action) : IActionControl<TAction, TResult>
         {
+            private readonly object _authority = new();
             private bool _used;
 
-            public ValueTask<IActionOutcome<TResult>> ProceedAsync(CancellationToken cancellationToken) =>
-                ProceedWith(action, cancellationToken);
+            public object Authority => _authority;
 
-            public ValueTask<IActionOutcome<TResult>> ProceedWithInputAsync(
+            public async ValueTask<IActionOutcome<TResult>> ProceedAsync(CancellationToken cancellationToken) =>
+                await ProceedWith(action, cancellationToken, ActionInterceptionCapabilities.Inspect);
+
+            public async ValueTask<IActionOutcome<TResult>> ProceedWithInputAsync(
                 ActionReplacement<TAction> replacement,
                 CancellationToken cancellationToken) =>
-                ProceedWith(replacement.Value, cancellationToken);
+                await ProceedWith(
+                    replacement.Value,
+                    cancellationToken,
+                    ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.ReplaceInput);
 
             public IActionOutcome<TResult> ReplaceResult(TResult result, string reason)
             {
                 EnsureCapability(ActionInterceptionCapabilities.ReplaceResult);
                 _used = true;
-                return KernelActionOutcome<TResult>.Completed(result);
+                return KernelActionOutcome<TResult>.CompletedBy(result, _authority);
             }
 
             public IActionOutcome<TResult> Cancel(string code, string message)
             {
                 EnsureCapability(ActionInterceptionCapabilities.Cancel);
                 _used = true;
-                return KernelActionOutcome<TResult>.Cancelled(code, message);
+                return KernelActionOutcome<TResult>.CancelledBy(code, message, _authority);
             }
 
             public IActionOutcome<TResult> Fail(ExecutionError error)
             {
+                ArgumentNullException.ThrowIfNull(error);
+                EnsureAvailable();
                 _used = true;
-                return KernelActionOutcome<TResult>.Failed(error);
+                return KernelActionOutcome<TResult>.FailedBy(error, _authority);
             }
 
             public async ValueTask<IActionOutcome<TResult>> DeferAsync(
                 ActionDeferRequest request,
                 CancellationToken cancellationToken)
             {
+                ArgumentNullException.ThrowIfNull(request);
                 EnsureCapability(ActionInterceptionCapabilities.Defer);
-                if (!(owner._definition.Descriptor.ContinuationPolicy ?? KernelCapabilities.DurableContinuation).Durable)
-                    return KernelActionOutcome<TResult>.Failed(
-                        "ACTION_CONTINUATION_DENIED",
-                        "The action continuation policy is not durable.");
-                if (!context.Snapshot.ActionGrants.Any(grant =>
-                        grant.ActionKey == context.ActionKey &&
-                        grant.Capabilities.HasFlag(ActionInterceptionCapabilities.Defer)))
-                    return KernelActionOutcome<TResult>.Failed(
-                        "ACTION_CAPABILITY_DENIED",
-                        "The compiled snapshot does not grant defer capability.");
+                var policy = owner._definition.Descriptor.ContinuationPolicy ?? KernelCapabilities.DurableContinuation;
+                if (!policy.Durable || !owner._continuationHost.SupportsDurableState)
+                    return KernelActionOutcome<TResult>.FailedBy(
+                        new ExecutionError(
+                            "ACTION_CONTINUATION_DENIED",
+                            "A durable continuation requires durable action policy and durable host state."),
+                        _authority);
                 _used = true;
                 var token = await owner._continuationHost.CreateAsync(
                     new KernelContinuationRequest(
@@ -374,88 +465,127 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                         owner._definition.Descriptor.Version,
                         context.IdempotencyKey,
                         request,
-                        owner._definition.Descriptor.ContinuationPolicy ?? KernelCapabilities.DurableContinuation,
-                        context.Snapshot.ContractHash),
+                        policy,
+                        context.Snapshot.ContractHash,
+                        new ContinuationDestination("action", context.ActionKey.Value),
+                        KernelJson.Serialize(context.Action).GetRawText()),
                     cancellationToken);
-                return KernelActionOutcome<TResult>.Deferred(token);
+                return KernelActionOutcome<TResult>.DeferredBy(token, _authority);
             }
 
             public async ValueTask<IActionOutcome<TResult>> RepeatAsync(
                 ActionRepeatRequest<TAction> request,
                 CancellationToken cancellationToken)
             {
+                ArgumentNullException.ThrowIfNull(request);
                 EnsureCapability(ActionInterceptionCapabilities.Repeat);
                 var policy = owner._definition.Descriptor.RepeatPolicy;
-                if (policy.Kind == ActionRepeatKind.None || context.Attempt >= policy.MaximumAttempts)
-                    return KernelActionOutcome<TResult>.Failed(
-                        "ACTION_REPEAT_DENIED",
-                        "The action repeat policy does not permit another attempt.");
+                if (!CanRepeat(policy, request))
+                    return KernelActionOutcome<TResult>.FailedBy(
+                        new ExecutionError(
+                            "ACTION_REPEAT_DENIED",
+                            "The action repeat policy does not permit another attempt."),
+                        _authority);
+
                 _used = true;
-                if (request.Backoff is { } backoff && backoff > TimeSpan.Zero)
+                var backoff = request.Backoff.GetValueOrDefault();
+                if (policy.MinimumBackoff > backoff)
+                    backoff = policy.MinimumBackoff;
+                if (backoff > TimeSpan.Zero)
                     await Task.Delay(backoff, cancellationToken);
-                return await owner.InvokeAsync(
+                var outcome = await owner.InvokeAsync(
                     request.Value,
                     0,
-                    depth,
+                    context.Depth,
                     cancellationToken,
                     context.Attempt + 1,
                     context.InvocationId);
+                return Reissue(outcome, _authority);
             }
 
-            private ValueTask<IActionOutcome<TResult>> ProceedWith(
+            private async ValueTask<IActionOutcome<TResult>> ProceedWith(
                 TAction nextAction,
-                CancellationToken cancellationToken)
+                CancellationToken cancellationToken,
+                ActionInterceptionCapabilities required)
             {
-                EnsureCapability(ActionInterceptionCapabilities.Inspect);
+                EnsureCapability(ActionInterceptionCapabilities.Wrap);
+                EnsureCapability(required & ~ActionInterceptionCapabilities.Wrap);
                 _used = true;
-                return owner.InvokeAsync(
+                var outcome = await owner.InvokeAsync(
                     nextAction,
-                    index + 1,
-                    depth,
+                    owner.FrameIndex(frame) + 1,
+                    context.Depth,
                     cancellationToken,
-                    attempt,
-                    invocationId);
+                    context.Attempt,
+                    context.InvocationId);
+                return Reissue(outcome, _authority);
+            }
+
+            private bool CanRepeat(ActionRepeatPolicy policy, ActionRepeatRequest<TAction> request)
+            {
+                if (policy.Kind == ActionRepeatKind.None || context.Attempt >= policy.MaximumAttempts)
+                    return false;
+                if (string.IsNullOrWhiteSpace(policy.IdempotencyScope) || context.IdempotencyKey == Guid.Empty)
+                    return false;
+                return policy.Kind switch
+                {
+                    ActionRepeatKind.ConflictOnly =>
+                        request.Reason.Contains("conflict", StringComparison.OrdinalIgnoreCase),
+                    ActionRepeatKind.Receipted => context.Features.Contains("action.receipt"),
+                    _ => true
+                };
             }
 
             private void EnsureCapability(ActionInterceptionCapabilities capability)
             {
-                if (!owner._definition.Descriptor.Capabilities.HasFlag(capability))
+                EnsureAvailable();
+                if (!owner._definition.EffectiveCapabilities.HasFlag(capability) ||
+                    !context.Snapshot.ActionGrants.Any(grant =>
+                        grant.ActionKey == context.ActionKey &&
+                        grant.Capabilities.HasFlag(capability)))
                 {
                     throw new KernelCapabilityException(
-                        $"Action '{context.ActionKey.Value}' does not declare capability '{capability}'.");
+                        $"Action '{context.ActionKey.Value}' does not have effective capability '{capability}'.");
                 }
+            }
+
+            private void EnsureAvailable()
+            {
                 if (_used)
-                    throw new KernelActionExecutionException(
+                    throw new KernelControlException(
                         $"Action control for '{context.ActionKey.Value}' was already consumed.");
             }
+        }
+
+        private int FrameIndex(object frame)
+        {
+            for (var index = 0; index < _definition.Frames.Count; index++)
+            {
+                if (ReferenceEquals(_definition.Frames[index], frame))
+                    return index;
+            }
+
+            throw new KernelActionExecutionException("The compiled action frame is not registered.");
         }
 
         private sealed class UntypedActionControl(
             KernelActionInvocation<TAction, TResult> owner,
             ActionContext<TAction> context,
-            TAction action,
-            int index,
-            int depth,
-            int attempt,
-            Guid invocationId) : IUntypedActionControl
+            AnyActionFrame<TAction, TResult> frame,
+            TAction action) : IUntypedActionControl
         {
-            private readonly TypedActionControl _typed = new(
-                owner,
-                context,
-                action,
-                index,
-                depth,
-                attempt,
-                invocationId);
+            private readonly TypedActionControl _typed = new(owner, context, frame, action);
 
-            public ValueTask<IUntypedActionOutcome> ProceedAsync(CancellationToken cancellationToken) =>
-                ConvertAsync(_typed.ProceedAsync(cancellationToken));
+            public object Authority => _typed.Authority;
 
-            public ValueTask<IUntypedActionOutcome> ProceedWithInputAsync(
+            public async ValueTask<IUntypedActionOutcome> ProceedAsync(CancellationToken cancellationToken) =>
+                Convert(await _typed.ProceedAsync(cancellationToken));
+
+            public async ValueTask<IUntypedActionOutcome> ProceedWithInputAsync(
                 JsonElement input,
                 string reason,
                 CancellationToken cancellationToken) =>
-                ConvertAsync(_typed.ProceedWithInputAsync(
+                Convert(await _typed.ProceedWithInputAsync(
                     new ActionReplacement<TAction>(KernelJson.Deserialize<TAction>(input), reason),
                     cancellationToken));
 
@@ -467,23 +597,19 @@ public sealed class KernelActionDispatcher : IActionDispatcher
 
             public IUntypedActionOutcome Fail(ExecutionError error) => Convert(_typed.Fail(error));
 
-            public ValueTask<IUntypedActionOutcome> DeferAsync(
+            public async ValueTask<IUntypedActionOutcome> DeferAsync(
                 ActionDeferRequest request,
                 CancellationToken cancellationToken) =>
-                ConvertAsync(_typed.DeferAsync(request, cancellationToken));
+                Convert(await _typed.DeferAsync(request, cancellationToken));
 
-            public ValueTask<IUntypedActionOutcome> RepeatAsync(
+            public async ValueTask<IUntypedActionOutcome> RepeatAsync(
                 JsonElement input,
                 string reason,
                 TimeSpan? backoff,
                 CancellationToken cancellationToken) =>
-                ConvertAsync(_typed.RepeatAsync(
+                Convert(await _typed.RepeatAsync(
                     new ActionRepeatRequest<TAction>(KernelJson.Deserialize<TAction>(input), reason, backoff),
                     cancellationToken));
-
-            private static async ValueTask<IUntypedActionOutcome> ConvertAsync(
-                ValueTask<IActionOutcome<TResult>> outcomeTask) =>
-                Convert(await outcomeTask);
 
             private static IUntypedActionOutcome Convert(IActionOutcome<TResult> outcome) =>
                 new KernelUntypedActionOutcome(
@@ -491,10 +617,28 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                     outcome.Result is null ? null : KernelJson.Serialize(outcome.Result),
                     outcome.Error,
                     outcome.Continuation,
-                    outcome.Uncertainty);
+                    outcome.Uncertainty,
+                    ((KernelActionOutcome<TResult>)outcome).Authority);
         }
     }
+
+    private static IActionOutcome<TResult> Reissue<TResult>(IActionOutcome<TResult> outcome, object authority) =>
+        outcome is KernelActionOutcome<TResult> trusted
+            ? KernelActionOutcome<TResult>.FromAuthority(
+                trusted.Kind,
+                trusted.Result,
+                trusted.Error,
+                trusted.Continuation,
+                trusted.Uncertainty,
+                authority)
+            : KernelActionOutcome<TResult>.FailedBy(
+                new ExecutionError(
+                    "ACTION_FORGED_OUTCOME",
+                    "The action path returned an outcome that Core did not issue."),
+                authority);
 }
+
+internal sealed class KernelControlException(string message) : InvalidOperationException(message);
 
 public sealed class KernelActionOutcome<TResult> : IActionOutcome<TResult>
 {
@@ -504,41 +648,75 @@ public sealed class KernelActionOutcome<TResult> : IActionOutcome<TResult>
         ExecutionError? error,
         ContinuationToken? continuation,
         ActionUncertainty? uncertainty)
+        : this(kind, result, error, continuation, uncertainty, null)
+    {
+    }
+
+    private KernelActionOutcome(
+        ActionOutcomeKind kind,
+        TResult result,
+        ExecutionError? error,
+        ContinuationToken? continuation,
+        ActionUncertainty? uncertainty,
+        object? authority)
     {
         Kind = kind;
         Result = result;
         Error = error;
         Continuation = continuation;
         Uncertainty = uncertainty;
+        Authority = authority;
     }
 
+    internal object? Authority { get; }
+
     public ActionOutcomeKind Kind { get; }
-
     public TResult Result { get; }
-
     public ContinuationToken? Continuation { get; }
-
     public ExecutionError? Error { get; }
-
     public ActionUncertainty? Uncertainty { get; }
 
     public static KernelActionOutcome<TResult> Completed(TResult result) =>
         new(ActionOutcomeKind.Completed, result, null, null, null);
 
+    internal static KernelActionOutcome<TResult> CompletedBy(TResult result, object authority) =>
+        new(ActionOutcomeKind.Completed, result, null, null, null, authority);
+
     public static KernelActionOutcome<TResult> Cancelled(string code, string message) =>
         Failed(ActionOutcomeKind.Cancelled, code, message);
+
+    internal static KernelActionOutcome<TResult> CancelledBy(string code, string message, object authority) =>
+        new(ActionOutcomeKind.Cancelled, default!, new ExecutionError(code, message), null, null, authority);
 
     public static KernelActionOutcome<TResult> Deferred(ContinuationToken token) =>
         new(ActionOutcomeKind.Deferred, default!, null, token, null);
 
+    internal static KernelActionOutcome<TResult> DeferredBy(ContinuationToken token, object authority) =>
+        new(ActionOutcomeKind.Deferred, default!, null, token, null, authority);
+
     public static KernelActionOutcome<TResult> Uncertain(ActionUncertainty uncertainty) =>
         new(ActionOutcomeKind.Uncertain, default!, null, null, uncertainty);
+
+    internal static KernelActionOutcome<TResult> UncertainBy(ActionUncertainty uncertainty, object authority) =>
+        new(ActionOutcomeKind.Uncertain, default!, null, null, uncertainty, authority);
 
     public static KernelActionOutcome<TResult> Failed(string code, string message) =>
         Failed(ActionOutcomeKind.Failed, code, message);
 
     public static KernelActionOutcome<TResult> Failed(ExecutionError error) =>
         new(ActionOutcomeKind.Failed, default!, error, null, null);
+
+    internal static KernelActionOutcome<TResult> FailedBy(ExecutionError error, object authority) =>
+        new(ActionOutcomeKind.Failed, default!, error, null, null, authority);
+
+    internal static KernelActionOutcome<TResult> FromAuthority(
+        ActionOutcomeKind kind,
+        TResult result,
+        ExecutionError? error,
+        ContinuationToken? continuation,
+        ActionUncertainty? uncertainty,
+        object authority) =>
+        new(kind, result, error, continuation, uncertainty, authority);
 
     private static KernelActionOutcome<TResult> Failed(
         ActionOutcomeKind kind,
@@ -547,20 +725,38 @@ public sealed class KernelActionOutcome<TResult> : IActionOutcome<TResult>
         new(kind, default!, new ExecutionError(code, message, false, new Dictionary<string, string>()), null, null);
 }
 
-public sealed class KernelUntypedActionOutcome(
-    ActionOutcomeKind kind,
-    JsonElement? result,
-    ExecutionError? error,
-    ContinuationToken? continuation,
-    ActionUncertainty? uncertainty) : IUntypedActionOutcome
+public sealed class KernelUntypedActionOutcome : IUntypedActionOutcome
 {
-    public ActionOutcomeKind Kind { get; } = kind;
+    public KernelUntypedActionOutcome(
+        ActionOutcomeKind kind,
+        JsonElement? result,
+        ExecutionError? error,
+        ContinuationToken? continuation,
+        ActionUncertainty? uncertainty)
+        : this(kind, result, error, continuation, uncertainty, null)
+    {
+    }
 
-    public JsonElement? Result { get; } = result;
+    internal KernelUntypedActionOutcome(
+        ActionOutcomeKind kind,
+        JsonElement? result,
+        ExecutionError? error,
+        ContinuationToken? continuation,
+        ActionUncertainty? uncertainty,
+        object? authority)
+    {
+        Kind = kind;
+        Result = result;
+        Error = error;
+        Continuation = continuation;
+        Uncertainty = uncertainty;
+        Authority = authority;
+    }
 
-    public ContinuationToken? Continuation { get; } = continuation;
-
-    public ExecutionError? Error { get; } = error;
-
-    public ActionUncertainty? Uncertainty { get; } = uncertainty;
+    internal object? Authority { get; }
+    public ActionOutcomeKind Kind { get; }
+    public JsonElement? Result { get; }
+    public ContinuationToken? Continuation { get; }
+    public ExecutionError? Error { get; }
+    public ActionUncertainty? Uncertainty { get; }
 }

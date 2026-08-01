@@ -60,7 +60,7 @@ public sealed class KernelGraphBuilder
 
     private void AddStandardDefinitions()
     {
-        var keys = KernelActionCatalog.RequiredKeys
+        var keys = SharpClawActionCatalog.Kernel
             .DistinctBy(key => key.Value, StringComparer.Ordinal)
             .ToArray();
 
@@ -101,19 +101,19 @@ public sealed class KernelSnapshotCompiler
             .Select(action => new ActionCapabilityGrant(
                 action.Key,
                 action.Version,
-                action.Capabilities,
-                true,
-                !action.ContainsSensitiveData || options.ApproveSensitiveActions))
+                action.EffectiveCapabilities,
+                action.SensitiveApproved,
+                false))
             .ToArray();
         var eventGrants = events.Values
             .Select(eventDefinition => new EventCapabilityGrant(
                 eventDefinition.Key,
                 eventDefinition.Version,
-                eventDefinition.Capabilities,
-                true,
-                !eventDefinition.ContainsSensitiveData || options.ApproveSensitiveEvents))
+                eventDefinition.EffectiveCapabilities,
+                eventDefinition.SensitiveApproved,
+                false))
             .ToArray();
-        var contractHash = ComputeContractHash(actions.Values, events.Values, tools);
+        var contractHash = ComputeContractHash(actions.Values, events.Values, tools, options);
         var snapshot = new ActionPipelineSnapshot(
             contractHash,
             actionGrants,
@@ -192,16 +192,30 @@ public sealed class KernelSnapshotCompiler
     private static string ComputeContractHash(
         IEnumerable<ICompiledActionDefinition> actions,
         IEnumerable<ICompiledEventDefinition> events,
-        IEnumerable<KernelToolRegistration> tools)
+        IEnumerable<KernelToolRegistration> tools,
+        KernelGraphCompileOptions options)
     {
         var content = string.Join(
             "\n",
             actions.OrderBy(action => action.Key.Value, StringComparer.Ordinal)
-                .Select(action => $"a|{action.Key.Value}|{action.Version}|{action.Category}|{(int)action.Capabilities}"),
+                .Select(action =>
+                    $"a|{action.Key.Value}|{action.Version}|{action.Category}|{(int)action.Capabilities}|" +
+                    $"{(int)action.EffectiveCapabilities}|{action.ContainsSensitiveData}|{action.SensitiveApproved}|" +
+                    $"{action.DescriptorObject}|{action.OwnerModuleId}|{action.Signature}"),
             events.OrderBy(eventDefinition => eventDefinition.Key.Value, StringComparer.Ordinal)
-                .Select(eventDefinition => $"e|{eventDefinition.Key.Value}|{eventDefinition.Version}|{eventDefinition.Category}|{(int)eventDefinition.Capabilities}"),
+                .Select(eventDefinition =>
+                    $"e|{eventDefinition.Key.Value}|{eventDefinition.Version}|{eventDefinition.Category}|" +
+                    $"{(int)eventDefinition.Capabilities}|{(int)eventDefinition.EffectiveCapabilities}|" +
+                    $"{eventDefinition.ContainsSensitiveData}|{eventDefinition.SensitiveApproved}|" +
+                    $"{eventDefinition.OwnerModuleId}|{eventDefinition.Signature}"),
             tools.OrderBy(tool => tool.Descriptor.Name, StringComparer.Ordinal)
-                .Select(tool => $"t|{tool.Descriptor.Name}|{tool.Descriptor.Version}"));
+                .Select(tool => $"t|{tool.Descriptor.Name}|{tool.Descriptor.Version}|{tool.OwnerModuleId}|{tool.HandlerType.FullName}"),
+            options.ActionCapabilityGrants?.OrderBy(pair => pair.Key, StringComparer.Ordinal)
+                .Select(pair => $"ag|{pair.Key}|{(int)pair.Value}") ?? [],
+            options.EventCapabilityGrants?.OrderBy(pair => pair.Key, StringComparer.Ordinal)
+                .Select(pair => $"eg|{pair.Key}|{(int)pair.Value}") ?? [],
+            options.ApprovedSensitiveActions.OrderBy(key => key, StringComparer.Ordinal).Select(key => $"sa|{key}"),
+            options.ApprovedSensitiveEvents.OrderBy(key => key, StringComparer.Ordinal).Select(key => $"se|{key}"));
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(content)));
     }
 }
@@ -356,8 +370,13 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
             throw new KernelGraphCompilationException(
                 $"Action '{descriptor.Key.Value}' requires unsupported capabilities: {unsupported}.");
         }
-        if (descriptor.ContainsSensitiveData && !options.ApproveSensitiveActions)
+        var sensitiveApproved = !descriptor.ContainsSensitiveData ||
+            options.ApprovedSensitiveActions.Contains(descriptor.Key.Value);
+        if (!sensitiveApproved)
             throw new KernelGraphCompilationException($"Sensitive action '{descriptor.Key.Value}' lacks approval.");
+        var effectiveCapabilities = descriptor.Capabilities;
+        if (options.ActionCapabilityGrants?.TryGetValue(descriptor.Key.Value, out var grant) == true)
+            effectiveCapabilities &= grant;
 
         var matching = hooks
             .Where(hook => Matches(hook.TargetKind, hook.Key, hook.Category, descriptor.Key, descriptor.Category))
@@ -372,7 +391,9 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
                     throw new KernelGraphCompilationException(
                         $"'{hook.HandlerType.FullName}' does not implement IAnyActionInterceptor.");
                 frames.Add(new AnyActionFrame<TAction, TResult>(
-                    (IAnyActionInterceptor)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider)));
+                    (IAnyActionInterceptor)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider),
+                    hook.Ordering,
+                    hook.OwnerModuleId));
             }
             else
             {
@@ -383,14 +404,18 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
                 frames.Add(new TypedActionFrame<TAction, TResult>(
                     (IActionInterceptor<TAction, TResult>)KernelServiceResolution.Resolve(
                         hook.HandlerType,
-                        serviceProvider)));
+                        serviceProvider),
+                    hook.Ordering,
+                    hook.OwnerModuleId));
             }
         }
 
         return new CompiledActionDefinition<TAction, TResult>(
             descriptor,
             ownerModuleId,
-            frames);
+            frames,
+            effectiveCapabilities,
+            sensitiveApproved);
     }
 
     private static bool Matches(
@@ -438,8 +463,13 @@ internal sealed class EventDefinitionRegistration<TEvent>(
             throw new KernelGraphCompilationException(
                 $"Event '{descriptor.Key.Value}' requires unsupported capabilities: {unsupported}.");
         }
-        if (descriptor.ContainsSensitiveData && !options.ApproveSensitiveEvents)
+        var sensitiveApproved = !descriptor.ContainsSensitiveData ||
+            options.ApprovedSensitiveEvents.Contains(descriptor.Key.Value);
+        if (!sensitiveApproved)
             throw new KernelGraphCompilationException($"Sensitive event '{descriptor.Key.Value}' lacks approval.");
+        var effectiveCapabilities = descriptor.Capabilities;
+        if (options.EventCapabilityGrants?.TryGetValue(descriptor.Key.Value, out var grant) == true)
+            effectiveCapabilities &= grant;
 
         var matching = hooks
             .Where(hook => Matches(hook.TargetKind, hook.Key, hook.Category, descriptor.Key, descriptor.Category))
@@ -457,7 +487,9 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         throw new KernelGraphCompilationException(
                             $"'{hook.HandlerType.FullName}' does not implement IAnyEventInterceptor.");
                     interceptors.Add(new AnyEventFrame<TEvent>(
-                        (IAnyEventInterceptor)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider)));
+                        (IAnyEventInterceptor)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider),
+                        hook.Ordering,
+                        hook.OwnerModuleId));
                 }
                 else
                 {
@@ -468,7 +500,9 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                     interceptors.Add(new TypedEventFrame<TEvent>(
                         (IEventInterceptor<TEvent>)KernelServiceResolution.Resolve(
                             hook.HandlerType,
-                            serviceProvider)));
+                            serviceProvider),
+                        hook.Ordering,
+                        hook.OwnerModuleId));
                 }
             }
             else
@@ -480,7 +514,11 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                             $"'{hook.HandlerType.FullName}' does not implement IAnyEventListener.");
                     listeners.Add(new KernelEventListener<TEvent>(
                         (IAnyEventListener)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider),
-                        hook.Delivery));
+                        hook.Delivery,
+                        hook.Ordering.Id,
+                        hook.OwnerModuleId,
+                        hook.HandlerType,
+                        hook.Ordering));
                 }
                 else
                 {
@@ -492,12 +530,22 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         (IEventListener<TEvent>)KernelServiceResolution.Resolve(
                             hook.HandlerType,
                             serviceProvider),
-                        hook.Delivery));
+                        hook.Delivery,
+                        hook.Ordering.Id,
+                        hook.OwnerModuleId,
+                        hook.HandlerType,
+                        hook.Ordering));
                 }
             }
         }
 
-        return new CompiledEventDefinition<TEvent>(descriptor, ownerModuleId, interceptors, listeners);
+        return new CompiledEventDefinition<TEvent>(
+            descriptor,
+            ownerModuleId,
+            interceptors,
+            listeners,
+            effectiveCapabilities,
+            sensitiveApproved);
     }
 
     private static bool Matches(
@@ -582,17 +630,27 @@ internal interface ICompiledActionDefinition
 
     ActionInterceptionCapabilities Capabilities { get; }
 
+    ActionInterceptionCapabilities EffectiveCapabilities { get; }
+
     bool ContainsSensitiveData { get; }
+
+    bool SensitiveApproved { get; }
+
+    string Signature { get; }
 
     Type ActionType { get; }
 
     Type ResultType { get; }
+
+    string OwnerModuleId { get; }
 }
 
 internal sealed class CompiledActionDefinition<TAction, TResult>(
     ActionDescriptor<TAction, TResult> descriptor,
     string ownerModuleId,
-    IReadOnlyList<IActionFrame<TAction, TResult>> frames) : ICompiledActionDefinition
+    IReadOnlyList<IActionFrame<TAction, TResult>> frames,
+    ActionInterceptionCapabilities effectiveCapabilities,
+    bool sensitiveApproved) : ICompiledActionDefinition
 {
     public ActionDescriptor<TAction, TResult> Descriptor { get; } = descriptor;
 
@@ -608,7 +666,21 @@ internal sealed class CompiledActionDefinition<TAction, TResult>(
 
     public ActionInterceptionCapabilities Capabilities => Descriptor.Capabilities;
 
+    public ActionInterceptionCapabilities EffectiveCapabilities { get; } = effectiveCapabilities;
+
     public bool ContainsSensitiveData => Descriptor.ContainsSensitiveData;
+
+    public bool SensitiveApproved { get; } = sensitiveApproved;
+
+    public string Signature => string.Join(
+        ",",
+        [
+            $"descriptor|{Descriptor.HasIrreversibleEffects}|{Descriptor.RepeatPolicy}|" +
+            $"{Descriptor.ContinuationPolicy}|{Descriptor.DefaultTimeout}|" +
+            $"{string.Join(",", Descriptor.SafePoints)}|{Descriptor.ProtocolVersionRange}",
+            ..Frames.Select(frame =>
+            $"{frame.Ordering.Id}|{frame.OwnerModuleId}|{frame.HandlerType.FullName}|" +
+            $"{frame.Ordering.Timeout}|{frame.Ordering.FailurePolicy}")]);
 
     public string OwnerModuleId { get; } = ownerModuleId;
 
@@ -622,22 +694,46 @@ internal sealed class CompiledActionDefinition<TAction, TResult>(
 internal interface IActionFrame<TAction, TResult>
 {
     bool IsUntyped { get; }
+
+    HookOrdering Ordering { get; }
+
+    string OwnerModuleId { get; }
+
+    Type HandlerType { get; }
 }
 
-internal sealed class TypedActionFrame<TAction, TResult>(IActionInterceptor<TAction, TResult> interceptor)
+internal sealed class TypedActionFrame<TAction, TResult>(
+    IActionInterceptor<TAction, TResult> interceptor,
+    HookOrdering ordering,
+    string ownerModuleId)
     : IActionFrame<TAction, TResult>
 {
     public IActionInterceptor<TAction, TResult> Interceptor { get; } = interceptor;
 
     public bool IsUntyped => false;
+
+    public HookOrdering Ordering { get; } = ordering;
+
+    public string OwnerModuleId { get; } = ownerModuleId;
+
+    public Type HandlerType => Interceptor.GetType();
 }
 
-internal sealed class AnyActionFrame<TAction, TResult>(IAnyActionInterceptor interceptor)
+internal sealed class AnyActionFrame<TAction, TResult>(
+    IAnyActionInterceptor interceptor,
+    HookOrdering ordering,
+    string ownerModuleId)
     : IActionFrame<TAction, TResult>
 {
     public IAnyActionInterceptor Interceptor { get; } = interceptor;
 
     public bool IsUntyped => true;
+
+    public HookOrdering Ordering { get; } = ordering;
+
+    public string OwnerModuleId { get; } = ownerModuleId;
+
+    public Type HandlerType => Interceptor.GetType();
 }
 
 internal interface ICompiledEventDefinition
@@ -652,16 +748,26 @@ internal interface ICompiledEventDefinition
 
     EventInterceptionCapabilities Capabilities { get; }
 
+    EventInterceptionCapabilities EffectiveCapabilities { get; }
+
     bool ContainsSensitiveData { get; }
 
+    bool SensitiveApproved { get; }
+
+    string Signature { get; }
+
     Type EventType { get; }
+
+    string OwnerModuleId { get; }
 }
 
 internal sealed class CompiledEventDefinition<TEvent>(
     EventDescriptor<TEvent> descriptor,
     string ownerModuleId,
     IReadOnlyList<IEventFrame<TEvent>> interceptors,
-    IReadOnlyList<KernelEventListener<TEvent>> listeners) : ICompiledEventDefinition
+    IReadOnlyList<KernelEventListener<TEvent>> listeners,
+    EventInterceptionCapabilities effectiveCapabilities,
+    bool sensitiveApproved) : ICompiledEventDefinition
 {
     public EventDescriptor<TEvent> Descriptor { get; } = descriptor;
 
@@ -677,7 +783,22 @@ internal sealed class CompiledEventDefinition<TEvent>(
 
     public EventInterceptionCapabilities Capabilities => Descriptor.Capabilities;
 
+    public EventInterceptionCapabilities EffectiveCapabilities { get; } = effectiveCapabilities;
+
     public bool ContainsSensitiveData => Descriptor.ContainsSensitiveData;
+
+    public bool SensitiveApproved { get; } = sensitiveApproved;
+
+    public string Signature => string.Join(
+        ",",
+        [
+            $"descriptor|{Descriptor.DurableByDefault}|{Descriptor.DeliveryClasses}|{Descriptor.ProtocolVersionRange}",
+            ..Interceptors.Select(frame =>
+            $"i|{frame.Ordering.Id}|{frame.OwnerModuleId}|{frame.HandlerType.FullName}|" +
+            $"{frame.Ordering.Timeout}|{frame.Ordering.FailurePolicy}"),
+            ..Listeners.Select(listener =>
+                $"l|{listener.Id}|{listener.OwnerModuleId}|{listener.HandlerType.FullName}|{listener.Delivery}|" +
+                $"{listener.Ordering.Timeout}|{listener.Ordering.FailurePolicy}")]);
 
     public IReadOnlyList<IEventFrame<TEvent>> Interceptors { get; } = interceptors;
 
@@ -689,23 +810,53 @@ internal sealed class CompiledEventDefinition<TEvent>(
 internal interface IEventFrame<TEvent>
 {
     bool IsUntyped { get; }
+
+    HookOrdering Ordering { get; }
+
+    string OwnerModuleId { get; }
+
+    Type HandlerType { get; }
 }
 
-internal sealed class TypedEventFrame<TEvent>(IEventInterceptor<TEvent> interceptor) : IEventFrame<TEvent>
+internal sealed class TypedEventFrame<TEvent>(
+    IEventInterceptor<TEvent> interceptor,
+    HookOrdering ordering,
+    string ownerModuleId) : IEventFrame<TEvent>
 {
     public IEventInterceptor<TEvent> Interceptor { get; } = interceptor;
 
     public bool IsUntyped => false;
+
+    public HookOrdering Ordering { get; } = ordering;
+
+    public string OwnerModuleId { get; } = ownerModuleId;
+
+    public Type HandlerType => Interceptor.GetType();
 }
 
-internal sealed class AnyEventFrame<TEvent>(IAnyEventInterceptor interceptor) : IEventFrame<TEvent>
+internal sealed class AnyEventFrame<TEvent>(
+    IAnyEventInterceptor interceptor,
+    HookOrdering ordering,
+    string ownerModuleId) : IEventFrame<TEvent>
 {
     public IAnyEventInterceptor Interceptor { get; } = interceptor;
 
     public bool IsUntyped => true;
+
+    public HookOrdering Ordering { get; } = ordering;
+
+    public string OwnerModuleId { get; } = ownerModuleId;
+
+    public Type HandlerType => Interceptor.GetType();
 }
 
-internal sealed record KernelEventListener<TEvent>(object Listener, EventDelivery Delivery);
+internal sealed record KernelEventListener<TEvent>(
+    object Listener,
+    EventDelivery Delivery,
+    string Id,
+    string OwnerModuleId,
+    Type HandlerType,
+    HookOrdering Ordering);
 
 public sealed class KernelActionDefinitionBuilder(
     KernelGraphBuilder builder,
@@ -830,6 +981,7 @@ public sealed class KernelModuleRegistry
     private readonly KernelGraphBuilder _graphBuilder = new();
     private readonly List<ISharpClawModule> _modules = [];
     private readonly HashSet<string> _moduleIds = new(StringComparer.Ordinal);
+    private KernelGraph? _compiledGraph;
 
     public IReadOnlyList<ISharpClawModule> Modules => new ReadOnlyCollection<ISharpClawModule>(_modules);
 
@@ -844,8 +996,11 @@ public sealed class KernelModuleRegistry
 
     public KernelGraph Compile(
         IServiceProvider? serviceProvider = null,
-        KernelGraphCompileOptions? options = null) =>
-        _graphBuilder.Compile(serviceProvider, options);
+        KernelGraphCompileOptions? options = null)
+    {
+        _compiledGraph = _graphBuilder.Compile(serviceProvider, options);
+        return _compiledGraph;
+    }
 
     public async ValueTask StartAsync(
         KernelGraph graph,
@@ -853,18 +1008,50 @@ public sealed class KernelModuleRegistry
         ExtensionFeatureSet features,
         CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(graph);
+        _compiledGraph = graph;
+        var dispatcher = new KernelActionDispatcher(graph);
+        var descriptor = graph.GetStandardAction(new SharpClawActionKey("module.start"));
         foreach (var module in _modules)
         {
-            await module.StartAsync(
-                new ModuleStartContext(module.Identity, graph.ActionSnapshot.ContractHash, hostVersion, features),
+            var context = new ModuleStartContext(
+                module.Identity,
+                hostVersion,
+                graph.ActionSnapshot.ContractHash,
+                features);
+            await dispatcher.RunRequiredAsync<KernelActionEnvelope, object>(
+                descriptor,
+                new KernelActionEnvelope(descriptor.Key, context),
+                async (_, ct) =>
+                {
+                    await module.StartAsync(context, ct);
+                    return (object)true;
+                },
+                graph.ActionSnapshot,
                 cancellationToken);
         }
     }
 
     public async ValueTask StopAsync(CancellationToken cancellationToken = default)
     {
+        if (_compiledGraph is null)
+            throw new KernelActionExecutionException("The module registry must compile before it can stop modules.");
+        var dispatcher = new KernelActionDispatcher(_compiledGraph);
+        var descriptor = _compiledGraph.GetStandardAction(new SharpClawActionKey("module.stop"));
         for (var index = _modules.Count - 1; index >= 0; index--)
-            await _modules[index].StopAsync(cancellationToken);
+        {
+            var module = _modules[index];
+            await dispatcher.RunRequiredAsync<KernelActionEnvelope, object>(
+                descriptor,
+                new KernelActionEnvelope(descriptor.Key, module.Identity),
+                async (_, ct) =>
+                {
+                    await module.StopAsync(ct);
+                    return (object)true;
+                },
+                _compiledGraph.ActionSnapshot,
+                cancellationToken);
+        }
     }
 }
 

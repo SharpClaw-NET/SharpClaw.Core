@@ -79,7 +79,7 @@ public sealed class KernelActionTests
     public async Task Defer_creates_a_store_neutral_continuation()
     {
         var key = new SharpClawActionKey("defer.action");
-        var host = new InMemoryContinuationHost();
+        var host = new InMemoryContinuationHost(supportsDurableState: true);
         var builder = new KernelGraphBuilder(false);
         builder.Add(Descriptor(key));
         builder.Hooks.For(key).Use<DeferInterceptor>(Order("defer"));
@@ -106,7 +106,7 @@ public sealed class KernelActionTests
         var builder = new KernelGraphBuilder(false);
         builder.Add(Descriptor(key));
         var graph = builder.Compile();
-        var dispatcher = new KernelActionDispatcher(graph);
+        var dispatcher = new KernelActionDispatcher(graph, new InMemoryContinuationHost(true));
 
         var outcome = await dispatcher.RunAsync(
             graph.GetStandardAction(key),

@@ -16,36 +16,26 @@ public static class KernelActionCatalog
     public static IReadOnlyList<KernelCoverageEntry> Coverage { get; } =
         new ReadOnlyCollection<KernelCoverageEntry>(
         [
-            new("K01", "runtime lifecycle", new("runtime.lifecycle")),
-            new("K02", "request ingress", new("request.ingress")),
-            new("K03", "security boundary", new("security.boundary")),
-            new("K04", "command ingress", new("command.ingress")),
-            new("K05", "client interaction", new("client.interaction")),
+            new("K01", "runtime lifecycle", new("runtime.start.prepare")),
+            new("K02", "request ingress", new("runtime.request.receive")),
+            new("K03", "security boundary", new("security.session.validate")),
+            new("K04", "command ingress", new("runtime.cli.parse")),
+            new("K05", "client interaction", new("client.command.dispatch")),
             new("K06", "chat turn", SharpClawActions.Chat.Turn),
             new("K07", "provider round", SharpClawActions.Chat.ProviderRound),
             new("K08", "tool invocation", SharpClawActions.Tools.Invoke),
-            new("K09", "storage operation", new("storage.operation")),
-            new("K10", "transaction commit", new("transaction.commit")),
-            new("K11", "module lifecycle", new("module.lifecycle")),
-            new("K12", "event delivery", new("event.delivery")),
-            new("K13", "background execution", new("background.execution")),
-            new("K14", "gateway boundary", new("gateway.boundary"))
+            new("K09", "storage operation", new("storage.get")),
+            new("K10", "transaction commit", new("storage.transaction.commit")),
+            new("K11", "module lifecycle", new("module.start")),
+            new("K12", "event delivery", new("event.deliver")),
+            new("K13", "background execution", new("background.tick.execute")),
+            new("K14", "gateway boundary", new("gateway.request.receive"))
         ]);
 
     public static IReadOnlyList<SharpClawActionKey> RequiredKeys { get; } =
         new ReadOnlyCollection<SharpClawActionKey>(
         [
-            .. Coverage.Select(entry => entry.ActionKey),
-            SharpClawActions.Chat.ResolveConversation,
-            SharpClawActions.Chat.ResolveProfile,
-            SharpClawActions.Chat.LoadHistory,
-            SharpClawActions.Chat.AssembleContext,
-            SharpClawActions.Chat.SelectTools,
-            SharpClawActions.Chat.CommitExchange,
-            SharpClawActions.Tools.Resolve,
-            SharpClawActions.Tools.Check,
-            SharpClawActions.Tools.InvokeHandler,
-            SharpClawActions.Tools.Coordinate
+            .. SharpClawActionCatalog.Kernel
         ]);
 
     public static string CategoryFor(SharpClawActionKey key) =>
@@ -64,6 +54,10 @@ public static class KernelActionCatalog
             var value when value.StartsWith("event.", StringComparison.Ordinal) => "event",
             var value when value.StartsWith("background.", StringComparison.Ordinal) => "background",
             var value when value.StartsWith("gateway.", StringComparison.Ordinal) => "gateway",
+            var value when value.StartsWith("provider.", StringComparison.Ordinal) => "provider",
+            var value when value.StartsWith("conversation.", StringComparison.Ordinal) => "conversation",
+            var value when value.StartsWith("continuation.", StringComparison.Ordinal) => "continuation",
+            var value when value.StartsWith("action_recovery.", StringComparison.Ordinal) => "action_recovery",
             _ => "kernel"
         };
 }
@@ -88,9 +82,19 @@ public sealed class KernelGraphCompileOptions
         EventInterceptionCapabilities.StopPropagation |
         EventInterceptionCapabilities.Observe;
 
-    public bool ApproveSensitiveActions { get; init; } = true;
+    /// <summary>Administrator grants keyed by action key. A missing key uses the descriptor grant.</summary>
+    public IReadOnlyDictionary<string, ActionInterceptionCapabilities>? ActionCapabilityGrants { get; init; }
 
-    public bool ApproveSensitiveEvents { get; init; } = true;
+    /// <summary>Administrator grants keyed by event key. A missing key uses the descriptor grant.</summary>
+    public IReadOnlyDictionary<string, EventInterceptionCapabilities>? EventCapabilityGrants { get; init; }
+
+    /// <summary>Sensitive action keys approved by the host.</summary>
+    public IReadOnlySet<string> ApprovedSensitiveActions { get; init; } =
+        new HashSet<string>(StringComparer.Ordinal);
+
+    /// <summary>Sensitive event keys approved by the host.</summary>
+    public IReadOnlySet<string> ApprovedSensitiveEvents { get; init; } =
+        new HashSet<string>(StringComparer.Ordinal);
 
     public int MaximumActionDepth { get; init; } = 32;
 }
@@ -102,7 +106,9 @@ public sealed record KernelContinuationRequest(
     Guid IdempotencyKey,
     ActionDeferRequest Defer,
     ActionContinuationPolicy Policy,
-    string ContractHash);
+    string ContractHash,
+    ContinuationDestination? Destination = null,
+    string? ProtectedInput = null);
 
 public sealed record KernelUncertaintyRequest(
     Guid InvocationId,
@@ -117,6 +123,9 @@ public sealed record KernelUncertaintyRequest(
 
 public interface IActionContinuationHost
 {
+    /// <summary>True only when the host persists continuation authority beyond this process.</summary>
+    bool SupportsDurableState { get; }
+
     ValueTask<ContinuationToken> CreateAsync(KernelContinuationRequest request, CancellationToken cancellationToken);
 
     ValueTask<ActionUncertainty> RecordUncertaintyAsync(
@@ -130,7 +139,23 @@ public sealed record KernelContinuationState(
     ContinuationState State,
     DateTimeOffset CreatedAt,
     DateTimeOffset? ClaimedAt,
-    DateTimeOffset? CompletedAt);
+    DateTimeOffset? CompletedAt,
+    string? ClaimOwner = null,
+    DateTimeOffset? LeaseExpiresAt = null,
+    int Generation = 0,
+    long Revision = 0,
+    ContinuationDestination? ResultDestination = null,
+    string? ProtectedInput = null,
+    string? CompletedOutcome = null);
+
+public sealed record KernelRecoveryState(
+    ActionRecoveryReference Reference,
+    KernelUncertaintyRequest Request,
+    ActionUncertainty Uncertainty,
+    ContinuationState State,
+    DateTimeOffset CreatedAt,
+    string? ProtectedInput,
+    ContinuationDestination ResultDestination);
 
 public interface IKernelProviderTransport
 {
@@ -147,18 +172,30 @@ public interface IKernelProviderTransport
 
 public interface IKernelEventDeliverySink
 {
+    /// <summary>True only when the sink persists durable delivery.</summary>
+    bool SupportsDurable { get; }
+
     ValueTask EnqueueAsync(
         SharpClawEventKey eventKey,
         object envelope,
         EventDelivery delivery,
         CancellationToken cancellationToken);
+
+    ValueTask EnqueueAsync(
+        SharpClawEventKey eventKey,
+        object envelope,
+        EventDelivery delivery,
+        CancellationToken cancellationToken,
+        string targetListenerId) =>
+        EnqueueAsync(eventKey, envelope, delivery, cancellationToken);
 }
 
 public sealed record KernelQueuedEvent(
     SharpClawEventKey EventKey,
     object Envelope,
     EventDelivery Delivery,
-    DateTimeOffset EnqueuedAt);
+    DateTimeOffset EnqueuedAt,
+    string TargetListenerId);
 
 public sealed record KernelToolRegistration(
     ToolDescriptor Descriptor,
