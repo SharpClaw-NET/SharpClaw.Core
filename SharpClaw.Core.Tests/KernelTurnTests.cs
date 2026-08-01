@@ -14,7 +14,7 @@ public sealed class KernelTurnTests
         builder.Hooks.For(SharpClawActions.Chat.Turn).Use<TurnRecordingInterceptor>(Order("turn"));
         builder.Hooks.For(SharpClawActions.Chat.SelectTools).Use<TurnRecordingInterceptor>(Order("tools"));
         var graph = builder.Compile();
-        var dispatcher = new KernelActionDispatcher(graph);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
         var store = new MemoryConversationStore();
         var conversationResolver = new ConversationResolver();
         var profileResolver = new ProfileResolver();

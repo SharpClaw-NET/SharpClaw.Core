@@ -1804,13 +1804,15 @@ public sealed class KernelModuleRegistry
 
     public async ValueTask StartAsync(
         KernelGraph graph,
+        KernelActionExecutionContext executionContext,
         string hostVersion,
         ExtensionFeatureSet features,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(graph);
+        ArgumentNullException.ThrowIfNull(executionContext);
         _compiledGraph = graph;
-        var dispatcher = new KernelActionDispatcher(graph);
+        var dispatcher = new KernelActionDispatcher(graph, executionContext);
         var descriptor = graph.GetStandardAction(new SharpClawActionKey("module.start"));
         foreach (var module in _modules)
         {
@@ -1839,11 +1841,14 @@ public sealed class KernelModuleRegistry
         }
     }
 
-    public async ValueTask StopAsync(CancellationToken cancellationToken = default)
+    public async ValueTask StopAsync(
+        KernelActionExecutionContext executionContext,
+        CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(executionContext);
         if (_compiledGraph is null)
             throw new KernelActionExecutionException("The module registry must compile before it can stop modules.");
-        var dispatcher = new KernelActionDispatcher(_compiledGraph);
+        var dispatcher = new KernelActionDispatcher(_compiledGraph, executionContext);
         var descriptor = _compiledGraph.GetStandardAction(new SharpClawActionKey("module.stop"));
         for (var index = _modules.Count - 1; index >= 0; index--)
         {

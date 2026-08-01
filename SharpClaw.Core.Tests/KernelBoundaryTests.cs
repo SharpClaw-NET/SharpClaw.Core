@@ -18,7 +18,7 @@ public sealed class KernelBoundaryTests
         var graph = builder.Compile();
         var terminalCalls = 0;
 
-        var outcome = await new KernelActionDispatcher(graph).RunAsync(
+        var outcome = await KernelTestExecution.CreateDispatcher(graph).RunAsync(
             graph.GetStandardAction(key),
             new KernelActionEnvelope(key, "input"),
             (_, _) =>
@@ -43,7 +43,7 @@ public sealed class KernelBoundaryTests
         builder.Hooks.For(key).Use<ProceedInterceptor>(Order("wrap"));
         var graph = builder.Compile();
 
-        var outcome = await new KernelActionDispatcher(graph).RunAsync(
+        var outcome = await KernelTestExecution.CreateDispatcher(graph).RunAsync(
             graph.GetStandardAction(key),
             new KernelActionEnvelope(key, "input"),
             (_, _) => ValueTask.FromResult<object>("terminal"),
@@ -61,7 +61,7 @@ public sealed class KernelBoundaryTests
         forgedBuilder.Add(Descriptor(forgedKey));
         forgedBuilder.Hooks.For(forgedKey).Use<ForgedInterceptor>(Order("forged"));
         var forgedGraph = forgedBuilder.Compile();
-        var forged = await new KernelActionDispatcher(forgedGraph).RunAsync(
+        var forged = await KernelTestExecution.CreateDispatcher(forgedGraph).RunAsync(
             forgedGraph.GetStandardAction(forgedKey),
             new KernelActionEnvelope(forgedKey, "input"),
             (_, _) => ValueTask.FromResult<object>("terminal"),
@@ -74,7 +74,7 @@ public sealed class KernelBoundaryTests
         consumedBuilder.Add(Descriptor(consumedKey));
         consumedBuilder.Hooks.For(consumedKey).Use<FailThenProceedInterceptor>(Order("consumed"));
         var consumedGraph = consumedBuilder.Compile();
-        var consumed = await new KernelActionDispatcher(consumedGraph).RunAsync(
+        var consumed = await KernelTestExecution.CreateDispatcher(consumedGraph).RunAsync(
             consumedGraph.GetStandardAction(consumedKey),
             new KernelActionEnvelope(consumedKey, "input"),
             (_, _) => ValueTask.FromResult<object>("terminal"),
@@ -88,7 +88,7 @@ public sealed class KernelBoundaryTests
         postProceedBuilder.Hooks.For(postProceedKey).Use<ProceedThenFailInterceptor>(Order("post-proceed"));
         var postProceedGraph = postProceedBuilder.Compile();
         var terminalCalls = 0;
-        var postProceed = await new KernelActionDispatcher(postProceedGraph).RunAsync(
+        var postProceed = await KernelTestExecution.CreateDispatcher(postProceedGraph).RunAsync(
             postProceedGraph.GetStandardAction(postProceedKey),
             new KernelActionEnvelope(postProceedKey, "input"),
             (_, _) =>
@@ -115,7 +115,9 @@ public sealed class KernelBoundaryTests
             new ActionRepeatPolicy(ActionRepeatKind.Idempotent, 3, TimeSpan.FromMilliseconds(1), "scope")));
         builder.Hooks.For(key).Use<AttemptInterceptor>(Order("repeat"));
         var graph = builder.Compile();
-        var outcome = await new KernelActionDispatcher(graph).RunAsync(
+        var outcome = await KernelTestExecution.CreateDispatcher(
+            graph,
+            repeatEvidenceAuthority: new MatchingRepeatEvidenceAuthority()).RunAsync(
             graph.GetStandardAction(key),
             new KernelActionEnvelope(key, "input"),
             (_, _) => ValueTask.FromResult<object>("done"),
@@ -137,13 +139,13 @@ public sealed class KernelBoundaryTests
             new ActionRepeatPolicy(ActionRepeatKind.ConflictOnly, 2, TimeSpan.Zero, "scope")));
         conflictBuilder.Hooks.For(conflictKey).Use<NonConflictRepeatInterceptor>(Order("conflict"));
         var conflictGraph = conflictBuilder.Compile();
-        var conflict = await new KernelActionDispatcher(conflictGraph).RunAsync(
+        var conflict = await KernelTestExecution.CreateDispatcher(conflictGraph).RunAsync(
             conflictGraph.GetStandardAction(conflictKey),
             new KernelActionEnvelope(conflictKey, "input"),
             (_, _) => ValueTask.FromResult<object>("done"),
             conflictGraph.ActionSnapshot,
             CancellationToken.None);
-        Assert.Equal("ACTION_REPEAT_DENIED", conflict.Error?.Code);
+        Assert.Equal("ACTION_REPEAT_EVIDENCE_INVALID", conflict.Error?.Code);
 
         var receiptKey = new SharpClawActionKey("boundary.receipt");
         var receiptBuilder = new KernelGraphBuilder(false);
@@ -153,13 +155,13 @@ public sealed class KernelBoundaryTests
             new ActionRepeatPolicy(ActionRepeatKind.Receipted, 2, TimeSpan.Zero, "scope")));
         receiptBuilder.Hooks.For(receiptKey).Use<ReceiptRepeatInterceptor>(Order("receipt"));
         var receiptGraph = receiptBuilder.Compile();
-        var receipt = await new KernelActionDispatcher(receiptGraph).RunAsync(
+        var receipt = await KernelTestExecution.CreateDispatcher(receiptGraph).RunAsync(
             receiptGraph.GetStandardAction(receiptKey),
             new KernelActionEnvelope(receiptKey, "input"),
             (_, _) => ValueTask.FromResult<object>("done"),
             receiptGraph.ActionSnapshot,
             CancellationToken.None);
-        Assert.Equal("ACTION_REPEAT_DENIED", receipt.Error?.Code);
+        Assert.Equal("ACTION_REPEAT_EVIDENCE_INVALID", receipt.Error?.Code);
     }
 
     [Fact]
@@ -170,7 +172,7 @@ public sealed class KernelBoundaryTests
         builder.Add(Descriptor(key));
         var graph = builder.Compile();
         var exception = await Assert.ThrowsAsync<ActionOutcomeUncertainException>(async () =>
-            await new KernelActionDispatcher(
+            await KernelTestExecution.CreateDispatcher(
                 graph,
                 new StoreBackedContinuationHost(new TestDurableContinuationStore()))
                 .RunRequiredAsync(
@@ -201,7 +203,7 @@ public sealed class KernelBoundaryTests
             Timeout: TimeSpan.FromMilliseconds(5),
             FailurePolicy: HookFailurePolicy.FailAction));
         var failGraph = failBuilder.Compile();
-        var failed = await new KernelActionDispatcher(failGraph).RunAsync(
+        var failed = await KernelTestExecution.CreateDispatcher(failGraph).RunAsync(
             failGraph.GetStandardAction(failKey),
             new KernelActionEnvelope(failKey, "input"),
             (_, _) => ValueTask.FromResult<object>("terminal"),
@@ -217,7 +219,7 @@ public sealed class KernelBoundaryTests
             Timeout: TimeSpan.FromMilliseconds(5),
             FailurePolicy: HookFailurePolicy.BestEffort));
         var bestEffortGraph = bestEffortBuilder.Compile();
-        var completed = await new KernelActionDispatcher(bestEffortGraph).RunAsync(
+        var completed = await KernelTestExecution.CreateDispatcher(bestEffortGraph).RunAsync(
             bestEffortGraph.GetStandardAction(bestEffortKey),
             new KernelActionEnvelope(bestEffortKey, "input"),
             (_, _) => ValueTask.FromResult<object>("terminal"),
@@ -234,7 +236,7 @@ public sealed class KernelBoundaryTests
         builder.Add(Descriptor(key));
         builder.Hooks.For(key).Use<DeferBoundaryInterceptor>(Order("defer"));
         var graph = builder.Compile();
-        var processOnly = await new KernelActionDispatcher(graph).RunAsync(
+        var processOnly = await KernelTestExecution.CreateDispatcher(graph).RunAsync(
             graph.GetStandardAction(key),
             new KernelActionEnvelope(key, "input"),
             (_, _) => ValueTask.FromResult<object>("unused"),
@@ -245,7 +247,7 @@ public sealed class KernelBoundaryTests
         var host = new StoreBackedContinuationHost(
             new TestDurableContinuationStore(),
             TimeSpan.FromMinutes(1));
-        var outcome = await new KernelActionDispatcher(graph, host).RunAsync(
+        var outcome = await KernelTestExecution.CreateDispatcher(graph, host).RunAsync(
             graph.GetStandardAction(key),
             new KernelActionEnvelope(key, "input"),
             (_, _) => ValueTask.FromResult<object>("unused"),
@@ -584,7 +586,7 @@ public sealed class KernelBoundaryTests
             });
         var terminalCalls = 0;
 
-        var outcome = await new KernelActionDispatcher(graph).RunAsync(
+        var outcome = await KernelTestExecution.CreateDispatcher(graph).RunAsync(
             graph.GetStandardAction(key),
             new KernelActionEnvelope(key, "input"),
             (_, _) =>
@@ -613,7 +615,7 @@ public sealed class KernelBoundaryTests
         var graph = builder.Compile();
         var terminalCalls = 0;
 
-        var outcome = await new KernelActionDispatcher(graph).RunAsync(
+        var outcome = await KernelTestExecution.CreateDispatcher(graph).RunAsync(
             graph.GetStandardAction(key),
             new KernelActionEnvelope(key, "input"),
             (_, _) =>
@@ -646,7 +648,7 @@ public sealed class KernelBoundaryTests
         NonCooperativePreProceedInterceptor.Completed =
             new TaskCompletionSource<Exception?>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        var outcome = await new KernelActionDispatcher(
+        var outcome = await KernelTestExecution.CreateDispatcher(
             graph,
             new StoreBackedContinuationHost(store)).RunAsync(
             graph.GetStandardAction(key),
@@ -750,7 +752,7 @@ public sealed class KernelBoundaryTests
         builder.Hooks.For(key).Use<NestedDispatchInterceptor>(Order("nested"));
         var graph = builder.Compile(options: new KernelGraphCompileOptions { MaximumActionDepth = 2 });
         NestedDispatchInterceptor.Graph = graph;
-        NestedDispatchInterceptor.Dispatcher = new KernelActionDispatcher(graph);
+        NestedDispatchInterceptor.Dispatcher = KernelTestExecution.CreateDispatcher(graph);
         NestedDispatchInterceptor.Observations.Clear();
 
         var outcome = await NestedDispatchInterceptor.Dispatcher.RunAsync(
@@ -776,7 +778,9 @@ public sealed class KernelBoundaryTests
     public async Task Durable_continuation_enforces_hash_claim_lease_generation_and_delivery_state()
     {
         var key = new SharpClawActionKey("boundary.continuation.state");
-        var host = new StoreBackedContinuationHost(new TestDurableContinuationStore());
+        var host = new StoreBackedContinuationHost(
+            new TestDurableContinuationStore(),
+            retentionPeriod: TimeSpan.FromSeconds(1));
         var request = new KernelContinuationRequest(
             Guid.NewGuid(),
             key,
@@ -837,6 +841,35 @@ public sealed class KernelBoundaryTests
             currentClaim,
             now,
             CancellationToken.None));
+        var started = await host.SetExecutionStateAsync(
+            token.TokenId,
+            token.Secret,
+            currentClaim,
+            new KernelContinuationExecutionUpdate(
+                ContinuationExecutionStage.TerminalStarted,
+                ActionOutcomeCertainty.Uncertain),
+            now,
+            CancellationToken.None);
+        Assert.NotNull(started);
+        currentClaim = currentClaim with
+        {
+            Claim = currentClaim.Claim with { ExpectedRevision = started!.Revision }
+        };
+        var persisted = await host.SetExecutionStateAsync(
+            token.TokenId,
+            token.Secret,
+            currentClaim,
+            new KernelContinuationExecutionUpdate(
+                ContinuationExecutionStage.OutcomePersisted,
+                ActionOutcomeCertainty.Certain,
+                PersistedOutcome: "completed"),
+            now,
+            CancellationToken.None);
+        Assert.NotNull(persisted);
+        currentClaim = currentClaim with
+        {
+            Claim = currentClaim.Claim with { ExpectedRevision = persisted!.Revision }
+        };
         var completed = await host.CompleteAsync(
             token.TokenId,
             token.Secret,
@@ -859,6 +892,17 @@ public sealed class KernelBoundaryTests
         {
             Claim = currentClaim.Claim with { ExpectedRevision = completed.Revision }
         };
+        var deliveryStarted = await host.BeginDeliveryAsync(
+            token.TokenId,
+            token.Secret,
+            deliveredClaim,
+            now,
+            CancellationToken.None);
+        Assert.Equal(ContinuationExecutionStage.DeliveryStarted, deliveryStarted!.ExecutionStage);
+        deliveredClaim = deliveredClaim with
+        {
+            Claim = deliveredClaim.Claim with { ExpectedRevision = deliveryStarted.Revision }
+        };
         var delivered = await host.DeliverAsync(
             token.TokenId,
             token.Secret,
@@ -876,14 +920,21 @@ public sealed class KernelBoundaryTests
             now,
             CancellationToken.None);
         Assert.Equal(ContinuationState.Delivered, acknowledged!.State);
+        var acknowledgedClaim = deliveredClaim with
+        {
+            Claim = deliveredClaim.Claim with { ExpectedRevision = acknowledged.Revision }
+        };
+        Assert.False(await host.DeleteAsync(
+            token.TokenId,
+            token.Secret,
+            acknowledgedClaim,
+            now,
+            CancellationToken.None));
         Assert.True(await host.DeleteAsync(
             token.TokenId,
             token.Secret,
-            deliveredClaim with
-            {
-                Claim = deliveredClaim.Claim with { ExpectedRevision = acknowledged.Revision }
-            },
-            now,
+            acknowledgedClaim,
+            now.AddSeconds(2),
             CancellationToken.None));
         Assert.Equal(ContinuationState.Deleted, (await host.GetAsync(token.TokenId, CancellationToken.None))!.State);
     }
@@ -1011,7 +1062,7 @@ public sealed class KernelBoundaryTests
     }
 
     [Fact]
-    public async Task Expired_claim_becomes_uncertain_before_deletion()
+    public async Task Expired_terminal_claim_requires_recovery_before_deletion()
     {
         var host = new StoreBackedContinuationHost(new TestDurableContinuationStore());
         var now = DateTimeOffset.UtcNow;
@@ -1031,22 +1082,34 @@ public sealed class KernelBoundaryTests
             new ContinuationClaim("owner", now.AddMinutes(1), 1, pending!.Revision),
             request.ContractHash);
         var claimed = await host.ClaimAsync(token.TokenId, token.Secret, claim, now, CancellationToken.None);
+        var started = await host.SetExecutionStateAsync(
+            token.TokenId,
+            token.Secret,
+            claim with { Claim = claim.Claim with { ExpectedRevision = claimed!.Revision } },
+            new KernelContinuationExecutionUpdate(
+                ContinuationExecutionStage.TerminalStarted,
+                ActionOutcomeCertainty.Uncertain),
+            now,
+            CancellationToken.None);
         var expired = await host.ExpireAsync(token.TokenId, claimed!.ExpiresAt.AddSeconds(1), CancellationToken.None);
 
         Assert.Equal(ContinuationState.OutcomeUncertain, expired!.State);
+        Assert.NotNull(expired.RecoveryReference);
         Assert.Null(await host.ResumeAsync(
             token.TokenId,
             token.Secret,
-            claim with { Claim = claim.Claim with { ExpectedRevision = expired.Revision } },
+            claim with { Claim = claim.Claim with { ExpectedRevision = started!.Revision } },
             expired.ExpiresAt.AddSeconds(1),
             CancellationToken.None));
-        Assert.True(await host.DeleteAsync(
+        Assert.False(await host.DeleteAsync(
             token.TokenId,
             token.Secret,
             claim with { Claim = claim.Claim with { ExpectedRevision = expired.Revision } },
             expired.ExpiresAt.AddSeconds(1),
             CancellationToken.None));
-        Assert.Equal(ContinuationState.Deleted, (await host.GetAsync(token.TokenId, CancellationToken.None))!.State);
+        Assert.Equal(
+            ContinuationState.OutcomeUncertain,
+            (await host.GetAsync(token.TokenId, CancellationToken.None))!.State);
     }
 
     [Fact]
@@ -1058,7 +1121,7 @@ public sealed class KernelBoundaryTests
             new ChatProfile("provider", Guid.NewGuid(), SystemPrompt: "system"),
             [new ChatCompletionMessage("user", "history")]);
         var graph = new KernelGraphBuilder().Compile();
-        var dispatcher = new KernelActionDispatcher(graph);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
         var context = await new KernelChatContextAssembler(graph, dispatcher, [])
             .BuildAsync(request, CancellationToken.None);
         Assert.Equal("system", Assert.Single(context.SystemPromptSegments).Content);
@@ -1066,7 +1129,7 @@ public sealed class KernelBoundaryTests
 
         var transport = new RecordingTransport();
         var requestForProvider = NewProviderRequest(graph, context);
-        await new ProviderRoundLoop(transport, graph).RunAsync(
+        await new ProviderRoundLoop(transport, graph, dispatcher).RunAsync(
             requestForProvider,
             new NoToolPipeline(),
             CancellationToken.None);
@@ -1098,7 +1161,7 @@ public sealed class KernelBoundaryTests
         var store = new DirectConversationStore();
         var contextContributor = new DirectContextContributor();
         var transport = new DirectTransport();
-        var dispatcher = new KernelActionDispatcher(graph);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
         var runner = new DirectTurnRunner(
             graph,
             dispatcher,
@@ -1144,7 +1207,7 @@ public sealed class KernelBoundaryTests
         var coordinator = new RecordingCoordinator();
         var pipeline = new UnifiedToolPipeline(
             graph,
-            new KernelActionDispatcher(graph),
+            KernelTestExecution.CreateDispatcher(graph),
             [gate],
             coordinator);
         using var arguments = JsonDocument.Parse("{\"stage\":\"original\"}");
@@ -1194,7 +1257,8 @@ public sealed class KernelBoundaryTests
         var graph = builder.Compile();
         var request = NewProviderRequest(graph, ChatContextContribution.Empty);
         var transport = new RecordingTransport();
-        var loop = new ProviderRoundLoop(transport, graph);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        var loop = new ProviderRoundLoop(transport, graph, dispatcher);
 
         var completion = await loop.RunAsync(request, new NoToolPipeline(), CancellationToken.None);
 
@@ -1215,7 +1279,10 @@ public sealed class KernelBoundaryTests
 
         ProviderRecordingInterceptor.Keys.Clear();
         var chunks = new List<ChatStreamChunk>();
-        await foreach (var chunk in new ProviderRoundLoop(new OneRoundStreamTransport(), graph).StreamAsync(
+        await foreach (var chunk in new ProviderRoundLoop(
+                           new OneRoundStreamTransport(),
+                           graph,
+                           dispatcher).StreamAsync(
                            request,
                            new NoToolPipeline(),
                            CancellationToken.None))
@@ -1245,7 +1312,7 @@ public sealed class KernelBoundaryTests
 
         ProviderRecordingInterceptor.Keys.Clear();
         await Assert.ThrowsAsync<KernelActionFailedException>(async () =>
-            await new ProviderRoundLoop(new FailingTransport(), graph)
+            await new ProviderRoundLoop(new FailingTransport(), graph, dispatcher)
                 .RunAsync(request, new NoToolPipeline(), CancellationToken.None));
         Assert.Contains("provider.request.fail", ProviderRecordingInterceptor.Keys);
     }
@@ -1267,7 +1334,7 @@ public sealed class KernelBoundaryTests
         await foreach (var chunk in new ProviderRoundLoop(
                            new OneRoundStreamTransport(),
                            graph,
-                           new KernelActionDispatcher(graph)).StreamAsync(
+                           KernelTestExecution.CreateDispatcher(graph)).StreamAsync(
                            NewProviderRequest(graph, ChatContextContribution.Empty),
                            new NoToolPipeline(),
                            CancellationToken.None))
@@ -1301,7 +1368,10 @@ public sealed class KernelBoundaryTests
         var graph = builder.Compile();
 
         var exception = await Record.ExceptionAsync(async () =>
-            await new ProviderRoundLoop(new RecordingTransport(), graph)
+            await new ProviderRoundLoop(
+                    new RecordingTransport(),
+                    graph,
+                    KernelTestExecution.CreateDispatcher(graph))
                 .RunAsync(NewProviderRequest(graph, ChatContextContribution.Empty), new NoToolPipeline(), CancellationToken.None));
 
         Assert.IsAssignableFrom<OperationCanceledException>(exception);
@@ -1331,7 +1401,7 @@ public sealed class KernelBoundaryTests
             await foreach (var chunk in new ProviderRoundLoop(
                                new OneRoundStreamTransport(),
                                graph,
-                               new KernelActionDispatcher(graph)).StreamAsync(
+                               KernelTestExecution.CreateDispatcher(graph)).StreamAsync(
                                NewProviderRequest(graph, ChatContextContribution.Empty),
                                new NoToolPipeline(),
                                CancellationToken.None))
@@ -1409,8 +1479,14 @@ public sealed class KernelBoundaryTests
                 }
             });
 
-        await registry.StartAsync(graph, "host", ExtensionFeatureSet.Empty, CancellationToken.None);
-        await registry.StopAsync(CancellationToken.None);
+        var executionContext = KernelTestExecution.CreateContext();
+        await registry.StartAsync(
+            graph,
+            executionContext,
+            "host",
+            ExtensionFeatureSet.Empty,
+            CancellationToken.None);
+        await registry.StopAsync(executionContext, CancellationToken.None);
 
         Assert.Equal(1, LifecycleModule.Starts);
         Assert.Equal(1, LifecycleModule.Stops);

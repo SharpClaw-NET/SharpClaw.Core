@@ -6,22 +6,31 @@ namespace SharpClaw.Core.Kernel;
 public sealed class KernelActionDispatcher : IActionDispatcher
 {
     private static readonly AsyncLocal<InvocationScope?> CurrentScope = new();
-    private sealed record InvocationScope(Guid InvocationId, int Depth);
+    private sealed record InvocationScope(
+        Guid InvocationId,
+        int Depth,
+        KernelActionExecutionContext ExecutionContext);
     private readonly KernelGraph _graph;
+    private readonly KernelActionExecutionContext _executionContext;
     private readonly IActionContinuationHost _continuationHost;
     private readonly ICommittedEventWriter _eventWriter;
     private readonly IKernelActionResultSnapshotter _resultSnapshotter;
+    private readonly IKernelActionRepeatEvidenceAuthority _repeatEvidenceAuthority;
 
     public KernelActionDispatcher(
         KernelGraph graph,
+        KernelActionExecutionContext executionContext,
         IActionContinuationHost? continuationHost = null,
         ICommittedEventWriter? eventWriter = null,
-        IKernelActionResultSnapshotter? resultSnapshotter = null)
+        IKernelActionResultSnapshotter? resultSnapshotter = null,
+        IKernelActionRepeatEvidenceAuthority? repeatEvidenceAuthority = null)
     {
         _graph = graph ?? throw new ArgumentNullException(nameof(graph));
+        _executionContext = executionContext ?? throw new ArgumentNullException(nameof(executionContext));
         _continuationHost = continuationHost ?? new InMemoryContinuationHost();
         _eventWriter = eventWriter ?? new KernelEventDispatcher(graph);
         _resultSnapshotter = resultSnapshotter ?? new JsonKernelActionResultSnapshotter();
+        _repeatEvidenceAuthority = repeatEvidenceAuthority ?? new DenyKernelActionRepeatEvidenceAuthority();
     }
 
     public ValueTask<IActionOutcome<TResult>> RunAsync<TAction, TResult>(
@@ -52,13 +61,16 @@ public sealed class KernelActionDispatcher : IActionDispatcher
 
         var parent = CurrentScope.Value;
         var depth = parent is null ? 0 : parent.Depth + 1;
+        var executionContext = parent?.ExecutionContext ?? _executionContext;
         var invocation = new KernelActionInvocation<TAction, TResult>(
             definition,
             terminal,
             snapshot,
+            executionContext,
             _continuationHost,
             _eventWriter,
             _resultSnapshotter,
+            _repeatEvidenceAuthority,
             cancellationToken);
         return invocation.InvokeRootAsync(action, depth, parent?.InvocationId, cancellationToken);
     }
@@ -90,36 +102,43 @@ public sealed class KernelActionDispatcher : IActionDispatcher
     private sealed class KernelActionInvocation<TAction, TResult>
     {
         private static readonly TimeSpan CancellationObservationWindow = TimeSpan.FromMilliseconds(25);
+        private sealed record ActionAttempt(
+            Guid InvocationId,
+            Guid? ParentInvocationId,
+            int Depth,
+            int Number);
         private readonly CompiledActionDefinition<TAction, TResult> _definition;
         private readonly Func<TAction, CancellationToken, ValueTask<TResult>> _terminal;
         private readonly ActionPipelineSnapshot _snapshot;
+        private readonly KernelActionExecutionContext _executionContext;
         private readonly IActionContinuationHost _continuationHost;
         private readonly ICommittedEventWriter _eventWriter;
         private readonly IKernelActionResultSnapshotter _resultSnapshotter;
+        private readonly IKernelActionRepeatEvidenceAuthority _repeatEvidenceAuthority;
         private readonly CancellationToken _rootCancellationToken;
         private readonly SemaphoreSlim _uncertaintyLock = new(1, 1);
-        private readonly Guid _invocationId = Guid.NewGuid();
-        private readonly Guid _traceId = Guid.NewGuid();
-        private readonly Guid _idempotencyKey = Guid.NewGuid();
         private readonly DateTimeOffset _deadline;
-        private Guid? _parentInvocationId;
         private ActionUncertainty? _recordedUncertainty;
 
         public KernelActionInvocation(
             CompiledActionDefinition<TAction, TResult> definition,
             Func<TAction, CancellationToken, ValueTask<TResult>> terminal,
             ActionPipelineSnapshot snapshot,
+            KernelActionExecutionContext executionContext,
             IActionContinuationHost continuationHost,
             ICommittedEventWriter eventWriter,
             IKernelActionResultSnapshotter resultSnapshotter,
+            IKernelActionRepeatEvidenceAuthority repeatEvidenceAuthority,
             CancellationToken rootCancellationToken)
         {
             _definition = definition;
             _terminal = terminal;
             _snapshot = snapshot;
+            _executionContext = executionContext;
             _continuationHost = continuationHost;
             _eventWriter = eventWriter;
             _resultSnapshotter = resultSnapshotter;
+            _repeatEvidenceAuthority = repeatEvidenceAuthority;
             _rootCancellationToken = rootCancellationToken;
             _deadline = DateTimeOffset.UtcNow + definition.Descriptor.DefaultTimeout;
         }
@@ -128,24 +147,36 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             TAction action,
             int depth,
             Guid? parentInvocationId,
+            CancellationToken cancellationToken) =>
+            await InvokeAttemptAsync(
+                action,
+                new ActionAttempt(Guid.NewGuid(), parentInvocationId, depth, 1),
+                cancellationToken);
+
+        private async ValueTask<IActionOutcome<TResult>> InvokeAttemptAsync(
+            TAction action,
+            ActionAttempt attempt,
             CancellationToken cancellationToken)
         {
-            _parentInvocationId = parentInvocationId;
             var previous = CurrentScope.Value;
-            CurrentScope.Value = new InvocationScope(_invocationId, depth);
+            CurrentScope.Value = new InvocationScope(
+                attempt.InvocationId,
+                attempt.Depth,
+                _executionContext);
             try
             {
                 await PublishLifecycleAsync(
+                    attempt,
                     KernelActionLifecycleEvents.DescriptorFor(SharpClawEvents.ActionStarting),
                     null,
                     CancellationToken.None);
                 var outcome = await InvokeFrameAsync(
                     action,
                     0,
-                    depth,
-                    cancellationToken,
-                    1);
+                    attempt,
+                    cancellationToken);
                 await PublishLifecycleAsync(
+                    attempt,
                     KernelActionLifecycleEvents.ForOutcome(outcome.Kind),
                     outcome,
                     CancellationToken.None);
@@ -158,15 +189,16 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         }
 
         private ValueTask PublishLifecycleAsync(
+            ActionAttempt attempt,
             EventDescriptor<KernelActionLifecycleEvent> descriptor,
             IActionOutcome<TResult>? outcome,
             CancellationToken cancellationToken) =>
             _eventWriter.PublishAsync(
                 descriptor,
                 new KernelActionLifecycleEvent(
-                    _invocationId,
-                    _parentInvocationId,
-                    _traceId,
+                    attempt.InvocationId,
+                    attempt.ParentInvocationId,
+                    _executionContext.TraceId,
                     _definition.Descriptor.Key,
                     _definition.Descriptor.Version,
                     outcome?.Kind,
@@ -179,15 +211,14 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         private async ValueTask<IActionOutcome<TResult>> InvokeFrameAsync(
             TAction action,
             int index,
-            int depth,
-            CancellationToken cancellationToken,
-            int attempt = 1)
+            ActionAttempt attempt,
+            CancellationToken cancellationToken)
         {
             if (cancellationToken.IsCancellationRequested)
                 return KernelActionOutcome<TResult>.Cancelled(
                     "ACTION_CANCELLED",
                     "The action was cancelled before the next action path started.");
-            if (depth > _snapshot.MaximumActionDepth)
+            if (attempt.Depth > _snapshot.MaximumActionDepth)
                 return KernelActionOutcome<TResult>.Failed(
                     "ACTION_DEPTH_EXCEEDED",
                     "The action graph exceeded its maximum recursion depth.");
@@ -197,22 +228,22 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                     "The action deadline expired before this action path completed.");
 
             if (index >= _definition.Frames.Count)
-                return await InvokeTerminalAsync(action, _invocationId, cancellationToken);
+                return await InvokeTerminalAsync(action, attempt.InvocationId, cancellationToken);
 
             var activeFrame = _definition.Frames[index];
             var context = new ActionContext<TAction>(
-                _invocationId,
-                _parentInvocationId,
-                _traceId,
-                _idempotencyKey,
-                depth,
-                attempt,
+                attempt.InvocationId,
+                attempt.ParentInvocationId,
+                _executionContext.TraceId,
+                _executionContext.IdempotencyKey,
+                attempt.Depth,
+                attempt.Number,
                 _deadline,
                 _definition.Descriptor.Key,
                 activeFrame.OwnerModuleId,
-                RequestPrincipal.Anonymous,
+                _executionContext.Caller,
                 action,
-                ExtensionFeatureSet.Empty,
+                _executionContext.Features,
                 _snapshot);
 
             var frame = activeFrame;
@@ -272,8 +303,11 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                     return Reissue(known!, control.Authority);
                 if (control.ContinuationStarted)
                     return await RecordControlUncertaintyAsync(context, control, exception.Message, cancellationToken);
-                return await InvokeFrameAsync(context.Action, FrameIndex(frame) + 1,
-                    context.Depth, cancellationToken, context.Attempt);
+                return await InvokeFrameAsync(
+                    context.Action,
+                    FrameIndex(frame) + 1,
+                    AttemptFrom(context),
+                    cancellationToken);
             }
             catch (KernelOperationTimeoutException exception)
             {
@@ -317,9 +351,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                     return await InvokeFrameAsync(
                         context.Action,
                         FrameIndex(frame) + 1,
-                        context.Depth,
-                        cancellationToken,
-                        context.Attempt);
+                        AttemptFrom(context),
+                        cancellationToken);
                 return KernelActionOutcome<TResult>.Failed("ACTION_INTERCEPTOR_FAILED", exception.Message);
             }
         }
@@ -403,8 +436,11 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                     return Reissue(known!, control.Authority);
                 if (control.ContinuationStarted)
                     return await RecordControlUncertaintyAsync(context, control, exception.Message, cancellationToken);
-                return await InvokeFrameAsync(context.Action, FrameIndex(frame) + 1,
-                    context.Depth, cancellationToken, context.Attempt);
+                return await InvokeFrameAsync(
+                    context.Action,
+                    FrameIndex(frame) + 1,
+                    AttemptFrom(context),
+                    cancellationToken);
             }
             catch (KernelOperationTimeoutException exception)
             {
@@ -448,9 +484,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                     return await InvokeFrameAsync(
                         context.Action,
                         FrameIndex(frame) + 1,
-                        context.Depth,
-                        cancellationToken,
-                        context.Attempt);
+                        AttemptFrom(context),
+                        cancellationToken);
                 return KernelActionOutcome<TResult>.Failed("ACTION_INTERCEPTOR_FAILED", exception.Message);
             }
         }
@@ -515,7 +550,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                         Guid.NewGuid(),
                         _definition.Descriptor.Key,
                         _definition.Descriptor.Version,
-                        _idempotencyKey),
+                        _executionContext.IdempotencyKey),
                     DateTimeOffset.UtcNow);
                 var uncertainty = await RecordUncertaintyAsync(
                     invocationId,
@@ -543,7 +578,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                         Guid.NewGuid(),
                         _definition.Descriptor.Key,
                         _definition.Descriptor.Version,
-                        _idempotencyKey),
+                        _executionContext.IdempotencyKey),
                     DateTimeOffset.UtcNow);
                 var uncertainty = await RecordUncertaintyAsync(
                     invocationId,
@@ -580,9 +615,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             return await InvokeFrameAsync(
                 context.Action,
                 FrameIndex(frame) + 1,
-                context.Depth,
-                cancellationToken,
-                context.Attempt);
+                AttemptFrom(context),
+                cancellationToken);
         }
 
         private async ValueTask<IActionOutcome<TResult>> ResolveUntypedHookTimeoutAsync(
@@ -603,9 +637,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             return await InvokeFrameAsync(
                 context.Action,
                 FrameIndex(frame) + 1,
-                context.Depth,
-                cancellationToken,
-                context.Attempt);
+                AttemptFrom(context),
+                cancellationToken);
         }
 
         private async ValueTask<IActionOutcome<TResult>> RecordControlUncertaintyAsync(
@@ -665,7 +698,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                         invocationId,
                         _definition.Descriptor.Key,
                         _definition.Descriptor.Version,
-                        _idempotencyKey,
+                        _executionContext.IdempotencyKey,
                         supplied.Stage,
                         supplied.Code,
                         supplied.Message,
@@ -957,7 +990,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                         policy,
                         context.Snapshot.ContractHash,
                         new ContinuationDestination("action", context.ActionKey.Value),
-                        KernelJson.Serialize(context.Action).GetRawText()),
+                        KernelJson.Serialize(context.Action).GetRawText(),
+                        owner._definition.Descriptor.RepeatPolicy),
                     cancellationToken);
                 return Issue(KernelActionOutcome<TResult>.DeferredBy(token, _authority));
             }
@@ -969,7 +1003,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                 ArgumentNullException.ThrowIfNull(request);
                 EnsureCapability(ActionInterceptionCapabilities.Repeat);
                 var policy = owner._definition.Descriptor.RepeatPolicy;
-                if (!CanRepeat(policy, request))
+                if (!CanRequestRepeat(policy))
                 {
                     _used = true;
                     return Issue(KernelActionOutcome<TResult>.FailedBy(
@@ -980,17 +1014,44 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                 }
 
                 _used = true;
+                var nextInvocationId = Guid.NewGuid();
+                var requestedAt = DateTimeOffset.UtcNow;
+                var evidenceRequest = new KernelActionRepeatEvidenceRequest(
+                    RequiredEvidence(policy.Kind),
+                    context.ActionKey,
+                    owner._definition.Descriptor.Version,
+                    policy.IdempotencyScope,
+                    context.IdempotencyKey,
+                    context.InvocationId,
+                    context.Attempt,
+                    nextInvocationId,
+                    context.Attempt + 1,
+                    requestedAt);
+                var evidence = await owner._repeatEvidenceAuthority.AuthorizeAsync(
+                    evidenceRequest,
+                    cancellationToken);
+                if (!ValidEvidence(evidenceRequest, evidence, DateTimeOffset.UtcNow))
+                {
+                    return Issue(KernelActionOutcome<TResult>.FailedBy(
+                        new ExecutionError(
+                            "ACTION_REPEAT_EVIDENCE_INVALID",
+                            "The host did not issue valid evidence for the requested action repeat."),
+                        _authority));
+                }
+
                 var backoff = request.Backoff.GetValueOrDefault();
                 if (policy.MinimumBackoff > backoff)
                     backoff = policy.MinimumBackoff;
                 if (backoff > TimeSpan.Zero)
                     await Task.Delay(backoff, cancellationToken);
-                var outcome = await owner.InvokeFrameAsync(
+                var outcome = await owner.InvokeAttemptAsync(
                     request.Value,
-                    0,
-                    context.Depth,
-                    cancellationToken,
-                    context.Attempt + 1);
+                    new ActionAttempt(
+                        nextInvocationId,
+                        context.ParentInvocationId,
+                        context.Depth,
+                        context.Attempt + 1),
+                    cancellationToken);
                 return Issue(outcome);
             }
 
@@ -1018,9 +1079,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                 _continuationTask = owner.InvokeFrameAsync(
                     nextAction,
                     owner.FrameIndex(frame) + 1,
-                    context.Depth,
-                    linked.Token,
-                    context.Attempt).AsTask();
+                    AttemptFrom(context),
+                    linked.Token).AsTask();
                 IActionOutcome<TResult> outcome;
                 try
                 {
@@ -1046,20 +1106,42 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                 return _issuedOutcome;
             }
 
-            private bool CanRepeat(ActionRepeatPolicy policy, ActionRepeatRequest<TAction> request)
+            private bool CanRequestRepeat(ActionRepeatPolicy policy)
             {
                 if (policy.Kind == ActionRepeatKind.None || context.Attempt >= policy.MaximumAttempts)
                     return false;
-                if (string.IsNullOrWhiteSpace(policy.IdempotencyScope) || context.IdempotencyKey == Guid.Empty)
-                    return false;
-                return policy.Kind switch
-                {
-                    ActionRepeatKind.ConflictOnly =>
-                        request.Reason.Contains("conflict", StringComparison.OrdinalIgnoreCase),
-                    ActionRepeatKind.Receipted => context.Features.Contains("action.receipt"),
-                    _ => true
-                };
+                return !string.IsNullOrWhiteSpace(policy.IdempotencyScope) &&
+                       context.IdempotencyKey != Guid.Empty;
             }
+
+            private static KernelActionRepeatEvidenceKind RequiredEvidence(ActionRepeatKind kind) =>
+                kind switch
+                {
+                    ActionRepeatKind.ConflictOnly => KernelActionRepeatEvidenceKind.Conflict,
+                    ActionRepeatKind.Idempotent => KernelActionRepeatEvidenceKind.IdempotencyAccepted,
+                    ActionRepeatKind.Receipted => KernelActionRepeatEvidenceKind.DurableReceipt,
+                    _ => throw new KernelActionExecutionException(
+                        $"Repeat kind '{kind}' does not have an evidence contract.")
+                };
+
+            private static bool ValidEvidence(
+                KernelActionRepeatEvidenceRequest request,
+                KernelActionRepeatEvidence? evidence,
+                DateTimeOffset now) =>
+                evidence is not null &&
+                !string.IsNullOrWhiteSpace(evidence.EvidenceId) &&
+                evidence.Kind == request.RequiredKind &&
+                evidence.ActionKey == request.ActionKey &&
+                evidence.ActionVersion == request.ActionVersion &&
+                string.Equals(evidence.IdempotencyScope, request.IdempotencyScope, StringComparison.Ordinal) &&
+                evidence.IdempotencyKey == request.IdempotencyKey &&
+                evidence.PriorInvocationId == request.PriorInvocationId &&
+                evidence.PriorAttempt == request.PriorAttempt &&
+                evidence.NextInvocationId == request.NextInvocationId &&
+                evidence.NextAttempt == request.NextAttempt &&
+                evidence.IssuedAt >= request.RequestedAt &&
+                evidence.IssuedAt <= now &&
+                evidence.ExpiresAt > now;
 
             private void EnsureCapability(ActionInterceptionCapabilities capability)
             {
@@ -1090,6 +1172,13 @@ public sealed class KernelActionDispatcher : IActionDispatcher
 
             throw new KernelActionExecutionException("The compiled action frame is not registered.");
         }
+
+        private static ActionAttempt AttemptFrom(ActionContext<TAction> context) =>
+            new(
+                context.InvocationId,
+                context.ParentInvocationId,
+                context.Depth,
+                context.Attempt);
 
         private sealed class UntypedActionControl(
             KernelActionInvocation<TAction, TResult> owner,

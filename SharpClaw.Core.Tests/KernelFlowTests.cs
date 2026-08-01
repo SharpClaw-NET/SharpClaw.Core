@@ -61,7 +61,7 @@ public sealed class KernelFlowTests
             1,
             false));
         var graph = builder.Compile();
-        var dispatcher = new KernelActionDispatcher(graph);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
         var pipeline = new UnifiedToolPipeline(graph, dispatcher);
         var invocation = NewInvocation("sample");
 
@@ -86,7 +86,7 @@ public sealed class KernelFlowTests
         var graph = builder.Compile();
         var pipeline = new UnifiedToolPipeline(
             graph,
-            new KernelActionDispatcher(graph),
+            KernelTestExecution.CreateDispatcher(graph),
             [new RejectGate()]);
 
         var outcome = await pipeline.InvokeAsync(NewInvocation("sample"), CancellationToken.None);
@@ -108,9 +108,10 @@ public sealed class KernelFlowTests
             1,
             false));
         var graph = builder.Compile();
-        var pipeline = new UnifiedToolPipeline(graph, new KernelActionDispatcher(graph));
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        var pipeline = new UnifiedToolPipeline(graph, dispatcher);
         var transport = new TwoRoundTransport();
-        var loop = new ProviderRoundLoop(transport);
+        var loop = new ProviderRoundLoop(transport, graph, dispatcher);
         var request = NewProviderRequest(graph);
 
         var completion = await loop.RunAsync(request, pipeline, CancellationToken.None);
@@ -132,9 +133,10 @@ public sealed class KernelFlowTests
             1,
             false));
         var graph = builder.Compile();
-        var pipeline = new UnifiedToolPipeline(graph, new KernelActionDispatcher(graph));
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        var pipeline = new UnifiedToolPipeline(graph, dispatcher);
         var transport = new StreamingTwoRoundTransport();
-        var loop = new ProviderRoundLoop(transport);
+        var loop = new ProviderRoundLoop(transport, graph, dispatcher);
         var chunks = new List<ChatStreamChunk>();
 
         await foreach (var chunk in loop.StreamAsync(NewProviderRequest(graph), pipeline, CancellationToken.None))

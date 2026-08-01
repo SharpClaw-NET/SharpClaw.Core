@@ -207,7 +207,42 @@ public sealed record KernelContinuationRequest(
     ActionContinuationPolicy Policy,
     string ContractHash,
     ContinuationDestination? Destination = null,
-    string? ProtectedInput = null);
+    string? ProtectedInput = null,
+    ActionRepeatPolicy? RepeatPolicy = null);
+
+public sealed record KernelContinuationExecutionUpdate(
+    ContinuationExecutionStage Stage,
+    ActionOutcomeCertainty Certainty,
+    string? ReceiptReference = null,
+    string? PersistedOutcome = null);
+
+public sealed record KernelContinuationReceiptRequest(
+    Guid TokenId,
+    ActionRecoveryReference RecoveryReference,
+    SharpClawActionKey ActionKey,
+    int ActionVersion,
+    Guid IdempotencyKey,
+    string ContractHash,
+    ContinuationExecutionStage Stage,
+    string? ReceiptReference);
+
+public sealed record KernelContinuationReceipt(
+    Guid TokenId,
+    Guid RecoveryId,
+    SharpClawActionKey ActionKey,
+    int ActionVersion,
+    Guid IdempotencyKey,
+    string ContractHash,
+    string ReceiptReference,
+    string Outcome,
+    DateTimeOffset ObservedAt);
+
+public interface IKernelContinuationReceiptResolver
+{
+    ValueTask<KernelContinuationReceipt?> FindAsync(
+        KernelContinuationReceiptRequest request,
+        CancellationToken cancellationToken);
+}
 
 public sealed record KernelUncertaintyRequest(
     Guid InvocationId,
@@ -276,6 +311,14 @@ public interface IActionContinuationHost
         DateTimeOffset now,
         CancellationToken cancellationToken);
 
+    ValueTask<KernelContinuationState?> SetExecutionStateAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
+        KernelContinuationExecutionUpdate update,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
     ValueTask<KernelContinuationState?> CompleteAsync(
         Guid tokenId,
         string secret,
@@ -285,6 +328,13 @@ public interface IActionContinuationHost
         CancellationToken cancellationToken);
 
     ValueTask<KernelContinuationState?> CancelAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelContinuationState?> BeginDeliveryAsync(
         Guid tokenId,
         string secret,
         KernelContinuationClaim claim,
@@ -307,6 +357,20 @@ public interface IActionContinuationHost
 
     ValueTask<KernelContinuationState?> ExpireAsync(
         Guid tokenId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelContinuationState?> ClaimContinuationRecoveryAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelContinuationState?> RecoverContinuationAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
         DateTimeOffset now,
         CancellationToken cancellationToken);
 
@@ -403,7 +467,14 @@ public sealed record KernelContinuationState(
     long Revision = 0,
     ContinuationDestination? ResultDestination = null,
     string? ProtectedInput = null,
-    string? CompletedOutcome = null);
+    string? CompletedOutcome = null,
+    ContinuationExecutionStage ExecutionStage = ContinuationExecutionStage.BeforeTerminal,
+    ActionOutcomeCertainty OutcomeCertainty = ActionOutcomeCertainty.Certain,
+    ActionRecoveryReference? RecoveryReference = null,
+    DateTimeOffset RetainUntil = default,
+    DateTimeOffset? DeliveryAcknowledgedAt = null,
+    string? ReceiptReference = null,
+    DateTimeOffset? CancellationRequestedAt = null);
 
 public sealed record KernelRecoveryState(
     ActionRecoveryReference Reference,

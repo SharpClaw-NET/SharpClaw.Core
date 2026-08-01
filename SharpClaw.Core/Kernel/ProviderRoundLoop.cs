@@ -36,20 +36,15 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
     private readonly KernelActionDispatcher _dispatcher;
     private readonly int _maximumRounds;
 
-    public ProviderRoundLoop(IKernelProviderTransport transport, int maximumRounds = 8)
-        : this(transport, new KernelGraphBuilder().Compile(), null, maximumRounds)
-    {
-    }
-
     public ProviderRoundLoop(
         IKernelProviderTransport transport,
         KernelGraph graph,
-        KernelActionDispatcher? dispatcher = null,
+        KernelActionDispatcher dispatcher,
         int maximumRounds = 8)
     {
         _transport = transport ?? throw new ArgumentNullException(nameof(transport));
         _graph = graph ?? throw new ArgumentNullException(nameof(graph));
-        _dispatcher = dispatcher ?? new KernelActionDispatcher(graph);
+        _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         if (maximumRounds < 1)
             throw new ArgumentOutOfRangeException(nameof(maximumRounds));
         _maximumRounds = maximumRounds;

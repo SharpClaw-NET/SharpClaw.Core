@@ -24,7 +24,7 @@ public sealed class KernelAuthorityCorrectionTests
             builder.Hooks.For(key).Use<CancellationTypedInterceptor>(Order("typed"));
         var graph = builder.Compile();
         var store = new TestDurableContinuationStore();
-        var dispatcher = new KernelActionDispatcher(
+        var dispatcher = KernelTestExecution.CreateDispatcher(
             graph,
             new StoreBackedContinuationHost(store));
         var started = NewSignal();
@@ -80,7 +80,7 @@ public sealed class KernelAuthorityCorrectionTests
             builder.Hooks.For(key).Use<CancellationTypedInterceptor>(Order("typed"));
         var graph = builder.Compile();
         var store = new TestDurableContinuationStore();
-        var dispatcher = new KernelActionDispatcher(
+        var dispatcher = KernelTestExecution.CreateDispatcher(
             graph,
             new StoreBackedContinuationHost(store));
         var started = NewSignal();
@@ -122,7 +122,7 @@ public sealed class KernelAuthorityCorrectionTests
         using var cancellation = new CancellationTokenSource();
         cancellation.Cancel();
 
-        var outcome = await new KernelActionDispatcher(graph).RunAsync(
+        var outcome = await KernelTestExecution.CreateDispatcher(graph).RunAsync(
             graph.GetStandardAction(key),
             new KernelActionEnvelope(key, "input"),
             (_, _) =>
@@ -385,7 +385,7 @@ public sealed class KernelAuthorityCorrectionTests
         builder.Hooks.For(SharpClawActions.Provider.AfterTransport)
             .UseAny<StandardWildcardContractInterceptor>(Order("replace-result"));
         var graph = builder.Compile();
-        var dispatcher = new KernelActionDispatcher(graph);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
         var request = NewProviderEnvelope("original");
         string? terminalMessage = null;
 
@@ -434,7 +434,7 @@ public sealed class KernelAuthorityCorrectionTests
         builder.Add(Descriptor(key));
         var graph = builder.Compile();
         var writer = new LifecycleWriter();
-        var dispatcher = new KernelActionDispatcher(graph, eventWriter: writer);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph, eventWriter: writer);
         var continuation = new ContinuationToken(Guid.NewGuid(), "secret");
 
         var outcome = await dispatcher.RunAsync(
@@ -480,7 +480,7 @@ public sealed class KernelAuthorityCorrectionTests
         builder.Hooks.For(key).Use<MutableResultInterceptor>(Order("retain"));
         var graph = builder.Compile();
 
-        var outcome = await new KernelActionDispatcher(graph).RunAsync(
+        var outcome = await KernelTestExecution.CreateDispatcher(graph).RunAsync(
             descriptor,
             "input",
             (_, _) => ValueTask.FromResult(new MutableResult { Value = "committed" }),
@@ -496,9 +496,9 @@ public sealed class KernelAuthorityCorrectionTests
     [Fact]
     public async Task Abandoned_claim_can_be_recovered_and_cancellation_is_fenced()
     {
-        var host = new StoreBackedContinuationHost(
-            new TestDurableContinuationStore(),
-            TimeSpan.FromSeconds(1));
+        var store = new TestDurableContinuationStore();
+        var firstHost = new StoreBackedContinuationHost(store, TimeSpan.FromSeconds(1));
+        var recoveryHost = new StoreBackedContinuationHost(store, TimeSpan.FromSeconds(1));
         var now = DateTimeOffset.UtcNow;
         var request = new KernelContinuationRequest(
             Guid.NewGuid(),
@@ -510,10 +510,10 @@ public sealed class KernelAuthorityCorrectionTests
             "contract-hash",
             new ContinuationDestination("test", "result"),
             "protected");
-        var token = await host.CreateAsync(request, CancellationToken.None);
-        var pending = await host.GetAsync(token.TokenId, CancellationToken.None);
+        var token = await firstHost.CreateAsync(request, CancellationToken.None);
+        var pending = await firstHost.GetAsync(token.TokenId, CancellationToken.None);
         var firstRequest = Claim("worker-a", now.AddSeconds(1), 1, pending!.Revision, request.ContractHash);
-        var first = await host.ClaimAsync(
+        var first = await firstHost.ClaimAsync(
             token.TokenId,
             token.Secret,
             firstRequest,
@@ -521,62 +521,99 @@ public sealed class KernelAuthorityCorrectionTests
             CancellationToken.None);
         Assert.Equal(ContinuationState.Claimed, first!.State);
 
-        var recoveryRequest = Claim(
+        var prematureRecovery = Claim(
             "worker-b",
             now.AddMinutes(1),
             2,
             first.Revision,
             request.ContractHash);
-        Assert.Null(await host.ClaimAsync(
+        Assert.Null(await recoveryHost.ClaimContinuationRecoveryAsync(
             token.TokenId,
             token.Secret,
-            recoveryRequest,
+            prematureRecovery,
             now.AddMilliseconds(500),
             CancellationToken.None));
-        var recovered = await host.ClaimAsync(
+        var abandoned = await recoveryHost.ExpireAsync(
+            token.TokenId,
+            now.AddSeconds(2),
+            CancellationToken.None);
+        Assert.Equal(ContinuationState.OutcomeUncertain, abandoned!.State);
+        Assert.NotNull(abandoned.RecoveryReference);
+
+        var recoveryRequest = Claim(
+            "worker-b",
+            now.AddMinutes(1),
+            2,
+            abandoned.Revision,
+            request.ContractHash);
+        var recoveryClaimed = await recoveryHost.ClaimContinuationRecoveryAsync(
             token.TokenId,
             token.Secret,
             recoveryRequest,
             now.AddSeconds(2),
             CancellationToken.None);
 
-        Assert.Equal(ContinuationState.Claimed, recovered!.State);
-        Assert.Equal("worker-b", recovered.ClaimOwner);
-        Assert.Equal(2, recovered.Generation);
-        Assert.Null(recovered.CompletedOutcome);
-        Assert.Null(await host.CompleteAsync(
+        Assert.Equal(ContinuationState.Claimed, recoveryClaimed!.State);
+        Assert.Equal("worker-b", recoveryClaimed.ClaimOwner);
+        Assert.Equal(2, recoveryClaimed.Generation);
+        Assert.Null(recoveryClaimed.CompletedOutcome);
+        Assert.Null(await recoveryHost.CompleteAsync(
             token.TokenId,
             token.Secret,
-            firstRequest with { Claim = firstRequest.Claim with { ExpectedRevision = recovered.Revision } },
+            firstRequest with { Claim = firstRequest.Claim with { ExpectedRevision = recoveryClaimed.Revision } },
             "stale",
             now.AddSeconds(2),
             CancellationToken.None));
-        Assert.Null(await host.CancelAsync(
+        Assert.Null(await recoveryHost.CancelAsync(
             token.TokenId,
             token.Secret,
-            Claim("worker-c", now.AddMinutes(1), 2, recovered.Revision, request.ContractHash),
+            Claim("worker-c", now.AddMinutes(1), 2, recoveryClaimed.Revision, request.ContractHash),
             now.AddSeconds(2),
             CancellationToken.None));
 
-        var current = recoveryRequest with
+        var recovered = await recoveryHost.RecoverContinuationAsync(
+            token.TokenId,
+            token.Secret,
+            recoveryRequest with
+            {
+                Claim = recoveryRequest.Claim with { ExpectedRevision = recoveryClaimed.Revision }
+            },
+            now.AddSeconds(2),
+            CancellationToken.None);
+        Assert.Equal(ContinuationState.Pending, recovered!.State);
+        Assert.Null(recovered.RecoveryReference);
+
+        var resumedClaim = Claim(
+            "worker-b",
+            now.AddMinutes(1),
+            3,
+            recovered.Revision,
+            request.ContractHash);
+        var resumed = await recoveryHost.ClaimAsync(
+            token.TokenId,
+            token.Secret,
+            resumedClaim,
+            now.AddSeconds(2),
+            CancellationToken.None);
+        var current = resumedClaim with
         {
-            Claim = recoveryRequest.Claim with { ExpectedRevision = recovered.Revision }
+            Claim = resumedClaim.Claim with { ExpectedRevision = resumed!.Revision }
         };
-        var requested = await host.CancelAsync(
+        var requested = await recoveryHost.CancelAsync(
             token.TokenId,
             token.Secret,
             current,
             now.AddSeconds(2),
             CancellationToken.None);
         Assert.Equal(ContinuationState.CancelRequested, requested!.State);
-        Assert.Null(await host.CompleteAsync(
+        Assert.Null(await recoveryHost.CompleteAsync(
             token.TokenId,
             token.Secret,
             current with { Claim = current.Claim with { ExpectedRevision = requested.Revision } },
             "late",
             now.AddSeconds(2),
             CancellationToken.None));
-        var cancelled = await host.CancelAsync(
+        var cancelled = await recoveryHost.CancelAsync(
             token.TokenId,
             token.Secret,
             current with { Claim = current.Claim with { ExpectedRevision = requested.Revision } },
@@ -584,9 +621,11 @@ public sealed class KernelAuthorityCorrectionTests
             CancellationToken.None);
         Assert.Equal(ContinuationState.Cancelled, cancelled!.State);
 
-        var pendingToken = await host.CreateAsync(request with { InvocationId = Guid.NewGuid() }, CancellationToken.None);
-        var pendingState = await host.GetAsync(pendingToken.TokenId, CancellationToken.None);
-        var pendingCancelled = await host.CancelAsync(
+        var pendingToken = await recoveryHost.CreateAsync(
+            request with { InvocationId = Guid.NewGuid() },
+            CancellationToken.None);
+        var pendingState = await recoveryHost.GetAsync(pendingToken.TokenId, CancellationToken.None);
+        var pendingCancelled = await recoveryHost.CancelAsync(
             pendingToken.TokenId,
             pendingToken.Secret,
             Claim("operator", now.AddMinutes(1), 1, pendingState!.Revision, request.ContractHash),

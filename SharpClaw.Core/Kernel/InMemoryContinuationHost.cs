@@ -11,19 +11,27 @@ public class StoreBackedContinuationHost : IActionContinuationHost
     private readonly IActionContinuationStore _store;
     private readonly TimeSpan _leaseDuration;
     private readonly TimeSpan _recoveryLifetime;
+    private readonly IKernelContinuationReceiptResolver _receiptResolver;
+    private readonly TimeSpan _retentionPeriod;
 
     public StoreBackedContinuationHost(
         IActionContinuationStore store,
         TimeSpan? leaseDuration = null,
-        TimeSpan? recoveryLifetime = null)
+        TimeSpan? recoveryLifetime = null,
+        IKernelContinuationReceiptResolver? receiptResolver = null,
+        TimeSpan? retentionPeriod = null)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _leaseDuration = leaseDuration ?? TimeSpan.FromMinutes(5);
         _recoveryLifetime = recoveryLifetime ?? TimeSpan.FromDays(7);
+        _receiptResolver = receiptResolver ?? new NullKernelContinuationReceiptResolver();
+        _retentionPeriod = retentionPeriod ?? TimeSpan.FromDays(7);
         if (_leaseDuration <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(leaseDuration));
         if (_recoveryLifetime <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(recoveryLifetime));
+        if (_retentionPeriod <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(retentionPeriod));
     }
 
     public bool SupportsDurableState => _store.IsDurable;
@@ -64,6 +72,13 @@ public class StoreBackedContinuationHost : IActionContinuationHost
             1,
             request.Destination ?? new ContinuationDestination("continuation"),
             request.ProtectedInput,
+            null,
+            ContinuationExecutionStage.BeforeTerminal,
+            ActionOutcomeCertainty.Certain,
+            null,
+            expiresAt + _retentionPeriod,
+            null,
+            null,
             null);
 
         if (!await _store.TryCreateAsync(state, cancellationToken))
@@ -103,22 +118,14 @@ public class StoreBackedContinuationHost : IActionContinuationHost
             }
 
             var leaseExpired = current.LeaseExpiresAt is { } expiry && expiry <= now;
-            if (current.State == ContinuationState.CancelRequested)
+            if (current.State is ContinuationState.Claimed or ContinuationState.CancelRequested)
             {
                 if (!leaseExpired)
                     return null;
-                var cancelled = current with
-                {
-                    State = ContinuationState.Cancelled,
-                    Revision = current.Revision + 1
-                };
-                if (await _store.TryUpdateAsync(tokenId, current, cancelled, cancellationToken))
-                    return null;
-                continue;
-            }
-            if (current.State == ContinuationState.Claimed && !leaseExpired)
+                await ExpireAsync(tokenId, now, cancellationToken);
                 return null;
-            if (current.State is not (ContinuationState.Pending or ContinuationState.Claimed))
+            }
+            if (current.State != ContinuationState.Pending)
                 return null;
             if (claim.ExpectedRevision != current.Revision ||
                 claim.Generation != current.Generation + 1)
@@ -176,7 +183,37 @@ public class StoreBackedContinuationHost : IActionContinuationHost
         CancellationToken cancellationToken)
     {
         var state = await ReadAsync(tokenId, cancellationToken);
-        return IsCurrentClaim(state, secret, claim, now, requireLiveLease: true) ? state : null;
+        return state?.RecoveryReference is null &&
+               IsCurrentClaim(state, secret, claim, now, requireLiveLease: true)
+            ? state
+            : null;
+    }
+
+    public ValueTask<KernelContinuationState?> SetExecutionStateAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
+        KernelContinuationExecutionUpdate update,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(update);
+        return MutateClaimAsync(
+            tokenId,
+            secret,
+            claim,
+            now,
+            state => !CanApplyExecutionUpdate(state, update)
+                ? null
+                : state with
+                {
+                    ExecutionStage = update.Stage,
+                    OutcomeCertainty = update.Certainty,
+                    ReceiptReference = update.ReceiptReference ?? state.ReceiptReference,
+                    CompletedOutcome = update.PersistedOutcome ?? state.CompletedOutcome,
+                    Revision = state.Revision + 1
+                },
+            cancellationToken);
     }
 
     public async ValueTask<KernelContinuationState?> CompleteAsync(
@@ -194,13 +231,22 @@ public class StoreBackedContinuationHost : IActionContinuationHost
             secret,
             claim,
             now,
-            state => state with
-            {
-                State = ContinuationState.Completed,
-                CompletedAt = now,
-                CompletedOutcome = outcome,
-                Revision = state.Revision + 1
-            },
+            state => state.OutcomeCertainty != ActionOutcomeCertainty.Certain ||
+                     state.ExecutionStage is not (
+                         ContinuationExecutionStage.TerminalReceipted or
+                         ContinuationExecutionStage.OutcomePersisted) ||
+                     state.ExecutionStage == ContinuationExecutionStage.OutcomePersisted &&
+                     !string.Equals(state.CompletedOutcome, outcome, StringComparison.Ordinal)
+                ? null
+                : state with
+                {
+                    State = ContinuationState.Completed,
+                    CompletedAt = now,
+                    CompletedOutcome = outcome,
+                    ExecutionStage = ContinuationExecutionStage.OutcomePersisted,
+                    RetainUntil = now + _retentionPeriod,
+                    Revision = state.Revision + 1
+                },
             cancellationToken);
     }
 
@@ -215,7 +261,8 @@ public class StoreBackedContinuationHost : IActionContinuationHost
             return null;
         while (await ReadAsync(tokenId, cancellationToken) is { } current)
         {
-            if (!IsValidContinuationState(current) || current.Request.ContractHash != claim.ContractHash ||
+            if (!IsValidContinuationState(current) || current.RecoveryReference is not null ||
+                current.Request.ContractHash != claim.ContractHash ||
                 current.ExpiresAt <= now || current.Revision != claim.ExpectedRevision)
                 return null;
             KernelContinuationState? next = current.State switch
@@ -225,6 +272,8 @@ public class StoreBackedContinuationHost : IActionContinuationHost
                     State = ContinuationState.Cancelled,
                     ClaimOwner = claim.Owner,
                     Generation = claim.Generation,
+                    CancellationRequestedAt = now,
+                    RetainUntil = now + _retentionPeriod,
                     Revision = current.Revision + 1
                 },
                 ContinuationState.Claimed when current.ClaimOwner == claim.Owner &&
@@ -232,12 +281,14 @@ public class StoreBackedContinuationHost : IActionContinuationHost
                                                    current.LeaseExpiresAt > now => current with
                                                    {
                                                        State = ContinuationState.CancelRequested,
+                                                       CancellationRequestedAt = now,
                                                        Revision = current.Revision + 1
                                                    },
                 ContinuationState.CancelRequested when current.ClaimOwner == claim.Owner &&
                                                        current.Generation == claim.Generation => current with
                                                        {
                                                            State = ContinuationState.Cancelled,
+                                                           RetainUntil = now + _retentionPeriod,
                                                            Revision = current.Revision + 1
                                                        },
                 _ => null
@@ -251,6 +302,35 @@ public class StoreBackedContinuationHost : IActionContinuationHost
         return null;
     }
 
+    public ValueTask<KernelContinuationState?> BeginDeliveryAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken) =>
+        MutateClaimAsync(
+            tokenId,
+            secret,
+            claim,
+            now,
+            state => state.State != ContinuationState.Completed ||
+                     state.ExecutionStage != ContinuationExecutionStage.OutcomePersisted ||
+                     string.IsNullOrWhiteSpace(state.CompletedOutcome) ||
+                     state.RetainUntil <= now
+                ? null
+                : state with
+                {
+                    State = ContinuationState.Claimed,
+                    ExecutionStage = ContinuationExecutionStage.DeliveryStarted,
+                    DeliveryAcknowledgedAt = null,
+                    Revision = state.Revision + 1
+                },
+            cancellationToken,
+            requireLiveLease: true,
+            allowCompleted: true,
+            allowRecovery: true,
+            allowExpired: true);
+
     public ValueTask<KernelContinuationState?> DeliverAsync(
         Guid tokenId,
         string secret,
@@ -262,7 +342,10 @@ public class StoreBackedContinuationHost : IActionContinuationHost
             secret,
             claim,
             now,
-            state => state.State != ContinuationState.Completed
+            state => state.State != ContinuationState.Claimed ||
+                     state.ExecutionStage != ContinuationExecutionStage.DeliveryStarted ||
+                     string.IsNullOrWhiteSpace(state.CompletedOutcome) ||
+                     state.RetainUntil <= now
                 ? null
                 : state with
                 {
@@ -270,8 +353,8 @@ public class StoreBackedContinuationHost : IActionContinuationHost
                     Revision = state.Revision + 1
                 },
             cancellationToken,
-            requireLiveLease: false,
-            allowCompleted: true);
+            allowRecovery: true,
+            allowExpired: true);
 
     public ValueTask<KernelContinuationState?> AcknowledgeAsync(
         Guid tokenId,
@@ -286,10 +369,16 @@ public class StoreBackedContinuationHost : IActionContinuationHost
             now,
             state => state.State != ContinuationState.Delivered
                 ? null
-                : state with { Revision = state.Revision + 1 },
+                : state with
+                {
+                    DeliveryAcknowledgedAt = now,
+                    Revision = state.Revision + 1
+                },
             cancellationToken,
             requireLiveLease: false,
-            allowCompleted: true);
+            allowCompleted: true,
+            allowRecovery: true,
+            allowExpired: true);
 
     public async ValueTask<KernelContinuationState?> ExpireAsync(
         Guid tokenId,
@@ -299,16 +388,112 @@ public class StoreBackedContinuationHost : IActionContinuationHost
         while (await ReadAsync(tokenId, cancellationToken) is { } current)
         {
             if (current.State is ContinuationState.Completed or ContinuationState.Delivered or
-                ContinuationState.Cancelled or ContinuationState.Expired or ContinuationState.Deleted ||
-                current.ExpiresAt > now)
+                ContinuationState.Cancelled or ContinuationState.Expired or ContinuationState.Deleted or
+                ContinuationState.OutcomeUncertain)
                 return current;
+
+            var claimExpired = current.State is ContinuationState.Claimed or ContinuationState.CancelRequested &&
+                               current.LeaseExpiresAt is { } leaseExpiry && leaseExpiry <= now;
+            var continuationExpired = current.ExpiresAt <= now;
+            if (!claimExpired && !continuationExpired)
+                return current;
+
+            KernelContinuationState next;
+            if (current.State is ContinuationState.Claimed or ContinuationState.CancelRequested)
+            {
+                next = current with
+                {
+                    State = ContinuationState.OutcomeUncertain,
+                    ClaimOwner = null,
+                    LeaseExpiresAt = null,
+                    OutcomeCertainty = CertaintyForExpiredClaim(current.ExecutionStage),
+                    RecoveryReference = current.RecoveryReference ?? new ActionRecoveryReference(
+                        Guid.NewGuid(),
+                        current.Request.ActionKey,
+                        current.Request.ActionVersion,
+                        current.Request.IdempotencyKey),
+                    RetainUntil = now + _retentionPeriod,
+                    Revision = current.Revision + 1
+                };
+            }
+            else
+            {
+                next = current with
+                {
+                    State = ContinuationState.Expired,
+                    RetainUntil = now + _retentionPeriod,
+                    Revision = current.Revision + 1
+                };
+            }
+            if (await _store.TryUpdateAsync(tokenId, current, next, cancellationToken))
+                return next;
+        }
+
+        return null;
+    }
+
+    public async ValueTask<KernelContinuationState?> ClaimContinuationRecoveryAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        if (!ValidClaimRequest(claim, now) || !VerifySecret(secret, await ReadAsync(tokenId, cancellationToken)))
+            return null;
+
+        while (await ReadAsync(tokenId, cancellationToken) is { } current)
+        {
+            if (!IsValidContinuationState(current) ||
+                current.State != ContinuationState.OutcomeUncertain ||
+                current.RecoveryReference is null ||
+                current.RetainUntil <= now ||
+                !string.Equals(current.Request.ContractHash, claim.ContractHash, StringComparison.Ordinal) ||
+                claim.ExpectedRevision != current.Revision ||
+                claim.Generation != current.Generation + 1)
+                return null;
+
+            var leaseExpiresAt = claim.LeaseExpiresAt <= now
+                ? now + _leaseDuration
+                : claim.LeaseExpiresAt;
+            leaseExpiresAt = Min(current.RetainUntil, leaseExpiresAt);
+            if (leaseExpiresAt <= now)
+                return null;
+
             var next = current with
             {
-                State = current.State is ContinuationState.Claimed or ContinuationState.CancelRequested
-                    ? ContinuationState.OutcomeUncertain
-                    : ContinuationState.Expired,
+                State = ContinuationState.Claimed,
+                ClaimedAt = now,
+                ClaimOwner = claim.Owner,
+                LeaseExpiresAt = leaseExpiresAt,
+                Generation = current.Generation + 1,
                 Revision = current.Revision + 1
             };
+            if (await _store.TryUpdateAsync(tokenId, current, next, cancellationToken))
+                return next;
+        }
+
+        return null;
+    }
+
+    public async ValueTask<KernelContinuationState?> RecoverContinuationAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        while (await ReadAsync(tokenId, cancellationToken) is { } current)
+        {
+            if (!IsCurrentContinuationRecoveryClaim(current, secret, claim, now))
+                return null;
+
+            var receipt = current.ExecutionStage is
+                ContinuationExecutionStage.TerminalStarted or
+                ContinuationExecutionStage.TerminalReceipted
+                    ? await FindValidReceiptAsync(current, now, cancellationToken)
+                    : null;
+            var next = ResolveContinuationRecovery(current, receipt, now);
             if (await _store.TryUpdateAsync(tokenId, current, next, cancellationToken))
                 return next;
         }
@@ -325,11 +510,18 @@ public class StoreBackedContinuationHost : IActionContinuationHost
     {
         var state = await ReadAsync(tokenId, cancellationToken);
         if (!IsCurrentClaim(state, secret, claim, now, requireLiveLease: false, allowExpired: true) ||
-            state!.State is ContinuationState.Pending or ContinuationState.Claimed or ContinuationState.Deleted)
+            state!.State != ContinuationState.Delivered ||
+            state.DeliveryAcknowledgedAt is null ||
+            state.RetainUntil == default ||
+            now < state.RetainUntil ||
+            state.RecoveryReference is not null && state.OutcomeCertainty == ActionOutcomeCertainty.Uncertain)
             return false;
         var next = state with
         {
             State = ContinuationState.Deleted,
+            Request = state.Request with { ProtectedInput = null },
+            ProtectedInput = null,
+            CompletedOutcome = null,
             Revision = state.Revision + 1
         };
         return await _store.TryUpdateAsync(tokenId, state, next, cancellationToken);
@@ -718,6 +910,155 @@ public class StoreBackedContinuationHost : IActionContinuationHost
         return !requireLiveLease || state.LeaseExpiresAt is { } lease && lease > now;
     }
 
+    private static bool CanApplyExecutionUpdate(
+        KernelContinuationState state,
+        KernelContinuationExecutionUpdate update)
+    {
+        if (state.RecoveryReference is not null)
+            return false;
+        return update.Stage switch
+        {
+            ContinuationExecutionStage.TerminalStarted =>
+                state.ExecutionStage == ContinuationExecutionStage.BeforeTerminal &&
+                update.Certainty == ActionOutcomeCertainty.Uncertain &&
+                string.IsNullOrWhiteSpace(update.ReceiptReference) &&
+                string.IsNullOrWhiteSpace(update.PersistedOutcome),
+            ContinuationExecutionStage.TerminalReceipted =>
+                state.ExecutionStage == ContinuationExecutionStage.TerminalStarted &&
+                update.Certainty == ActionOutcomeCertainty.Certain &&
+                !string.IsNullOrWhiteSpace(update.ReceiptReference) &&
+                string.IsNullOrWhiteSpace(update.PersistedOutcome),
+            ContinuationExecutionStage.OutcomePersisted =>
+                (state.ExecutionStage is ContinuationExecutionStage.TerminalStarted or
+                    ContinuationExecutionStage.TerminalReceipted) &&
+                update.Certainty == ActionOutcomeCertainty.Certain &&
+                !string.IsNullOrWhiteSpace(update.PersistedOutcome),
+            _ => false
+        };
+    }
+
+    private static ActionOutcomeCertainty CertaintyForExpiredClaim(
+        ContinuationExecutionStage stage) =>
+        stage == ContinuationExecutionStage.TerminalStarted
+            ? ActionOutcomeCertainty.Uncertain
+            : ActionOutcomeCertainty.Certain;
+
+    private static bool IsCurrentContinuationRecoveryClaim(
+        KernelContinuationState state,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now) =>
+        state.State == ContinuationState.Claimed &&
+        state.RecoveryReference is not null &&
+        state.RetainUntil > now &&
+        VerifySecret(secret, state) &&
+        state.ClaimOwner == claim.Owner &&
+        state.Generation == claim.Generation &&
+        state.Revision == claim.ExpectedRevision &&
+        string.Equals(state.Request.ContractHash, claim.ContractHash, StringComparison.Ordinal) &&
+        state.LeaseExpiresAt is { } lease &&
+        lease > now;
+
+    private async ValueTask<KernelContinuationReceipt?> FindValidReceiptAsync(
+        KernelContinuationState state,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var recovery = state.RecoveryReference!;
+        var request = new KernelContinuationReceiptRequest(
+            state.TokenId,
+            recovery,
+            state.Request.ActionKey,
+            state.Request.ActionVersion,
+            state.Request.IdempotencyKey,
+            state.Request.ContractHash,
+            state.ExecutionStage,
+            state.ReceiptReference);
+        var receipt = await _receiptResolver.FindAsync(request, cancellationToken);
+        return IsValidReceipt(request, receipt, now) ? receipt : null;
+    }
+
+    private static bool IsValidReceipt(
+        KernelContinuationReceiptRequest request,
+        KernelContinuationReceipt? receipt,
+        DateTimeOffset now) =>
+        receipt is not null &&
+        receipt.TokenId == request.TokenId &&
+        receipt.RecoveryId == request.RecoveryReference.RecoveryId &&
+        receipt.ActionKey == request.ActionKey &&
+        receipt.ActionVersion == request.ActionVersion &&
+        receipt.IdempotencyKey == request.IdempotencyKey &&
+        string.Equals(receipt.ContractHash, request.ContractHash, StringComparison.Ordinal) &&
+        !string.IsNullOrWhiteSpace(receipt.ReceiptReference) &&
+        (string.IsNullOrWhiteSpace(request.ReceiptReference) ||
+         string.Equals(receipt.ReceiptReference, request.ReceiptReference, StringComparison.Ordinal)) &&
+        !string.IsNullOrWhiteSpace(receipt.Outcome) &&
+        receipt.ObservedAt <= now;
+
+    private KernelContinuationState ResolveContinuationRecovery(
+        KernelContinuationState current,
+        KernelContinuationReceipt? receipt,
+        DateTimeOffset now)
+    {
+        if (current.ExecutionStage == ContinuationExecutionStage.BeforeTerminal &&
+            current.CancellationRequestedAt is not null)
+        {
+            return current with
+            {
+                State = ContinuationState.Cancelled,
+                ClaimedAt = null,
+                ClaimOwner = null,
+                LeaseExpiresAt = null,
+                OutcomeCertainty = ActionOutcomeCertainty.Certain,
+                RecoveryReference = null,
+                RetainUntil = now + _retentionPeriod,
+                Revision = current.Revision + 1
+            };
+        }
+
+        if (current.ExecutionStage == ContinuationExecutionStage.BeforeTerminal && current.ExpiresAt > now)
+        {
+            return current with
+            {
+                State = ContinuationState.Pending,
+                ClaimedAt = null,
+                ClaimOwner = null,
+                LeaseExpiresAt = null,
+                OutcomeCertainty = ActionOutcomeCertainty.Certain,
+                RecoveryReference = null,
+                Revision = current.Revision + 1
+            };
+        }
+
+        var persistedOutcome = receipt?.Outcome ?? current.CompletedOutcome;
+        if (receipt is not null ||
+            (current.ExecutionStage is ContinuationExecutionStage.OutcomePersisted or
+                ContinuationExecutionStage.DeliveryStarted &&
+             !string.IsNullOrWhiteSpace(persistedOutcome)))
+        {
+            return current with
+            {
+                State = ContinuationState.Completed,
+                CompletedAt = current.CompletedAt ?? now,
+                CompletedOutcome = persistedOutcome,
+                ExecutionStage = ContinuationExecutionStage.OutcomePersisted,
+                OutcomeCertainty = ActionOutcomeCertainty.Certain,
+                ReceiptReference = receipt?.ReceiptReference ?? current.ReceiptReference,
+                RetainUntil = now + _retentionPeriod,
+                Revision = current.Revision + 1
+            };
+        }
+
+        return current with
+        {
+            State = ContinuationState.OutcomeUncertain,
+            ClaimOwner = null,
+            LeaseExpiresAt = null,
+            OutcomeCertainty = ActionOutcomeCertainty.Uncertain,
+            Revision = current.Revision + 1
+        };
+    }
+
     private static void ValidateContinuationRequest(KernelContinuationRequest request)
     {
         if (string.IsNullOrWhiteSpace(request.ContractHash))
@@ -756,11 +1097,14 @@ public class StoreBackedContinuationHost : IActionContinuationHost
         Func<KernelContinuationState, KernelContinuationState?> mutate,
         CancellationToken cancellationToken,
         bool requireLiveLease = true,
-        bool allowCompleted = false)
+        bool allowCompleted = false,
+        bool allowRecovery = false,
+        bool allowExpired = false)
     {
         while (await ReadAsync(tokenId, cancellationToken) is { } current)
         {
-            if (!IsCurrentClaim(current, secret, claim, now, requireLiveLease) ||
+            if (!IsCurrentClaim(current, secret, claim, now, requireLiveLease, allowExpired) ||
+                (!allowRecovery && current.RecoveryReference is not null) ||
                 (!allowCompleted && current.State != ContinuationState.Claimed))
                 return null;
             var next = mutate(current);
@@ -823,19 +1167,40 @@ public class StoreBackedContinuationHost : IActionContinuationHost
         }
     }
 
-    private static bool IsValidContinuationState(KernelContinuationState state) =>
-        state.TokenId != Guid.Empty &&
-        state.TokenHash.Length == 64 &&
-        state.Request.ActionVersion > 0 &&
-        state.Request.IdempotencyKey != Guid.Empty &&
-        !string.IsNullOrWhiteSpace(state.Request.ContractHash) &&
-        state.Request.Destination is { } destination &&
-        !string.IsNullOrWhiteSpace(destination.Kind) &&
-        state.ResultDestination == destination &&
-        !string.IsNullOrWhiteSpace(state.Request.ProtectedInput) &&
-        state.ProtectedInput == state.Request.ProtectedInput &&
-        (state.State is not (ContinuationState.Completed or ContinuationState.Delivered) ||
-         !string.IsNullOrWhiteSpace(state.CompletedOutcome));
+    private static bool IsValidContinuationState(KernelContinuationState state)
+    {
+        var deleted = state.State == ContinuationState.Deleted;
+        var recovery = state.RecoveryReference;
+        return state.TokenId != Guid.Empty &&
+               state.TokenHash.Length == 64 &&
+               state.Request.ActionVersion > 0 &&
+               state.Request.IdempotencyKey != Guid.Empty &&
+               !string.IsNullOrWhiteSpace(state.Request.ContractHash) &&
+               state.Request.Destination is { } destination &&
+               !string.IsNullOrWhiteSpace(destination.Kind) &&
+               state.ResultDestination == destination &&
+               state.RetainUntil > state.CreatedAt &&
+               (!deleted
+                   ? !string.IsNullOrWhiteSpace(state.Request.ProtectedInput) &&
+                     state.ProtectedInput == state.Request.ProtectedInput
+                   : state.Request.ProtectedInput is null &&
+                     state.ProtectedInput is null &&
+                     state.CompletedOutcome is null &&
+                     state.DeliveryAcknowledgedAt is not null) &&
+               (state.State is not (ContinuationState.Completed or ContinuationState.Delivered) ||
+                !string.IsNullOrWhiteSpace(state.CompletedOutcome)) &&
+               (state.ExecutionStage is not (
+                    ContinuationExecutionStage.OutcomePersisted or
+                    ContinuationExecutionStage.DeliveryStarted) ||
+                deleted ||
+                !string.IsNullOrWhiteSpace(state.CompletedOutcome)) &&
+               (state.State != ContinuationState.OutcomeUncertain || recovery is not null) &&
+               (state.State != ContinuationState.CancelRequested || state.CancellationRequestedAt is not null) &&
+               (recovery is null ||
+                recovery.ActionKey == state.Request.ActionKey &&
+                recovery.ActionVersion == state.Request.ActionVersion &&
+                recovery.IdempotencyKey == state.Request.IdempotencyKey);
+    }
 
     private static bool IsValidRecoveryState(KernelRecoveryState state) =>
         state.Reference.RecoveryId != Guid.Empty &&
@@ -856,6 +1221,17 @@ public class StoreBackedContinuationHost : IActionContinuationHost
 
     private static DateTimeOffset Min(DateTimeOffset left, DateTimeOffset right) =>
         left <= right ? left : right;
+}
+
+internal sealed class NullKernelContinuationReceiptResolver : IKernelContinuationReceiptResolver
+{
+    public ValueTask<KernelContinuationReceipt?> FindAsync(
+        KernelContinuationReceiptRequest request,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.FromResult<KernelContinuationReceipt?>(null);
+    }
 }
 
 /// <summary>Provides process-local state and never claims durable storage.</summary>

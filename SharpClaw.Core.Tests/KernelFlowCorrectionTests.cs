@@ -20,7 +20,7 @@ public sealed class KernelFlowCorrectionTests
             "Sample tool.",
             JsonSerializer.SerializeToElement(new { type = "object" })));
         var graph = builder.Compile();
-        var dispatcher = new KernelActionDispatcher(graph);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
         var store = new TracedConversationStore();
         var transport = new TracedTwoRoundTransport();
         var runner = new DirectTurnRunner(
@@ -98,7 +98,7 @@ public sealed class KernelFlowCorrectionTests
         var graph = builder.Compile();
         var store = new TestDurableContinuationStore();
         var host = new StoreBackedContinuationHost(store);
-        var dispatcher = new KernelActionDispatcher(graph, host);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph, host);
         var transport = new CountingTransport();
         var runner = new DirectTurnRunner(
             graph,
@@ -135,7 +135,7 @@ public sealed class KernelFlowCorrectionTests
         var graph = builder.Compile();
         var store = new TestDurableContinuationStore();
         var host = new StoreBackedContinuationHost(store);
-        var dispatcher = new KernelActionDispatcher(graph, host);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph, host);
         var transport = new CountingTransport();
 
         var exception = await Record.ExceptionAsync(async () =>
@@ -173,7 +173,7 @@ public sealed class KernelFlowCorrectionTests
         var graph = builder.Compile();
         var store = new TestDurableContinuationStore();
         var host = new StoreBackedContinuationHost(store);
-        var dispatcher = new KernelActionDispatcher(graph, host);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph, host);
 
         var outcome = await new UnifiedToolPipeline(graph, dispatcher).InvokeAsync(
             NewToolInvocation(),
@@ -203,7 +203,7 @@ public sealed class KernelFlowCorrectionTests
     public async Task Streaming_stops_before_reading_data_after_first_final_chunk()
     {
         var graph = new KernelGraphBuilder().Compile();
-        var dispatcher = new KernelActionDispatcher(graph);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
         var transport = new FinalThenExtraTransport();
         var chunks = new List<ChatStreamChunk>();
 
@@ -225,7 +225,7 @@ public sealed class KernelFlowCorrectionTests
         builder.Hooks.For(SharpClawActions.Provider.AfterTransport)
             .Use<ResponseCompletionReplacementInterceptor>(Order("replace-completion"));
         var graph = builder.Compile();
-        var dispatcher = new KernelActionDispatcher(graph);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
         var chunks = new List<ChatStreamChunk>();
 
         await foreach (var chunk in new ProviderRoundLoop(

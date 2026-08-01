@@ -28,7 +28,7 @@ public sealed class KernelModuleGraphCorrectionTests
         Assert.Equal(typeof(ModuleConversationResolver), graph.Modules.ConversationResolver);
         Assert.Contains(typeof(ModuleContributor), graph.Modules.ContextContributors);
 
-        var dispatcher = new KernelActionDispatcher(graph);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
         var contribution = await graph.CreateChatContextAssembler(dispatcher).BuildAsync(
             new ChatContextRequest(
                 Guid.NewGuid(),
@@ -107,7 +107,7 @@ public sealed class KernelModuleGraphCorrectionTests
         var registry = new KernelModuleRegistry();
         registry.Add(new ToolServiceModule());
         var graph = registry.Compile();
-        var dispatcher = new KernelActionDispatcher(graph);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
         var pipeline = new UnifiedToolPipeline(graph, dispatcher);
 
         var outcome = await pipeline.InvokeAsync(

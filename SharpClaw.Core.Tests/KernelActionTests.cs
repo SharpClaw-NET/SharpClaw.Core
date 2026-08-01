@@ -15,7 +15,7 @@ public sealed class KernelActionTests
         builder.Hooks.For(key).Use<TypedInterceptor>(Order("typed"));
         builder.Hooks.AnyAction().UseAny<WildcardInterceptor>(Order("wildcard"));
         var graph = builder.Compile();
-        var dispatcher = new KernelActionDispatcher(graph);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
 
         var outcome = await dispatcher.RunAsync(
             graph.GetStandardAction(key),
@@ -56,7 +56,9 @@ public sealed class KernelActionTests
             new ActionRepeatPolicy(ActionRepeatKind.Idempotent, 2, TimeSpan.Zero, "sample")));
         builder.Hooks.For(key).Use<RepeatInterceptor>(Order("repeat"));
         var graph = builder.Compile();
-        var dispatcher = new KernelActionDispatcher(graph);
+        var dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            repeatEvidenceAuthority: new MatchingRepeatEvidenceAuthority());
         var terminalCalls = 0;
 
         var outcome = await dispatcher.RunAsync(
@@ -84,7 +86,7 @@ public sealed class KernelActionTests
         builder.Add(Descriptor(key));
         builder.Hooks.For(key).Use<DeferInterceptor>(Order("defer"));
         var graph = builder.Compile();
-        var dispatcher = new KernelActionDispatcher(graph, host);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph, host);
 
         var outcome = await dispatcher.RunAsync(
             graph.GetStandardAction(key),
@@ -106,7 +108,7 @@ public sealed class KernelActionTests
         var builder = new KernelGraphBuilder(false);
         builder.Add(Descriptor(key));
         var graph = builder.Compile();
-        var dispatcher = new KernelActionDispatcher(
+        var dispatcher = KernelTestExecution.CreateDispatcher(
             graph,
             new StoreBackedContinuationHost(new TestDurableContinuationStore()));
 
