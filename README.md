@@ -1,9 +1,7 @@
 # SharpClaw.Core
 
-SharpClaw.Core is the AGPL-3.0 host-agnostic behavior package for SharpClaw. It
-provides shared chat and provider pipelines, runtime state, module registry behavior,
-resource management, permissions, and tool infrastructure. It does not provide an
-application host, API, CLI, database, migrations, sidecar launcher, or UI. It consumes
-SharpClaw.Contracts, the MIT-licensed contract package, through NuGet and requires a
-host to provide stores, provider clients, clocks, logging, metrics, and dependency
-injection.
+SharpClaw.Core is the AGPL-3.0 host-agnostic direct-chat kernel for SharpClaw. It
+provides store-neutral action and event dispatch, compiled interception, provider
+rounds, unified tool execution, continuation recovery, and direct-turn orchestration.
+It consumes the MIT-licensed SharpClaw.Contracts package and leaves storage,
+transport, hosting, and application policy to the host.
