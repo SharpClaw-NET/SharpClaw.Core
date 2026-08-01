@@ -60,6 +60,37 @@ public static class KernelActionCatalog
             var value when value.StartsWith("action_recovery.", StringComparison.Ordinal) => "action_recovery",
             _ => "kernel"
         };
+
+    public static ActionInterceptionCapabilities StandardCapabilities(SharpClawActionKey key) =>
+        key.Value switch
+        {
+            var value when value.StartsWith("security.secret.", StringComparison.Ordinal) =>
+                ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap |
+                ActionInterceptionCapabilities.Cancel | ActionInterceptionCapabilities.Observe,
+            var value when value.StartsWith("storage.", StringComparison.Ordinal) =>
+                ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap |
+                ActionInterceptionCapabilities.ReplaceInput | ActionInterceptionCapabilities.ReplaceResult |
+                ActionInterceptionCapabilities.Cancel | ActionInterceptionCapabilities.Observe,
+            var value when value.StartsWith("provider.", StringComparison.Ordinal) =>
+                ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap |
+                ActionInterceptionCapabilities.ReplaceInput | ActionInterceptionCapabilities.ReplaceResult |
+                ActionInterceptionCapabilities.Cancel | ActionInterceptionCapabilities.Observe,
+            var value when value.StartsWith("runtime.request.", StringComparison.Ordinal) ||
+                          value.StartsWith("gateway.request.", StringComparison.Ordinal) =>
+                ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap |
+                ActionInterceptionCapabilities.ReplaceInput | ActionInterceptionCapabilities.ReplaceResult |
+                ActionInterceptionCapabilities.Cancel | ActionInterceptionCapabilities.Observe,
+            _ => ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap |
+                 ActionInterceptionCapabilities.ReplaceInput | ActionInterceptionCapabilities.ReplaceResult |
+                 ActionInterceptionCapabilities.Cancel | ActionInterceptionCapabilities.Observe
+        };
+
+    public static bool StandardSensitive(SharpClawActionKey key) =>
+        key.Value.StartsWith("security.", StringComparison.Ordinal) ||
+        key.Value.StartsWith("provider.", StringComparison.Ordinal) ||
+        key.Value.StartsWith("storage.", StringComparison.Ordinal) ||
+        key.Value.StartsWith("runtime.request.", StringComparison.Ordinal) ||
+        key.Value.StartsWith("gateway.request.", StringComparison.Ordinal);
 }
 
 public sealed class KernelGraphCompileOptions
@@ -85,19 +116,40 @@ public sealed class KernelGraphCompileOptions
     /// <summary>Administrator grants keyed by action key. A missing key uses the descriptor grant.</summary>
     public IReadOnlyDictionary<string, ActionInterceptionCapabilities>? ActionCapabilityGrants { get; init; }
 
+    /// <summary>Module manifest grants keyed by module id and action key.</summary>
+    public IReadOnlyDictionary<string, IReadOnlyDictionary<string, ActionInterceptionCapabilities>>?
+        ActionModuleCapabilityGrants { get; init; }
+
     /// <summary>Administrator grants keyed by event key. A missing key uses the descriptor grant.</summary>
     public IReadOnlyDictionary<string, EventInterceptionCapabilities>? EventCapabilityGrants { get; init; }
 
-    /// <summary>Sensitive action keys approved by the host.</summary>
-    public IReadOnlySet<string> ApprovedSensitiveActions { get; init; } =
-        new HashSet<string>(StringComparer.Ordinal);
+    /// <summary>Module manifest grants keyed by module id and event key.</summary>
+    public IReadOnlyDictionary<string, IReadOnlyDictionary<string, EventInterceptionCapabilities>>?
+        EventModuleCapabilityGrants { get; init; }
 
-    /// <summary>Sensitive event keys approved by the host.</summary>
-    public IReadOnlySet<string> ApprovedSensitiveEvents { get; init; } =
-        new HashSet<string>(StringComparer.Ordinal);
+    /// <summary>Exact sensitive action approvals bound to module, version, and schema identity.</summary>
+    public IReadOnlyList<KernelSensitiveActionApproval> SensitiveActionApprovals { get; init; } = [];
+
+    /// <summary>Exact sensitive event approvals bound to module, version, and schema identity.</summary>
+    public IReadOnlyList<KernelSensitiveEventApproval> SensitiveEventApprovals { get; init; } = [];
 
     public int MaximumActionDepth { get; init; } = 32;
 }
+
+public sealed record KernelSensitiveActionApproval(
+    string ModuleId,
+    SharpClawActionKey ActionKey,
+    int ActionVersion,
+    string ActionType,
+    string ResultType,
+    string SchemaIdentity);
+
+public sealed record KernelSensitiveEventApproval(
+    string ModuleId,
+    SharpClawEventKey EventKey,
+    int EventVersion,
+    string EventType,
+    string SchemaIdentity);
 
 public sealed record KernelContinuationRequest(
     Guid InvocationId,
@@ -119,7 +171,31 @@ public sealed record KernelUncertaintyRequest(
     string Code,
     string Message,
     string? ReceiptReference,
-    string ContractHash);
+    string ContractHash,
+    ContinuationDestination? ResultDestination = null,
+    string? ProtectedInput = null,
+    ActionContinuationPolicy? Policy = null);
+
+public sealed record KernelRecoveryToken(Guid RecoveryId, string Secret);
+
+public sealed record KernelRecoveryRecord(
+    ActionUncertainty Uncertainty,
+    KernelRecoveryToken Token,
+    KernelRecoveryState State);
+
+/// <summary>One continuation claim bound to the compiled graph snapshot.</summary>
+public sealed record KernelContinuationClaim(
+    ContinuationClaim Claim,
+    string ContractHash)
+{
+    public string Owner => Claim.Owner;
+
+    public DateTimeOffset LeaseExpiresAt => Claim.LeaseExpiresAt;
+
+    public int Generation => Claim.Generation;
+
+    public long ExpectedRevision => Claim.ExpectedRevision;
+}
 
 public interface IActionContinuationHost
 {
@@ -128,16 +204,150 @@ public interface IActionContinuationHost
 
     ValueTask<ContinuationToken> CreateAsync(KernelContinuationRequest request, CancellationToken cancellationToken);
 
-    ValueTask<ActionUncertainty> RecordUncertaintyAsync(
+    ValueTask<KernelContinuationState?> GetAsync(
+        Guid tokenId,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelContinuationState?> ClaimAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelContinuationState?> RenewLeaseAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelContinuationState?> ResumeAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelContinuationState?> CompleteAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
+        string outcome,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelContinuationState?> CancelAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelContinuationState?> DeliverAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelContinuationState?> AcknowledgeAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelContinuationState?> ExpireAsync(
+        Guid tokenId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<bool> DeleteAsync(
+        Guid tokenId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelRecoveryRecord> RecordUncertaintyAsync(
         KernelUncertaintyRequest request,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelRecoveryState?> GetRecoveryAsync(
+        Guid recoveryId,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelRecoveryState?> ClaimRecoveryAsync(
+        Guid recoveryId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelRecoveryState?> RenewRecoveryLeaseAsync(
+        Guid recoveryId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelRecoveryState?> ResumeRecoveryAsync(
+        Guid recoveryId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelRecoveryState?> CompleteRecoveryAsync(
+        Guid recoveryId,
+        string secret,
+        KernelContinuationClaim claim,
+        string outcome,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelRecoveryState?> CancelRecoveryAsync(
+        Guid recoveryId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelRecoveryState?> DeliverRecoveryAsync(
+        Guid recoveryId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelRecoveryState?> AcknowledgeRecoveryAsync(
+        Guid recoveryId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelRecoveryState?> ExpireRecoveryAsync(
+        Guid recoveryId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken);
+
+    ValueTask<bool> DeleteRecoveryAsync(
+        Guid recoveryId,
+        string secret,
+        KernelContinuationClaim claim,
+        DateTimeOffset now,
         CancellationToken cancellationToken);
 }
 
 public sealed record KernelContinuationState(
-    ContinuationToken Token,
+    Guid TokenId,
+    string TokenHash,
     KernelContinuationRequest Request,
     ContinuationState State,
     DateTimeOffset CreatedAt,
+    DateTimeOffset ExpiresAt,
     DateTimeOffset? ClaimedAt,
     DateTimeOffset? CompletedAt,
     string? ClaimOwner = null,
@@ -154,8 +364,61 @@ public sealed record KernelRecoveryState(
     ActionUncertainty Uncertainty,
     ContinuationState State,
     DateTimeOffset CreatedAt,
+    DateTimeOffset ExpiresAt,
+    string TokenHash,
+    DateTimeOffset? ClaimedAt,
+    DateTimeOffset? CompletedAt,
+    string? ClaimOwner,
+    DateTimeOffset? LeaseExpiresAt,
+    int Generation,
+    long Revision,
     string? ProtectedInput,
-    ContinuationDestination ResultDestination);
+    ContinuationDestination ResultDestination,
+    string? CompletedOutcome = null);
+
+public interface IActionContinuationStore
+{
+    /// <summary>True only when state survives process loss and uses durable storage.</summary>
+    bool IsDurable { get; }
+
+    ValueTask<KernelContinuationState?> ReadAsync(
+        Guid tokenId,
+        CancellationToken cancellationToken);
+
+    ValueTask<bool> TryCreateAsync(
+        KernelContinuationState state,
+        CancellationToken cancellationToken);
+
+    ValueTask<bool> TryUpdateAsync(
+        Guid tokenId,
+        KernelContinuationState expected,
+        KernelContinuationState replacement,
+        CancellationToken cancellationToken);
+
+    ValueTask<bool> TryDeleteAsync(
+        Guid tokenId,
+        KernelContinuationState expected,
+        CancellationToken cancellationToken);
+
+    ValueTask<KernelRecoveryState?> ReadRecoveryAsync(
+        Guid recoveryId,
+        CancellationToken cancellationToken);
+
+    ValueTask<bool> TryCreateRecoveryAsync(
+        KernelRecoveryState state,
+        CancellationToken cancellationToken);
+
+    ValueTask<bool> TryUpdateRecoveryAsync(
+        Guid recoveryId,
+        KernelRecoveryState expected,
+        KernelRecoveryState replacement,
+        CancellationToken cancellationToken);
+
+    ValueTask<bool> TryDeleteRecoveryAsync(
+        Guid recoveryId,
+        KernelRecoveryState expected,
+        CancellationToken cancellationToken);
+}
 
 public interface IKernelProviderTransport
 {

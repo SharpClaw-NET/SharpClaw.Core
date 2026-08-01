@@ -1,6 +1,8 @@
+using System.Collections;
 using System.Collections.ObjectModel;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using SharpClaw.Contracts.Modules;
 
@@ -71,8 +73,8 @@ public sealed class KernelGraphBuilder
                     key,
                     1,
                     KernelActionCatalog.CategoryFor(key),
-                    KernelCapabilities.AllActions,
-                    false,
+                    KernelActionCatalog.StandardCapabilities(key),
+                    KernelActionCatalog.StandardSensitive(key),
                     false,
                     KernelCapabilities.NoRepeat,
                     KernelCapabilities.DurableContinuation,
@@ -101,19 +103,25 @@ public sealed class KernelSnapshotCompiler
             .Select(action => new ActionCapabilityGrant(
                 action.Key,
                 action.Version,
-                action.EffectiveCapabilities,
-                action.SensitiveApproved,
+                action.SnapshotCapabilities,
+                action.SnapshotSensitiveApproved,
                 false))
             .ToArray();
         var eventGrants = events.Values
             .Select(eventDefinition => new EventCapabilityGrant(
                 eventDefinition.Key,
                 eventDefinition.Version,
-                eventDefinition.EffectiveCapabilities,
-                eventDefinition.SensitiveApproved,
+                eventDefinition.SnapshotCapabilities,
+                eventDefinition.SnapshotSensitiveApproved,
                 false))
             .ToArray();
-        var contractHash = ComputeContractHash(actions.Values, events.Values, tools, options);
+        var contractHash = ComputeContractHash(
+            actions.Values,
+            events.Values,
+            tools,
+            builder.ActionHooks,
+            builder.EventHooks,
+            options);
         var snapshot = new ActionPipelineSnapshot(
             contractHash,
             actionGrants,
@@ -193,31 +201,211 @@ public sealed class KernelSnapshotCompiler
         IEnumerable<ICompiledActionDefinition> actions,
         IEnumerable<ICompiledEventDefinition> events,
         IEnumerable<KernelToolRegistration> tools,
+        IEnumerable<KernelActionHookRegistration> actionHooks,
+        IEnumerable<KernelEventHookRegistration> eventHooks,
         KernelGraphCompileOptions options)
     {
-        var content = string.Join(
-            "\n",
-            actions.OrderBy(action => action.Key.Value, StringComparer.Ordinal)
-                .Select(action =>
-                    $"a|{action.Key.Value}|{action.Version}|{action.Category}|{(int)action.Capabilities}|" +
-                    $"{(int)action.EffectiveCapabilities}|{action.ContainsSensitiveData}|{action.SensitiveApproved}|" +
-                    $"{action.DescriptorObject}|{action.OwnerModuleId}|{action.Signature}"),
-            events.OrderBy(eventDefinition => eventDefinition.Key.Value, StringComparer.Ordinal)
-                .Select(eventDefinition =>
-                    $"e|{eventDefinition.Key.Value}|{eventDefinition.Version}|{eventDefinition.Category}|" +
-                    $"{(int)eventDefinition.Capabilities}|{(int)eventDefinition.EffectiveCapabilities}|" +
-                    $"{eventDefinition.ContainsSensitiveData}|{eventDefinition.SensitiveApproved}|" +
-                    $"{eventDefinition.OwnerModuleId}|{eventDefinition.Signature}"),
-            tools.OrderBy(tool => tool.Descriptor.Name, StringComparer.Ordinal)
-                .Select(tool => $"t|{tool.Descriptor.Name}|{tool.Descriptor.Version}|{tool.OwnerModuleId}|{tool.HandlerType.FullName}"),
-            options.ActionCapabilityGrants?.OrderBy(pair => pair.Key, StringComparer.Ordinal)
-                .Select(pair => $"ag|{pair.Key}|{(int)pair.Value}") ?? [],
-            options.EventCapabilityGrants?.OrderBy(pair => pair.Key, StringComparer.Ordinal)
-                .Select(pair => $"eg|{pair.Key}|{(int)pair.Value}") ?? [],
-            options.ApprovedSensitiveActions.OrderBy(key => key, StringComparer.Ordinal).Select(key => $"sa|{key}"),
-            options.ApprovedSensitiveEvents.OrderBy(key => key, StringComparer.Ordinal).Select(key => $"se|{key}"));
+        var records = new List<string>
+        {
+            $"options|supported-action|{(int)options.SupportedActionCapabilities}",
+            $"options|supported-event|{(int)options.SupportedEventCapabilities}",
+            $"options|max-depth|{options.MaximumActionDepth}"
+        };
+        foreach (var action in actions.OrderBy(action => action.Key.Value, StringComparer.Ordinal))
+        {
+            records.AddRange(KernelGraphHasher.Flatten("action.descriptor", action.DescriptorObject));
+            records.Add($"action.compiled|{action.Key.Value}|{action.Version}|{action.Category}|" +
+                        $"{(int)action.Capabilities}|{(int)action.EffectiveCapabilities}|" +
+                        $"{action.ContainsSensitiveData}|{action.SensitiveApproved}|{action.OwnerModuleId}|" +
+                        $"{action.ActionType.AssemblyQualifiedName}|{action.ResultType.AssemblyQualifiedName}");
+            records.Add($"action.signature|{action.Signature}");
+        }
+        foreach (var eventDefinition in events.OrderBy(eventDefinition => eventDefinition.Key.Value, StringComparer.Ordinal))
+        {
+            records.AddRange(KernelGraphHasher.Flatten("event.descriptor", eventDefinition.Descriptor));
+            records.Add($"event.compiled|{eventDefinition.Key.Value}|{eventDefinition.Version}|" +
+                        $"{eventDefinition.Category}|{(int)eventDefinition.Capabilities}|" +
+                        $"{(int)eventDefinition.EffectiveCapabilities}|{eventDefinition.ContainsSensitiveData}|" +
+                        $"{eventDefinition.SensitiveApproved}|{eventDefinition.OwnerModuleId}|" +
+                        $"{eventDefinition.EventType.AssemblyQualifiedName}");
+            records.Add($"event.signature|{eventDefinition.Signature}");
+        }
+        foreach (var tool in tools.OrderBy(tool => tool.Descriptor.Name, StringComparer.Ordinal))
+        {
+            records.AddRange(KernelGraphHasher.Flatten("tool.descriptor", tool.Descriptor));
+            records.Add($"tool.owner|{tool.OwnerModuleId}|{tool.HandlerType.AssemblyQualifiedName}");
+        }
+        foreach (var hook in actionHooks
+                     .OrderBy(hook => hook.OwnerModuleId, StringComparer.Ordinal)
+                     .ThenBy(hook => hook.TargetKind)
+                     .ThenBy(hook => hook.Key?.Value, StringComparer.Ordinal)
+                     .ThenBy(hook => hook.Category, StringComparer.Ordinal)
+                     .ThenBy(hook => hook.Ordering.Id, StringComparer.Ordinal))
+            records.AddRange(KernelGraphHasher.Flatten("action.registration", hook));
+        foreach (var hook in eventHooks
+                     .OrderBy(hook => hook.OwnerModuleId, StringComparer.Ordinal)
+                     .ThenBy(hook => hook.TargetKind)
+                     .ThenBy(hook => hook.Key?.Value, StringComparer.Ordinal)
+                     .ThenBy(hook => hook.Category, StringComparer.Ordinal)
+                     .ThenBy(hook => hook.Ordering.Id, StringComparer.Ordinal))
+            records.AddRange(KernelGraphHasher.Flatten("event.registration", hook));
+        AddDictionary(records, "action.grant", options.ActionCapabilityGrants);
+        AddDictionary(records, "event.grant", options.EventCapabilityGrants);
+        AddNestedDictionary(records, "action.module-grant", options.ActionModuleCapabilityGrants);
+        AddNestedDictionary(records, "event.module-grant", options.EventModuleCapabilityGrants);
+        AddApprovalBoundary(records, "sensitive.action", options.SensitiveActionApprovals);
+        AddApprovalBoundary(records, "sensitive.event", options.SensitiveEventApprovals);
+        foreach (var approval in (options.SensitiveActionApprovals ?? []).OrderBy(approval => approval.ModuleId, StringComparer.Ordinal)
+                     .ThenBy(approval => approval.ActionKey.Value, StringComparer.Ordinal)
+                     .ThenBy(approval => approval.ActionVersion)
+                     .ThenBy(approval => approval.ActionType, StringComparer.Ordinal)
+                     .ThenBy(approval => approval.ResultType, StringComparer.Ordinal)
+                     .ThenBy(approval => approval.SchemaIdentity, StringComparer.Ordinal))
+            records.AddRange(KernelGraphHasher.Flatten("sensitive.action", approval));
+        foreach (var approval in (options.SensitiveEventApprovals ?? []).OrderBy(approval => approval.ModuleId, StringComparer.Ordinal)
+                     .ThenBy(approval => approval.EventKey.Value, StringComparer.Ordinal)
+                     .ThenBy(approval => approval.EventVersion)
+                     .ThenBy(approval => approval.EventType, StringComparer.Ordinal)
+                     .ThenBy(approval => approval.SchemaIdentity, StringComparer.Ordinal))
+            records.AddRange(KernelGraphHasher.Flatten("sensitive.event", approval));
+
+        var content = string.Join("\n", records);
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(content)));
     }
+
+    private static void AddApprovalBoundary<T>(
+        ICollection<string> records,
+        string prefix,
+        IReadOnlyList<T>? values)
+    {
+        if (values is null)
+        {
+            records.Add($"{prefix}|<null>");
+            return;
+        }
+        if (values.Count == 0)
+            records.Add($"{prefix}|<empty>");
+    }
+
+    private static void AddDictionary<T>(
+        ICollection<string> records,
+        string prefix,
+        IReadOnlyDictionary<string, T>? values)
+    {
+        if (values is null)
+        {
+            records.Add($"{prefix}|<null>");
+            return;
+        }
+        if (values.Count == 0)
+        {
+            records.Add($"{prefix}|<empty>");
+            return;
+        }
+        foreach (var pair in values.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+            records.Add($"{prefix}|{pair.Key}|{pair.Value}");
+    }
+
+    private static void AddNestedDictionary<T>(
+        ICollection<string> records,
+        string prefix,
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, T>>? values)
+    {
+        if (values is null)
+        {
+            records.Add($"{prefix}|<null>");
+            return;
+        }
+        if (values.Count == 0)
+        {
+            records.Add($"{prefix}|<empty>");
+            return;
+        }
+        foreach (var module in values.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+        {
+            if (module.Value.Count == 0)
+            {
+                records.Add($"{prefix}|{module.Key}|<empty>");
+                continue;
+            }
+            foreach (var grant in module.Value.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+                records.Add($"{prefix}|{module.Key}|{grant.Key}|{grant.Value}");
+        }
+    }
+}
+
+internal static class KernelGraphHasher
+{
+    public static string JoinWith(this IEnumerable<string> values, string separator) =>
+        string.Join(separator, values);
+
+    public static IEnumerable<string> Flatten(string path, object? value)
+    {
+        if (value is null)
+        {
+            yield return $"{path}=<null>";
+            yield break;
+        }
+        if (value is JsonElement json)
+        {
+            yield return $"{path}.json={json.GetRawText()}";
+            yield break;
+        }
+        if (value is Type type)
+        {
+            yield return $"{path}.type={type.AssemblyQualifiedName}";
+            yield break;
+        }
+        if (value is string or char or bool or byte or sbyte or short or ushort or int or uint or long or ulong or float or double or decimal or Guid or DateTime or DateTimeOffset or TimeSpan or Enum)
+        {
+            yield return $"{path}={value}";
+            yield break;
+        }
+        if (value is IEnumerable sequence)
+        {
+            var items = sequence.Cast<object?>().ToArray();
+            if (items.Length > 0 && items.All(IsKeyValuePair))
+            {
+                items = items
+                    .OrderBy(item => ScalarKey(GetPropertyValue(item!, "Key")), StringComparer.Ordinal)
+                    .ThenBy(item => ScalarKey(GetPropertyValue(item!, "Value")), StringComparer.Ordinal)
+                    .ToArray();
+            }
+
+            for (var index = 0; index < items.Length; index++)
+            {
+                foreach (var itemRecord in Flatten($"{path}[{index}]", items[index]))
+                    yield return itemRecord;
+            }
+            if (items.Length == 0)
+                yield return $"{path}=<empty>";
+            yield break;
+        }
+        yield return $"{path}.$type={value.GetType().AssemblyQualifiedName}";
+        foreach (var property in value.GetType().GetProperties(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public)
+                     .Where(property => property.GetMethod is not null)
+                     .OrderBy(property => property.Name, StringComparer.Ordinal))
+        {
+            foreach (var propertyRecord in Flatten($"{path}.{property.Name}", property.GetValue(value)))
+                yield return propertyRecord;
+        }
+    }
+
+    private static bool IsKeyValuePair(object? value) =>
+        value is not null &&
+        value.GetType().IsGenericType &&
+        value.GetType().GetGenericTypeDefinition() == typeof(KeyValuePair<,>);
+
+    private static object? GetPropertyValue(object value, string name) =>
+        value.GetType().GetProperty(name)?.GetValue(value);
+
+    private static string ScalarKey(object? value) =>
+        value switch
+        {
+            null => "<null>",
+            Type type => type.AssemblyQualifiedName ?? type.FullName ?? type.Name,
+            _ => Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty
+        };
 }
 
 public sealed class KernelGraph
@@ -370,13 +558,13 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
             throw new KernelGraphCompilationException(
                 $"Action '{descriptor.Key.Value}' requires unsupported capabilities: {unsupported}.");
         }
-        var sensitiveApproved = !descriptor.ContainsSensitiveData ||
-            options.ApprovedSensitiveActions.Contains(descriptor.Key.Value);
-        if (!sensitiveApproved)
-            throw new KernelGraphCompilationException($"Sensitive action '{descriptor.Key.Value}' lacks approval.");
-        var effectiveCapabilities = descriptor.Capabilities;
+        var effectiveCapabilities = descriptor.Capabilities & options.SupportedActionCapabilities;
         if (options.ActionCapabilityGrants?.TryGetValue(descriptor.Key.Value, out var grant) == true)
             effectiveCapabilities &= grant;
+        effectiveCapabilities &= ResolveActionModuleGrant(
+            descriptor,
+            ownerModuleId,
+            options);
 
         var matching = hooks
             .Where(hook => Matches(hook.TargetKind, hook.Key, hook.Category, descriptor.Key, descriptor.Category))
@@ -385,6 +573,13 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
         var frames = new List<IActionFrame<TAction, TResult>>();
         foreach (var hook in ordered)
         {
+            var hookCapabilities = ResolveActionCapabilities(descriptor, hook, options);
+            var hookSensitiveApproved = ResolveSensitiveApproval(
+                descriptor,
+                hook.OwnerModuleId,
+                options,
+                typeof(TAction),
+                typeof(TResult));
             if (hook.IsUntyped)
             {
                 if (!typeof(IAnyActionInterceptor).IsAssignableFrom(hook.HandlerType))
@@ -392,8 +587,13 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
                         $"'{hook.HandlerType.FullName}' does not implement IAnyActionInterceptor.");
                 frames.Add(new AnyActionFrame<TAction, TResult>(
                     (IAnyActionInterceptor)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider),
+                    hook.TargetKind,
+                    hook.Key,
+                    hook.Category,
                     hook.Ordering,
-                    hook.OwnerModuleId));
+                    hook.OwnerModuleId,
+                    hookCapabilities,
+                    hookSensitiveApproved));
             }
             else
             {
@@ -405,10 +605,26 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
                     (IActionInterceptor<TAction, TResult>)KernelServiceResolution.Resolve(
                         hook.HandlerType,
                         serviceProvider),
+                    hook.TargetKind,
+                    hook.Key,
+                    hook.Category,
                     hook.Ordering,
-                    hook.OwnerModuleId));
+                    hook.OwnerModuleId,
+                    hookCapabilities,
+                    hookSensitiveApproved));
             }
         }
+
+        var sensitiveApproved = ResolveSensitiveApproval(
+            descriptor,
+            ownerModuleId,
+            options,
+            typeof(TAction),
+            typeof(TResult));
+        if (descriptor.ContainsSensitiveData && frames.Any(frame => !frame.SensitiveApproved))
+            sensitiveApproved = false;
+        if (descriptor.ContainsSensitiveData && !sensitiveApproved)
+            throw new KernelGraphCompilationException($"Sensitive action '{descriptor.Key.Value}' lacks exact approval.");
 
         return new CompiledActionDefinition<TAction, TResult>(
             descriptor,
@@ -417,6 +633,85 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
             effectiveCapabilities,
             sensitiveApproved);
     }
+
+    private static ActionInterceptionCapabilities ResolveActionCapabilities<TActionValue, TResultValue>(
+        ActionDescriptor<TActionValue, TResultValue> descriptor,
+        KernelActionHookRegistration hook,
+        KernelGraphCompileOptions options)
+    {
+        var capabilities = descriptor.Capabilities & options.SupportedActionCapabilities;
+        if (options.ActionCapabilityGrants?.TryGetValue(descriptor.Key.Value, out var administratorGrant) == true)
+            capabilities &= administratorGrant;
+        capabilities &= ResolveActionModuleGrant(
+            descriptor,
+            hook.OwnerModuleId,
+            options,
+            validateDescriptorRequest: false);
+        return capabilities;
+    }
+
+    private static ActionInterceptionCapabilities ResolveActionModuleGrant<TActionValue, TResultValue>(
+        ActionDescriptor<TActionValue, TResultValue> descriptor,
+        string ownerModuleId,
+        KernelGraphCompileOptions options,
+        bool validateDescriptorRequest = true)
+    {
+        if (ownerModuleId == KernelCapabilities.CoreOwner)
+            return KernelCapabilities.AllActions;
+        if (options.ActionModuleCapabilityGrants is not { } grants ||
+            !grants.TryGetValue(ownerModuleId, out var moduleGrants) ||
+            !moduleGrants.TryGetValue(descriptor.Key.Value, out var moduleGrant))
+            throw new KernelGraphCompilationException(
+                $"Module '{ownerModuleId}' has no manifest grant for action '{descriptor.Key.Value}'.");
+        var unauthorized = descriptor.Capabilities & ~moduleGrant;
+        if (validateDescriptorRequest && unauthorized != 0)
+            throw new KernelGraphCompilationException(
+                $"Module '{ownerModuleId}' requests unauthorized effects '{unauthorized}' " +
+                $"for action '{descriptor.Key.Value}'.");
+        return moduleGrant;
+    }
+
+    private static bool ResolveSensitiveApproval<TActionValue, TResultValue>(
+        ActionDescriptor<TActionValue, TResultValue> descriptor,
+        string moduleId,
+        KernelGraphCompileOptions options,
+        Type actionType,
+        Type resultType)
+    {
+        if (!descriptor.ContainsSensitiveData)
+            return true;
+        if (IsCanonicalCoreSensitiveAction(descriptor, moduleId, actionType, resultType))
+            return true;
+        var schema = KernelSchemaIdentity.Action(descriptor, actionType, resultType);
+        return (options.SensitiveActionApprovals ?? []).Any(approval =>
+            approval.ModuleId == moduleId &&
+            approval.ActionKey == descriptor.Key &&
+            approval.ActionVersion == descriptor.Version &&
+            approval.ActionType == actionType.AssemblyQualifiedName &&
+            approval.ResultType == resultType.AssemblyQualifiedName &&
+            approval.SchemaIdentity == schema);
+    }
+
+    private static bool IsCanonicalCoreSensitiveAction<TActionValue, TResultValue>(
+        ActionDescriptor<TActionValue, TResultValue> descriptor,
+        string moduleId,
+        Type actionType,
+        Type resultType) =>
+        moduleId == KernelCapabilities.CoreOwner &&
+        actionType == typeof(KernelActionEnvelope) &&
+        resultType == typeof(object) &&
+        descriptor.Version == 1 &&
+        SharpClawActionCatalog.Kernel.Contains(descriptor.Key) &&
+        descriptor.Category == KernelActionCatalog.CategoryFor(descriptor.Key) &&
+        descriptor.Capabilities == KernelActionCatalog.StandardCapabilities(descriptor.Key) &&
+        descriptor.ContainsSensitiveData &&
+        !descriptor.HasIrreversibleEffects &&
+        descriptor.RepeatPolicy == KernelCapabilities.NoRepeat &&
+        descriptor.ContinuationPolicy == KernelCapabilities.DurableContinuation &&
+        descriptor.DefaultTimeout == TimeSpan.FromSeconds(30) &&
+        descriptor.ProtocolVersionRange == ContractVersionRange.Exact(1) &&
+        descriptor.SafePoints.Count == 0 &&
+        KernelActionCatalog.StandardSensitive(descriptor.Key);
 
     private static bool Matches(
         KernelHookTargetKind targetKind,
@@ -463,13 +758,13 @@ internal sealed class EventDefinitionRegistration<TEvent>(
             throw new KernelGraphCompilationException(
                 $"Event '{descriptor.Key.Value}' requires unsupported capabilities: {unsupported}.");
         }
-        var sensitiveApproved = !descriptor.ContainsSensitiveData ||
-            options.ApprovedSensitiveEvents.Contains(descriptor.Key.Value);
-        if (!sensitiveApproved)
-            throw new KernelGraphCompilationException($"Sensitive event '{descriptor.Key.Value}' lacks approval.");
-        var effectiveCapabilities = descriptor.Capabilities;
+        var effectiveCapabilities = descriptor.Capabilities & options.SupportedEventCapabilities;
         if (options.EventCapabilityGrants?.TryGetValue(descriptor.Key.Value, out var grant) == true)
             effectiveCapabilities &= grant;
+        effectiveCapabilities &= ResolveEventModuleGrant(
+            descriptor,
+            ownerModuleId,
+            options);
 
         var matching = hooks
             .Where(hook => Matches(hook.TargetKind, hook.Key, hook.Category, descriptor.Key, descriptor.Category))
@@ -479,6 +774,12 @@ internal sealed class EventDefinitionRegistration<TEvent>(
         var listeners = new List<KernelEventListener<TEvent>>();
         foreach (var hook in ordered)
         {
+            var hookCapabilities = ResolveEventCapabilities(descriptor, hook, options);
+            var hookSensitiveApproved = ResolveSensitiveApproval(
+                descriptor,
+                hook.OwnerModuleId,
+                options,
+                typeof(TEvent));
             if (hook.Kind == KernelEventHookKind.Interceptor)
             {
                 if (hook.IsUntyped)
@@ -488,8 +789,13 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                             $"'{hook.HandlerType.FullName}' does not implement IAnyEventInterceptor.");
                     interceptors.Add(new AnyEventFrame<TEvent>(
                         (IAnyEventInterceptor)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider),
+                        hook.TargetKind,
+                        hook.Key,
+                        hook.Category,
                         hook.Ordering,
-                        hook.OwnerModuleId));
+                        hook.OwnerModuleId,
+                        hookCapabilities,
+                        hookSensitiveApproved));
                 }
                 else
                 {
@@ -501,8 +807,13 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         (IEventInterceptor<TEvent>)KernelServiceResolution.Resolve(
                             hook.HandlerType,
                             serviceProvider),
+                        hook.TargetKind,
+                        hook.Key,
+                        hook.Category,
                         hook.Ordering,
-                        hook.OwnerModuleId));
+                        hook.OwnerModuleId,
+                        hookCapabilities,
+                        hookSensitiveApproved));
                 }
             }
             else
@@ -516,9 +827,14 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         (IAnyEventListener)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider),
                         hook.Delivery,
                         hook.Ordering.Id,
+                        hook.TargetKind,
+                        hook.Key,
+                        hook.Category,
                         hook.OwnerModuleId,
                         hook.HandlerType,
-                        hook.Ordering));
+                        hook.Ordering,
+                        hookCapabilities,
+                        hookSensitiveApproved));
                 }
                 else
                 {
@@ -532,12 +848,27 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                             serviceProvider),
                         hook.Delivery,
                         hook.Ordering.Id,
+                        hook.TargetKind,
+                        hook.Key,
+                        hook.Category,
                         hook.OwnerModuleId,
                         hook.HandlerType,
-                        hook.Ordering));
+                        hook.Ordering,
+                        hookCapabilities,
+                        hookSensitiveApproved));
                 }
             }
         }
+
+        var sensitiveApproved = ResolveSensitiveApproval(
+            descriptor,
+            ownerModuleId,
+            options,
+            typeof(TEvent));
+        if (descriptor.ContainsSensitiveData && interceptors.Any(frame => !frame.SensitiveApproved))
+            sensitiveApproved = false;
+        if (descriptor.ContainsSensitiveData && !sensitiveApproved)
+            throw new KernelGraphCompilationException($"Sensitive event '{descriptor.Key.Value}' lacks exact approval.");
 
         return new CompiledEventDefinition<TEvent>(
             descriptor,
@@ -546,6 +877,64 @@ internal sealed class EventDefinitionRegistration<TEvent>(
             listeners,
             effectiveCapabilities,
             sensitiveApproved);
+    }
+
+    private static EventInterceptionCapabilities ResolveEventCapabilities<TEventValue>(
+        EventDescriptor<TEventValue> descriptor,
+        KernelEventHookRegistration hook,
+        KernelGraphCompileOptions options)
+    {
+        var capabilities = descriptor.Capabilities & options.SupportedEventCapabilities;
+        if (options.EventCapabilityGrants?.TryGetValue(descriptor.Key.Value, out var administratorGrant) == true)
+            capabilities &= administratorGrant;
+        capabilities &= ResolveEventModuleGrant(
+            descriptor,
+            hook.OwnerModuleId,
+            options,
+            validateDescriptorRequest: false);
+        return capabilities;
+    }
+
+    private static EventInterceptionCapabilities ResolveEventModuleGrant<TEventValue>(
+        EventDescriptor<TEventValue> descriptor,
+        string ownerModuleId,
+        KernelGraphCompileOptions options,
+        bool validateDescriptorRequest = true)
+    {
+        if (ownerModuleId == KernelCapabilities.CoreOwner)
+            return EventInterceptionCapabilities.Inspect |
+                   EventInterceptionCapabilities.Replace |
+                   EventInterceptionCapabilities.Cancel |
+                   EventInterceptionCapabilities.StopPropagation |
+                   EventInterceptionCapabilities.Observe;
+        if (options.EventModuleCapabilityGrants is not { } grants ||
+            !grants.TryGetValue(ownerModuleId, out var moduleGrants) ||
+            !moduleGrants.TryGetValue(descriptor.Key.Value, out var moduleGrant))
+            throw new KernelGraphCompilationException(
+                $"Module '{ownerModuleId}' has no manifest grant for event '{descriptor.Key.Value}'.");
+        var unauthorized = descriptor.Capabilities & ~moduleGrant;
+        if (validateDescriptorRequest && unauthorized != 0)
+            throw new KernelGraphCompilationException(
+                $"Module '{ownerModuleId}' requests unauthorized effects '{unauthorized}' " +
+                $"for event '{descriptor.Key.Value}'.");
+        return moduleGrant;
+    }
+
+    private static bool ResolveSensitiveApproval<TEventValue>(
+        EventDescriptor<TEventValue> descriptor,
+        string moduleId,
+        KernelGraphCompileOptions options,
+        Type eventType)
+    {
+        if (!descriptor.ContainsSensitiveData)
+            return true;
+        var schema = KernelSchemaIdentity.Event(descriptor, eventType);
+        return (options.SensitiveEventApprovals ?? []).Any(approval =>
+            approval.ModuleId == moduleId &&
+            approval.EventKey == descriptor.Key &&
+            approval.EventVersion == descriptor.Version &&
+            approval.EventType == eventType.AssemblyQualifiedName &&
+            approval.SchemaIdentity == schema);
     }
 
     private static bool Matches(
@@ -616,6 +1005,40 @@ internal static class KernelHookOrdering
     };
 }
 
+public static class KernelSchemaIdentity
+{
+    public static string Action<TAction, TResult>(
+        ActionDescriptor<TAction, TResult> descriptor) =>
+        Action(descriptor, typeof(TAction), typeof(TResult));
+
+    public static string Action<TAction, TResult>(
+        ActionDescriptor<TAction, TResult> descriptor,
+        Type actionType,
+        Type resultType) =>
+        string.Join(
+            "|",
+            descriptor.Key.Value,
+            descriptor.Version,
+            descriptor.Category,
+            actionType.AssemblyQualifiedName,
+            resultType.AssemblyQualifiedName,
+            descriptor.ProtocolVersionRange.Minimum,
+            descriptor.ProtocolVersionRange.Maximum,
+            string.Join(",", descriptor.SafePoints));
+
+    public static string Event<TEvent>(
+        EventDescriptor<TEvent> descriptor,
+        Type eventType) =>
+        string.Join(
+            "|",
+            descriptor.Key.Value,
+            descriptor.Version,
+            descriptor.Category,
+            eventType.AssemblyQualifiedName,
+            descriptor.ProtocolVersionRange.Minimum,
+            descriptor.ProtocolVersionRange.Maximum);
+}
+
 internal interface ICompiledActionDefinition
 {
     object DescriptorObject { get; }
@@ -632,9 +1055,13 @@ internal interface ICompiledActionDefinition
 
     ActionInterceptionCapabilities EffectiveCapabilities { get; }
 
+    ActionInterceptionCapabilities SnapshotCapabilities { get; }
+
     bool ContainsSensitiveData { get; }
 
     bool SensitiveApproved { get; }
+
+    bool SnapshotSensitiveApproved { get; }
 
     string Signature { get; }
 
@@ -668,19 +1095,31 @@ internal sealed class CompiledActionDefinition<TAction, TResult>(
 
     public ActionInterceptionCapabilities EffectiveCapabilities { get; } = effectiveCapabilities;
 
+    public ActionInterceptionCapabilities SnapshotCapabilities =>
+        Frames.Count == 0
+            ? EffectiveCapabilities
+            : Frames.Aggregate(
+                EffectiveCapabilities,
+                (capabilities, frame) => capabilities & frame.EffectiveCapabilities);
+
     public bool ContainsSensitiveData => Descriptor.ContainsSensitiveData;
 
     public bool SensitiveApproved { get; } = sensitiveApproved;
 
+    public bool SnapshotSensitiveApproved =>
+        SensitiveApproved && Frames.All(frame => frame.SensitiveApproved);
+
     public string Signature => string.Join(
         ",",
         [
-            $"descriptor|{Descriptor.HasIrreversibleEffects}|{Descriptor.RepeatPolicy}|" +
-            $"{Descriptor.ContinuationPolicy}|{Descriptor.DefaultTimeout}|" +
-            $"{string.Join(",", Descriptor.SafePoints)}|{Descriptor.ProtocolVersionRange}",
+            $"descriptor|{KernelGraphHasher.Flatten("value", Descriptor).JoinWith(";")}",
             ..Frames.Select(frame =>
-            $"{frame.Ordering.Id}|{frame.OwnerModuleId}|{frame.HandlerType.FullName}|" +
-            $"{frame.Ordering.Timeout}|{frame.Ordering.FailurePolicy}")]);
+            $"hook|{frame.TargetKind}|{frame.TargetKey?.Value}|{frame.TargetCategory}|" +
+            $"{frame.Ordering.Id}|{frame.Ordering.Priority}|" +
+            $"{string.Join(";", frame.Ordering.Before ?? [])}|{string.Join(";", frame.Ordering.After ?? [])}|" +
+            $"{frame.Ordering.Timeout?.Ticks}|{frame.Ordering.FailurePolicy}|{frame.OwnerModuleId}|" +
+            $"{frame.HandlerType.AssemblyQualifiedName}|{frame.IsUntyped}|" +
+            $"{(int)frame.EffectiveCapabilities}|{frame.SensitiveApproved}")]);
 
     public string OwnerModuleId { get; } = ownerModuleId;
 
@@ -695,45 +1134,85 @@ internal interface IActionFrame<TAction, TResult>
 {
     bool IsUntyped { get; }
 
+    KernelHookTargetKind TargetKind { get; }
+
+    SharpClawActionKey? TargetKey { get; }
+
+    string? TargetCategory { get; }
+
     HookOrdering Ordering { get; }
 
     string OwnerModuleId { get; }
 
     Type HandlerType { get; }
+
+    ActionInterceptionCapabilities EffectiveCapabilities { get; }
+
+    bool SensitiveApproved { get; }
 }
 
 internal sealed class TypedActionFrame<TAction, TResult>(
     IActionInterceptor<TAction, TResult> interceptor,
+    KernelHookTargetKind targetKind,
+    SharpClawActionKey? targetKey,
+    string? targetCategory,
     HookOrdering ordering,
-    string ownerModuleId)
+    string ownerModuleId,
+    ActionInterceptionCapabilities effectiveCapabilities,
+    bool sensitiveApproved)
     : IActionFrame<TAction, TResult>
 {
     public IActionInterceptor<TAction, TResult> Interceptor { get; } = interceptor;
 
     public bool IsUntyped => false;
 
+    public KernelHookTargetKind TargetKind { get; } = targetKind;
+
+    public SharpClawActionKey? TargetKey { get; } = targetKey;
+
+    public string? TargetCategory { get; } = targetCategory;
+
     public HookOrdering Ordering { get; } = ordering;
 
     public string OwnerModuleId { get; } = ownerModuleId;
 
     public Type HandlerType => Interceptor.GetType();
+
+    public ActionInterceptionCapabilities EffectiveCapabilities { get; } = effectiveCapabilities;
+
+    public bool SensitiveApproved { get; } = sensitiveApproved;
 }
 
 internal sealed class AnyActionFrame<TAction, TResult>(
     IAnyActionInterceptor interceptor,
+    KernelHookTargetKind targetKind,
+    SharpClawActionKey? targetKey,
+    string? targetCategory,
     HookOrdering ordering,
-    string ownerModuleId)
+    string ownerModuleId,
+    ActionInterceptionCapabilities effectiveCapabilities,
+    bool sensitiveApproved)
     : IActionFrame<TAction, TResult>
 {
     public IAnyActionInterceptor Interceptor { get; } = interceptor;
 
     public bool IsUntyped => true;
 
+    public KernelHookTargetKind TargetKind { get; } = targetKind;
+
+    public SharpClawActionKey? TargetKey { get; } = targetKey;
+
+    public string? TargetCategory { get; } = targetCategory;
+
     public HookOrdering Ordering { get; } = ordering;
 
     public string OwnerModuleId { get; } = ownerModuleId;
 
     public Type HandlerType => Interceptor.GetType();
+
+    public ActionInterceptionCapabilities EffectiveCapabilities { get; } = effectiveCapabilities;
+
+    public bool SensitiveApproved { get; } = sensitiveApproved;
 }
 
 internal interface ICompiledEventDefinition
@@ -750,9 +1229,13 @@ internal interface ICompiledEventDefinition
 
     EventInterceptionCapabilities EffectiveCapabilities { get; }
 
+    EventInterceptionCapabilities SnapshotCapabilities { get; }
+
     bool ContainsSensitiveData { get; }
 
     bool SensitiveApproved { get; }
+
+    bool SnapshotSensitiveApproved { get; }
 
     string Signature { get; }
 
@@ -785,20 +1268,40 @@ internal sealed class CompiledEventDefinition<TEvent>(
 
     public EventInterceptionCapabilities EffectiveCapabilities { get; } = effectiveCapabilities;
 
+    public EventInterceptionCapabilities SnapshotCapabilities =>
+        Interceptors.Count == 0 && Listeners.Count == 0
+            ? EffectiveCapabilities
+            : Interceptors
+                .Select(frame => frame.EffectiveCapabilities)
+                .Concat(Listeners.Select(listener => listener.EffectiveCapabilities))
+                .Aggregate(EffectiveCapabilities, (capabilities, grant) => capabilities & grant);
+
     public bool ContainsSensitiveData => Descriptor.ContainsSensitiveData;
 
     public bool SensitiveApproved { get; } = sensitiveApproved;
 
+    public bool SnapshotSensitiveApproved =>
+        SensitiveApproved &&
+        Interceptors.All(frame => frame.SensitiveApproved) &&
+        Listeners.All(listener => listener.SensitiveApproved);
+
     public string Signature => string.Join(
         ",",
         [
-            $"descriptor|{Descriptor.DurableByDefault}|{Descriptor.DeliveryClasses}|{Descriptor.ProtocolVersionRange}",
+            $"descriptor|{KernelGraphHasher.Flatten("value", Descriptor).JoinWith(";")}",
             ..Interceptors.Select(frame =>
-            $"i|{frame.Ordering.Id}|{frame.OwnerModuleId}|{frame.HandlerType.FullName}|" +
-            $"{frame.Ordering.Timeout}|{frame.Ordering.FailurePolicy}"),
+            $"i|{frame.TargetKind}|{frame.TargetKey?.Value}|{frame.TargetCategory}|" +
+            $"{frame.Ordering.Id}|{frame.Ordering.Priority}|" +
+            $"{string.Join(";", frame.Ordering.Before ?? [])}|{string.Join(";", frame.Ordering.After ?? [])}|" +
+            $"{frame.Ordering.Timeout?.Ticks}|{frame.Ordering.FailurePolicy}|{frame.OwnerModuleId}|" +
+            $"{frame.HandlerType.AssemblyQualifiedName}|{frame.IsUntyped}|" +
+            $"{(int)frame.EffectiveCapabilities}|{frame.SensitiveApproved}"),
             ..Listeners.Select(listener =>
-                $"l|{listener.Id}|{listener.OwnerModuleId}|{listener.HandlerType.FullName}|{listener.Delivery}|" +
-                $"{listener.Ordering.Timeout}|{listener.Ordering.FailurePolicy}")]);
+                $"l|{listener.TargetKind}|{listener.TargetKey?.Value}|{listener.TargetCategory}|" +
+                $"{listener.Id}|{listener.OwnerModuleId}|{listener.HandlerType.AssemblyQualifiedName}|{listener.Delivery}|" +
+                $"{listener.Ordering.Priority}|{string.Join(";", listener.Ordering.Before ?? [])}|" +
+                $"{string.Join(";", listener.Ordering.After ?? [])}|{listener.Ordering.Timeout?.Ticks}|" +
+                $"{listener.Ordering.FailurePolicy}|{(int)listener.EffectiveCapabilities}|{listener.SensitiveApproved}")]);
 
     public IReadOnlyList<IEventFrame<TEvent>> Interceptors { get; } = interceptors;
 
@@ -811,52 +1314,97 @@ internal interface IEventFrame<TEvent>
 {
     bool IsUntyped { get; }
 
+    KernelHookTargetKind TargetKind { get; }
+
+    SharpClawEventKey? TargetKey { get; }
+
+    string? TargetCategory { get; }
+
     HookOrdering Ordering { get; }
 
     string OwnerModuleId { get; }
 
     Type HandlerType { get; }
+
+    EventInterceptionCapabilities EffectiveCapabilities { get; }
+
+    bool SensitiveApproved { get; }
 }
 
 internal sealed class TypedEventFrame<TEvent>(
     IEventInterceptor<TEvent> interceptor,
+    KernelHookTargetKind targetKind,
+    SharpClawEventKey? targetKey,
+    string? targetCategory,
     HookOrdering ordering,
-    string ownerModuleId) : IEventFrame<TEvent>
+    string ownerModuleId,
+    EventInterceptionCapabilities effectiveCapabilities,
+    bool sensitiveApproved) : IEventFrame<TEvent>
 {
     public IEventInterceptor<TEvent> Interceptor { get; } = interceptor;
 
     public bool IsUntyped => false;
 
+    public KernelHookTargetKind TargetKind { get; } = targetKind;
+
+    public SharpClawEventKey? TargetKey { get; } = targetKey;
+
+    public string? TargetCategory { get; } = targetCategory;
+
     public HookOrdering Ordering { get; } = ordering;
 
     public string OwnerModuleId { get; } = ownerModuleId;
 
     public Type HandlerType => Interceptor.GetType();
+
+    public EventInterceptionCapabilities EffectiveCapabilities { get; } = effectiveCapabilities;
+
+    public bool SensitiveApproved { get; } = sensitiveApproved;
 }
 
 internal sealed class AnyEventFrame<TEvent>(
     IAnyEventInterceptor interceptor,
+    KernelHookTargetKind targetKind,
+    SharpClawEventKey? targetKey,
+    string? targetCategory,
     HookOrdering ordering,
-    string ownerModuleId) : IEventFrame<TEvent>
+    string ownerModuleId,
+    EventInterceptionCapabilities effectiveCapabilities,
+    bool sensitiveApproved) : IEventFrame<TEvent>
 {
     public IAnyEventInterceptor Interceptor { get; } = interceptor;
 
     public bool IsUntyped => true;
 
+    public KernelHookTargetKind TargetKind { get; } = targetKind;
+
+    public SharpClawEventKey? TargetKey { get; } = targetKey;
+
+    public string? TargetCategory { get; } = targetCategory;
+
     public HookOrdering Ordering { get; } = ordering;
 
     public string OwnerModuleId { get; } = ownerModuleId;
 
     public Type HandlerType => Interceptor.GetType();
+
+    public EventInterceptionCapabilities EffectiveCapabilities { get; } = effectiveCapabilities;
+
+    public bool SensitiveApproved { get; } = sensitiveApproved;
 }
 
 internal sealed record KernelEventListener<TEvent>(
     object Listener,
     EventDelivery Delivery,
     string Id,
+    KernelHookTargetKind TargetKind,
+    SharpClawEventKey? TargetKey,
+    string? TargetCategory,
     string OwnerModuleId,
     Type HandlerType,
-    HookOrdering Ordering);
+    HookOrdering Ordering,
+    EventInterceptionCapabilities EffectiveCapabilities,
+    bool SensitiveApproved);
 
 public sealed class KernelActionDefinitionBuilder(
     KernelGraphBuilder builder,
@@ -1022,9 +1570,16 @@ public sealed class KernelModuleRegistry
             await dispatcher.RunRequiredAsync<KernelActionEnvelope, object>(
                 descriptor,
                 new KernelActionEnvelope(descriptor.Key, context),
-                async (_, ct) =>
+                async (envelope, ct) =>
                 {
-                    await module.StartAsync(context, ct);
+                    var effectiveContext = envelope.Payload switch
+                    {
+                        ModuleStartContext value => value,
+                        KernelActionEnvelope nested when nested.Payload is ModuleStartContext value => value,
+                        _ => throw new KernelActionExecutionException(
+                            "The module.start action returned an invalid ModuleStartContext replacement.")
+                    };
+                    await module.StartAsync(effectiveContext, ct);
                     return (object)true;
                 },
                 graph.ActionSnapshot,

@@ -37,6 +37,12 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
     {
         ArgumentNullException.ThrowIfNull(descriptor);
         ArgumentNullException.ThrowIfNull(snapshot);
+        if (!string.Equals(
+                snapshot.ContractHash,
+                _graph.ActionSnapshot.ContractHash,
+                StringComparison.Ordinal))
+            throw new KernelActionExecutionException(
+                "The event pipeline snapshot is not compatible with the compiled kernel graph.");
         var definition = _graph.GetEvent(descriptor.Key);
         if (definition is not CompiledEventDefinition<TEvent> typed)
             throw new KernelActionExecutionException(
@@ -45,6 +51,10 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
             throw new KernelActionExecutionException(
                 $"Event '{descriptor.Key.Value}' was invoked with version {descriptor.Version}, " +
                 $"but the graph contains version {typed.Descriptor.Version}.");
+        if (!KernelGraphHasher.Flatten("descriptor", typed.Descriptor)
+                .SequenceEqual(KernelGraphHasher.Flatten("descriptor", descriptor)))
+            throw new KernelActionExecutionException(
+                $"Event '{descriptor.Key.Value}' does not match the compiled descriptor schema.");
 
         var invocation = new KernelEventInvocation<TEvent>(
             typed,
@@ -121,7 +131,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                 _features,
                 _snapshot.ContractHash);
             var frame = _definition.Interceptors[index];
-            var control = new TypedEventControl(this, payload, index, cancellationToken);
+            var control = new TypedEventControl(this, payload, index, cancellationToken, frame);
             try
             {
                 IEventInterception<TEvent> outcome;
@@ -138,7 +148,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                         _definition.Descriptor.Key,
                         _definition.Descriptor.Version,
                         _definition.Descriptor.Category,
-                        _definition.EffectiveCapabilities,
+                        frame.EffectiveCapabilities,
                         new JsonSchemaReference("core.event.payload", 1, string.Empty),
                         _definition.Descriptor.ContainsSensitiveData);
                     var untypedEnvelope = new UntypedEventEnvelope(
@@ -178,15 +188,39 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
             }
             catch (KernelControlException exception)
             {
+                if (control.TryGetKnownOutcome(out var known))
+                    return control.Reissue(known!);
                 return Failed("EVENT_CONTROL_CONSUMED", exception.Message);
             }
-            catch (TimeoutException) when (frame.Ordering.FailurePolicy == HookFailurePolicy.BestEffort)
+            catch (KernelEventOperationTimeoutException exception) when (frame.Ordering.FailurePolicy == HookFailurePolicy.BestEffort)
             {
+                if (control.TryGetKnownOutcome(out var known))
+                    return control.Reissue(known!);
+                if (control.ContinuationStarted || exception.OperationStillRunning)
+                {
+                    control.ConsumeForUncertainty();
+                    return Failed("EVENT_OUTCOME_UNCERTAIN", exception.Message, control.Authority);
+                }
                 return await InvokeAsync(payload, index + 1, cancellationToken);
             }
-            catch (Exception) when (frame.Ordering.FailurePolicy == HookFailurePolicy.BestEffort)
+            catch (TimeoutException exception) when (frame.Ordering.FailurePolicy == HookFailurePolicy.BestEffort)
             {
+                if (control.TryGetKnownOutcome(out var known))
+                    return control.Reissue(known!);
+                if (control.ContinuationStarted)
+                    return Failed("EVENT_OUTCOME_UNCERTAIN", exception.Message, control.Authority);
                 return await InvokeAsync(payload, index + 1, cancellationToken);
+            }
+            catch (KernelEventOperationTimeoutException exception)
+            {
+                if (control.TryGetKnownOutcome(out var known))
+                    return control.Reissue(known!);
+                if (control.ContinuationStarted || exception.OperationStillRunning)
+                {
+                    control.ConsumeForUncertainty();
+                    return Failed("EVENT_OUTCOME_UNCERTAIN", exception.Message, control.Authority);
+                }
+                return Failed("EVENT_HOOK_TIMEOUT", exception.Message, control.Authority);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -198,6 +232,12 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
             }
             catch (Exception exception)
             {
+                if (control.TryGetKnownOutcome(out var known))
+                    return control.Reissue(known!);
+                if (control.ContinuationStarted)
+                    return Failed("EVENT_OUTCOME_UNCERTAIN", exception.Message, control.Authority);
+                if (frame.Ordering.FailurePolicy == HookFailurePolicy.BestEffort)
+                    return await InvokeAsync(payload, index + 1, cancellationToken);
                 return Failed("EVENT_INTERCEPTOR_FAILED", exception.Message);
             }
         }
@@ -303,19 +343,29 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                 throw new TimeoutException("The event hook timeout is not positive.");
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             linked.CancelAfter(timeout);
+            var operationTask = Task.Run(
+                () => operation(linked.Token).AsTask(),
+                CancellationToken.None);
             try
             {
-                return await operation(linked.Token).AsTask().WaitAsync(timeout, cancellationToken);
+                return await operationTask.WaitAsync(timeout, cancellationToken);
             }
             catch (TimeoutException)
             {
-                throw new TimeoutException("The event hook exceeded its timeout.");
+                throw new KernelEventOperationTimeoutException(
+                    "The event hook exceeded its timeout.",
+                    await IsStillRunningAsync(operationTask));
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
-                throw new TimeoutException("The event hook exceeded its timeout.");
+                throw new KernelEventOperationTimeoutException(
+                    "The event hook exceeded its timeout.",
+                    await IsStillRunningAsync(operationTask));
             }
         }
+
+        private static ValueTask<bool> IsStillRunningAsync(Task operationTask) =>
+            ValueTask.FromResult(!operationTask.IsCompleted);
 
         private IEventInterception<TEvent> Validate(
             IEventInterception<TEvent>? outcome,
@@ -341,49 +391,82 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                 authority);
         }
 
-        private static KernelEventInterception<TEvent> Failed(string code, string message) =>
-            KernelEventInterception<TEvent>.Failed(code, message);
+        private static KernelEventInterception<TEvent> Failed(
+            string code,
+            string message,
+            object? authority = null) =>
+            KernelEventInterception<TEvent>.Failed(code, message, authority);
 
         private sealed class TypedEventControl(
             KernelEventInvocation<TEvent> owner,
             TEvent payload,
             int index,
-            CancellationToken cancellationToken) : IEventControl<TEvent>
+            CancellationToken cancellationToken,
+            IEventFrame<TEvent> frame) : IEventControl<TEvent>
         {
             private readonly object _authority = new();
             private bool _used;
+            private bool _continuationStarted;
+            private Task<IEventInterception<TEvent>>? _continuationTask;
+            private IEventInterception<TEvent>? _continuationOutcome;
+            private IEventInterception<TEvent>? _issuedOutcome;
 
             public object Authority => _authority;
+
+            public bool ContinuationStarted => _continuationStarted;
+
+            public bool TryGetKnownOutcome(out IEventInterception<TEvent>? outcome)
+            {
+                outcome = _issuedOutcome ?? _continuationOutcome;
+                return outcome is not null;
+            }
+
+            public void ConsumeForUncertainty() => _used = true;
 
             public IEventInterception<TEvent> Continue()
             {
                 Ensure(EventInterceptionCapabilities.Inspect);
-                var result = owner.InvokeAsync(payload, index + 1, cancellationToken).GetAwaiter().GetResult();
-                return Reissue(result);
+                var result = InvokeContinuation(payload);
+                return _issuedOutcome = Reissue(result);
             }
 
             public IEventInterception<TEvent> Replace(TEvent replacement, string reason)
             {
                 Ensure(EventInterceptionCapabilities.Replace);
-                var result = owner.InvokeAsync(replacement, index + 1, cancellationToken).GetAwaiter().GetResult();
-                return Reissue(result);
+                var result = InvokeContinuation(replacement);
+                return _issuedOutcome = Reissue(result);
+            }
+
+            private IEventInterception<TEvent> InvokeContinuation(TEvent nextPayload)
+            {
+                _continuationStarted = true;
+                _continuationTask = owner.InvokeAsync(nextPayload, index + 1, cancellationToken).AsTask();
+                try
+                {
+                    _continuationOutcome = _continuationTask.GetAwaiter().GetResult();
+                    return _continuationOutcome;
+                }
+                catch
+                {
+                    throw;
+                }
             }
 
             public IEventInterception<TEvent> Cancel(string code, string message)
             {
                 Ensure(EventInterceptionCapabilities.Cancel);
                 _used = true;
-                return KernelEventInterception<TEvent>.Cancelled(code, message, _authority);
+                return _issuedOutcome = KernelEventInterception<TEvent>.Cancelled(code, message, _authority);
             }
 
             public IEventInterception<TEvent> StopPropagation()
             {
                 Ensure(EventInterceptionCapabilities.StopPropagation);
                 _used = true;
-                return KernelEventInterception<TEvent>.Stopped(payload, _authority);
+                return _issuedOutcome = KernelEventInterception<TEvent>.Stopped(payload, _authority);
             }
 
-            private IEventInterception<TEvent> Reissue(IEventInterception<TEvent> result) =>
+            public IEventInterception<TEvent> Reissue(IEventInterception<TEvent> result) =>
                 result is KernelEventInterception<TEvent> trusted
                     ? KernelEventInterception<TEvent>.FromAuthority(
                         trusted.Kind,
@@ -400,13 +483,11 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                 if (_used)
                     throw new KernelControlException(
                         $"Event control for '{owner._definition.Descriptor.Key.Value}' was already consumed.");
-                if (!owner._definition.EffectiveCapabilities.HasFlag(capability) ||
-                    !owner._snapshot.EventGrants!.Any(grant =>
-                        grant.EventKey == owner._definition.Descriptor.Key &&
-                        grant.Capabilities.HasFlag(capability)))
+                if (!frame.EffectiveCapabilities.HasFlag(capability))
                 {
                     throw new KernelCapabilityException(
-                        $"Event '{owner._definition.Descriptor.Key.Value}' does not have effective capability '{capability}'.");
+                        $"Module '{frame.OwnerModuleId}' does not have effective capability '{capability}' " +
+                        $"for event '{owner._definition.Descriptor.Key.Value}'.");
                 }
                 _used = true;
             }
@@ -500,6 +581,13 @@ public sealed class KernelUntypedEventInterception : IUntypedEventInterception
     public EventInterceptionKind Kind { get; }
     public JsonElement? Payload { get; }
     public ExecutionError? Error { get; }
+}
+
+internal sealed class KernelEventOperationTimeoutException(
+    string message,
+    bool operationStillRunning) : TimeoutException(message)
+{
+    public bool OperationStillRunning { get; } = operationStillRunning;
 }
 
 public sealed class InMemoryEventDeliverySink : IKernelEventDeliverySink

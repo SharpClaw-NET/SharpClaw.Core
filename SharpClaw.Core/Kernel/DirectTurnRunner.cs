@@ -40,12 +40,37 @@ public sealed class DirectTurnRunner
     {
         ArgumentNullException.ThrowIfNull(input);
         var snapshot = _graph.ChatSnapshot;
-        return await RunStageAsync(
-            SharpClawActions.Chat.Turn,
-            input,
-            ct => RunCoreAsync(input, snapshot, ct),
-            snapshot.Actions,
-            cancellationToken);
+        var effectiveInput = input;
+        try
+        {
+            var stage = await RunStageWithInputAsync(
+                SharpClawActions.Chat.Turn,
+                input,
+                (replacedInput, ct) =>
+                {
+                    effectiveInput = replacedInput;
+                    return RunCoreAsync(replacedInput, snapshot, ct);
+                },
+                snapshot.Actions,
+                cancellationToken);
+            return stage.Result;
+        }
+        catch (OperationCanceledException)
+        {
+            await TryDispatchTerminalAsync(
+                new SharpClawActionKey("chat.turn.cancel"),
+                effectiveInput,
+                snapshot.Actions);
+            throw;
+        }
+        catch (Exception)
+        {
+            await TryDispatchTerminalAsync(
+                new SharpClawActionKey("chat.turn.fail"),
+                effectiveInput,
+                snapshot.Actions);
+            throw;
+        }
     }
 
     private async ValueTask<ChatTurnResult> RunCoreAsync(
@@ -53,33 +78,40 @@ public sealed class DirectTurnRunner
         ChatPipelineSnapshot snapshot,
         CancellationToken cancellationToken)
     {
-        var conversation = await RunStageAsync(
+        var conversationStage = await RunStageWithInputAsync(
             SharpClawActions.Chat.ResolveConversation,
             input,
-            ct => _conversationResolver.ResolveAsync(input, ct),
+            (effectiveInput, ct) => _conversationResolver.ResolveAsync(effectiveInput, ct),
             snapshot.Actions,
             cancellationToken);
-        var turn = new ChatTurnContext(Guid.NewGuid(), input, conversation);
-        var profile = await RunStageAsync(
+        var effectiveInput = conversationStage.Input;
+        var conversation = conversationStage.Result;
+        var turn = new ChatTurnContext(Guid.NewGuid(), effectiveInput, conversation);
+        var profileStage = await RunStageWithInputAsync(
             SharpClawActions.Chat.ResolveProfile,
             turn,
-            ct => _profileResolver.ResolveAsync(turn, ct),
+            (effectiveTurn, ct) => _profileResolver.ResolveAsync(effectiveTurn, ct),
             snapshot.Actions,
             cancellationToken);
-        var history = await RunStageAsync(
+        turn = profileStage.Input;
+        var profile = profileStage.Result;
+        var historyStage = await RunStageWithInputAsync(
             SharpClawActions.Chat.LoadHistory,
             turn,
-            ct => _conversationStore.LoadHistoryAsync(conversation.ConversationId, ct),
-            snapshot.Actions,
-            cancellationToken);
-        var context = await RunStageAsync(
-            SharpClawActions.Chat.AssembleContext,
-            new ChatContextRequest(conversation.ConversationId, profile, history, turn),
-            ct => _contextAssembler.BuildAsync(
-                new ChatContextRequest(conversation.ConversationId, profile, history, turn),
+            (effectiveTurn, ct) => _conversationStore.LoadHistoryAsync(
+                effectiveTurn.Conversation.ConversationId,
                 ct),
             snapshot.Actions,
             cancellationToken);
+        turn = historyStage.Input;
+        var history = historyStage.Result;
+        var contextStage = await RunStageWithInputAsync(
+            SharpClawActions.Chat.AssembleContext,
+            new ChatContextRequest(turn.Conversation.ConversationId, profile, history, turn),
+            (effectiveRequest, ct) => _contextAssembler.BuildAsync(effectiveRequest, ct),
+            snapshot.Actions,
+            cancellationToken);
+        var context = contextStage.Result;
         var selectedTools = await RunInputStageAsync(
             SharpClawActions.Chat.SelectTools,
             snapshot.Tools,
@@ -91,37 +123,48 @@ public sealed class DirectTurnRunner
             profile,
             context,
             selectedTools);
-        var completion = await RunStageAsync(
+        var providerStage = await RunStageWithInputAsync(
             SharpClawActions.Chat.ProviderRound,
             request,
-            ct => _providerLoop.RunAsync(request, _toolPipeline, ct),
+            (effectiveRequest, ct) => _providerLoop.RunAsync(effectiveRequest, _toolPipeline, ct),
             snapshot.Actions,
             cancellationToken);
-        var exchange = new ChatExchange(turn, input.Message, completion);
+        request = providerStage.Input;
+        turn = request.Turn;
+        profile = request.Profile;
+        context = request.Context;
+        var completion = providerStage.Result;
+        var exchange = new ChatExchange(turn, turn.Input.Message, completion);
         await RunStageAsync(
             SharpClawActions.Chat.CommitExchange,
             exchange,
-            async ct =>
+            async (effectiveExchange, ct) =>
             {
-                await _conversationStore.CommitExchangeAsync(exchange, ct);
+                await _conversationStore.CommitExchangeAsync(effectiveExchange, ct);
                 return true;
             },
             snapshot.Actions,
             cancellationToken);
-        return new ChatTurnResult(
+        var result = new ChatTurnResult(
             turn.TurnId,
-            conversation.ConversationId,
+            turn.Conversation.ConversationId,
             completion,
             context.Features);
+        return await RunStageAsync(
+            new SharpClawActionKey("chat.turn.complete"),
+            result,
+            static (effectiveResult, _) => ValueTask.FromResult(effectiveResult),
+            snapshot.Actions,
+            cancellationToken);
     }
 
     private ValueTask<TResult> RunStageAsync<TInput, TResult>(
         SharpClawActionKey key,
         TInput input,
-        Func<CancellationToken, ValueTask<TResult>> operation,
+        Func<TInput, CancellationToken, ValueTask<TResult>> operation,
         ActionPipelineSnapshot snapshot,
         CancellationToken cancellationToken) =>
-        RunStageCoreAsync(key, input, operation, snapshot, cancellationToken);
+        RunStageResultAsync(key, input, operation, snapshot, cancellationToken);
 
     private ValueTask<TResult> RunInputStageAsync<TInput, TResult>(
         SharpClawActionKey key,
@@ -138,31 +181,25 @@ public sealed class DirectTurnRunner
         ActionPipelineSnapshot snapshot,
         CancellationToken cancellationToken)
     {
-        var descriptor = _graph.GetStandardAction(key);
-        var result = await _dispatcher.RunRequiredAsync(
-            descriptor,
-            new KernelActionEnvelope(key, input),
-            async (envelope, ct) =>
-            {
-                var effectiveInput = envelope.Payload is TInput typed ? typed : input;
-                var value = await operation(effectiveInput, ct);
-                return value is null
-                    ? throw new KernelActionExecutionException($"Action '{key.Value}' returned no value.")
-                    : (object)value;
-            },
-            snapshot,
-            cancellationToken);
-        return result is TResult typed
-            ? typed
-            : throw new KernelActionExecutionException(
-                $"Action '{key.Value}' returned '{result?.GetType().FullName ?? "null"}' " +
-                $"instead of '{typeof(TResult).FullName}'.");
+        var stage = await RunStageWithInputAsync(key, input, operation, snapshot, cancellationToken);
+        return stage.Result;
     }
 
-    private async ValueTask<TResult> RunStageCoreAsync<TInput, TResult>(
+    private async ValueTask<TResult> RunStageResultAsync<TInput, TResult>(
         SharpClawActionKey key,
         TInput input,
-        Func<CancellationToken, ValueTask<TResult>> operation,
+        Func<TInput, CancellationToken, ValueTask<TResult>> operation,
+        ActionPipelineSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
+        var stage = await RunStageWithInputAsync(key, input, operation, snapshot, cancellationToken);
+        return stage.Result;
+    }
+
+    private async ValueTask<StageResult<TInput, TResult>> RunStageWithInputAsync<TInput, TResult>(
+        SharpClawActionKey key,
+        TInput input,
+        Func<TInput, CancellationToken, ValueTask<TResult>> operation,
         ActionPipelineSnapshot snapshot,
         CancellationToken cancellationToken)
     {
@@ -170,21 +207,51 @@ public sealed class DirectTurnRunner
         var result = await _dispatcher.RunRequiredAsync(
             descriptor,
             new KernelActionEnvelope(key, input),
-            async (_, ct) =>
+            async (envelope, ct) =>
             {
-                var value = await operation(ct);
-                return value is null
-                    ? throw new KernelActionExecutionException($"Action '{key.Value}' returned no value.")
-                    : (object)value;
+                var effectiveInput = envelope.Payload switch
+                {
+                    TInput typed => typed,
+                    KernelActionEnvelope nested when nested.Payload is TInput typed => typed,
+                    _ => throw new KernelActionExecutionException(
+                        $"Action '{key.Value}' returned an invalid replacement input.")
+                };
+                var value = await operation(effectiveInput, ct);
+                return (object)new StageResult<TInput, TResult>(effectiveInput, value);
             },
             snapshot,
             cancellationToken);
-        return result is TResult typed
-            ? typed
+        return result is StageResult<TInput, TResult> stage
+            ? stage
             : throw new KernelActionExecutionException(
                 $"Action '{key.Value}' returned '{result?.GetType().FullName ?? "null"}' " +
-                $"instead of '{typeof(TResult).FullName}'.");
+                $"instead of a stage result for '{typeof(TResult).FullName}'.");
     }
+
+    private sealed record StageResult<TInput, TResult>(TInput Input, TResult Result);
+
+    private async ValueTask TryDispatchTerminalAsync<TInput>(
+        SharpClawActionKey key,
+        TInput input,
+        ActionPipelineSnapshot snapshot)
+    {
+        if (!_graph.ContainsAction(key))
+            return;
+        try
+        {
+            var descriptor = _graph.GetStandardAction(key);
+            await _dispatcher.RunAsync(
+                descriptor,
+                new KernelActionEnvelope(key, input),
+                static (_, _) => ValueTask.FromResult<object>(true),
+                snapshot,
+                CancellationToken.None);
+        }
+        catch
+        {
+        }
+    }
+
 }
 
 public sealed class KernelChatContextAssembler : IChatContextAssembler

@@ -79,7 +79,7 @@ public sealed class KernelActionTests
     public async Task Defer_creates_a_store_neutral_continuation()
     {
         var key = new SharpClawActionKey("defer.action");
-        var host = new InMemoryContinuationHost(supportsDurableState: true);
+        var host = new StoreBackedContinuationHost(new TestDurableContinuationStore());
         var builder = new KernelGraphBuilder(false);
         builder.Add(Descriptor(key));
         builder.Hooks.For(key).Use<DeferInterceptor>(Order("defer"));
@@ -95,7 +95,7 @@ public sealed class KernelActionTests
 
         Assert.Equal(ActionOutcomeKind.Deferred, outcome.Kind);
         Assert.NotNull(outcome.Continuation);
-        Assert.True(host.TryGet(outcome.Continuation!.TokenId, out var state));
+        var state = await host.GetAsync(outcome.Continuation!.TokenId, CancellationToken.None);
         Assert.Equal(ContinuationState.Pending, state!.State);
     }
 
@@ -106,7 +106,9 @@ public sealed class KernelActionTests
         var builder = new KernelGraphBuilder(false);
         builder.Add(Descriptor(key));
         var graph = builder.Compile();
-        var dispatcher = new KernelActionDispatcher(graph, new InMemoryContinuationHost(true));
+        var dispatcher = new KernelActionDispatcher(
+            graph,
+            new StoreBackedContinuationHost(new TestDurableContinuationStore()));
 
         var outcome = await dispatcher.RunAsync(
             graph.GetStandardAction(key),
@@ -146,7 +148,19 @@ public sealed class KernelActionTests
         var registry = new KernelModuleRegistry();
         registry.Add(new SampleModule());
 
-        var graph = registry.Compile();
+        var graph = registry.Compile(
+            options: new KernelGraphCompileOptions
+            {
+                ActionModuleCapabilityGrants = new Dictionary<
+                    string,
+                    IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
+                {
+                    ["sample.module"] = new Dictionary<string, ActionInterceptionCapabilities>
+                    {
+                        ["module.action"] = KernelActionCapabilities
+                    }
+                }
+            });
 
         Assert.Single(registry.Modules);
         Assert.True(graph.ContainsAction(new SharpClawActionKey("module.action")));
