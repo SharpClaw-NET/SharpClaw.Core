@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text.Json;
 using SharpClaw.Contracts.Modules;
 using SharpClaw.Core.Kernel;
@@ -218,6 +219,53 @@ public sealed class KernelDispatchAuthorityTests
 
         Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
         Assert.Equal("ACTION_REPEAT_EVIDENCE_INVALID", outcome.Error?.Code);
+        Assert.Equal(0, terminalCalls);
+        Assert.Single(RepeatAuthorityInterceptor.Items);
+        Assert.Single(authority.Requests);
+    }
+
+    [Fact]
+    public async Task Repeat_evidence_must_remain_valid_after_minimum_backoff()
+    {
+        RepeatAuthorityInterceptor.Reset();
+        var key = new SharpClawActionKey("repeat.backoff-expiry");
+        var builder = new KernelGraphBuilder(false);
+        builder.Add(Descriptor(
+            key,
+            new ActionRepeatPolicy(
+                ActionRepeatKind.ConflictOnly,
+                2,
+                TimeSpan.FromMilliseconds(500),
+                "tenant-a")));
+        builder.Hooks.For(key).Use<RepeatAuthorityInterceptor>(Order("repeat"));
+        var graph = builder.Compile();
+        var authority = new ConfigurableRepeatEvidenceAuthority(
+            request => ValidEvidence(request) with
+            {
+                ExpiresAt = DateTimeOffset.UtcNow.AddMilliseconds(200)
+            });
+        var terminalCalls = 0;
+        var dispatcher = new KernelActionDispatcher(
+            graph,
+            Context("caller-a", "feature-a"),
+            repeatEvidenceAuthority: authority);
+        var elapsed = Stopwatch.StartNew();
+
+        var outcome = await dispatcher.RunAsync(
+            graph.GetStandardAction(key),
+            new KernelActionEnvelope(key, "conflict"),
+            (_, _) =>
+            {
+                terminalCalls++;
+                return ValueTask.FromResult<object>("done");
+            },
+            graph.ActionSnapshot,
+            CancellationToken.None);
+
+        elapsed.Stop();
+        Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
+        Assert.Equal("ACTION_REPEAT_EVIDENCE_INVALID", outcome.Error?.Code);
+        Assert.True(elapsed.Elapsed >= TimeSpan.FromMilliseconds(400));
         Assert.Equal(0, terminalCalls);
         Assert.Single(RepeatAuthorityInterceptor.Items);
         Assert.Single(authority.Requests);
@@ -543,6 +591,237 @@ public sealed class KernelContinuationRecoveryTests
             CancellationToken.None));
     }
 
+    [Fact]
+    public async Task Completed_outcome_recovers_destination_delivery_after_lease_expiry()
+    {
+        var store = new TestDurableContinuationStore();
+        var now = DateTimeOffset.UtcNow;
+        var firstHost = new StoreBackedContinuationHost(
+            store,
+            TimeSpan.FromSeconds(1),
+            retentionPeriod: TimeSpan.FromSeconds(5));
+        var recoveryHost = new StoreBackedContinuationHost(
+            store,
+            TimeSpan.FromSeconds(1),
+            retentionPeriod: TimeSpan.FromSeconds(5));
+        var request = Request(now, ContinuationExecutionStage.OutcomePersisted);
+        var token = await firstHost.CreateAsync(request, CancellationToken.None);
+        var pending = await firstHost.GetAsync(token.TokenId, CancellationToken.None);
+        var claim = Claim("worker-a", now.AddSeconds(1), 1, pending!.Revision, request.ContractHash);
+        var claimed = await firstHost.ClaimAsync(
+            token.TokenId,
+            token.Secret,
+            claim,
+            now,
+            CancellationToken.None);
+        claim = WithRevision(claim, claimed!.Revision);
+        var started = await firstHost.SetExecutionStateAsync(
+            token.TokenId,
+            token.Secret,
+            claim,
+            new KernelContinuationExecutionUpdate(
+                ContinuationExecutionStage.TerminalStarted,
+                ActionOutcomeCertainty.Uncertain),
+            now,
+            CancellationToken.None);
+        claim = WithRevision(claim, started!.Revision);
+        var persisted = await firstHost.SetExecutionStateAsync(
+            token.TokenId,
+            token.Secret,
+            claim,
+            new KernelContinuationExecutionUpdate(
+                ContinuationExecutionStage.OutcomePersisted,
+                ActionOutcomeCertainty.Certain,
+                PersistedOutcome: "stored-result"),
+            now,
+            CancellationToken.None);
+        claim = WithRevision(claim, persisted!.Revision);
+        var completed = await firstHost.CompleteAsync(
+            token.TokenId,
+            token.Secret,
+            claim,
+            "stored-result",
+            now,
+            CancellationToken.None);
+        Assert.Equal(ContinuationState.Completed, completed!.State);
+
+        var recoveryTime = now.AddSeconds(2);
+        var recoverable = await recoveryHost.ExpireAsync(
+            token.TokenId,
+            recoveryTime,
+            CancellationToken.None);
+        Assert.Equal(ContinuationState.Completed, recoverable!.State);
+        Assert.Equal(ContinuationExecutionStage.OutcomePersisted, recoverable.ExecutionStage);
+        Assert.Equal("stored-result", recoverable.CompletedOutcome);
+        Assert.Null(recoverable.ClaimOwner);
+        Assert.Null(recoverable.LeaseExpiresAt);
+        var deliveryClaim = Claim(
+            "worker-b",
+            recoveryTime.AddMinutes(1),
+            recoverable.Generation + 1,
+            recoverable.Revision,
+            request.ContractHash);
+        Assert.Null(await recoveryHost.ClaimAsync(
+            token.TokenId,
+            token.Secret,
+            deliveryClaim,
+            recoveryTime,
+            CancellationToken.None));
+        var deliveryClaimed = await recoveryHost.ClaimContinuationDeliveryAsync(
+            token.TokenId,
+            token.Secret,
+            deliveryClaim,
+            recoveryTime,
+            CancellationToken.None);
+
+        Assert.Equal(ContinuationState.Completed, deliveryClaimed!.State);
+        Assert.Equal("stored-result", deliveryClaimed.CompletedOutcome);
+        Assert.Equal(recoverable.Generation + 1, deliveryClaimed.Generation);
+        Assert.Null(await firstHost.BeginDeliveryAsync(
+            token.TokenId,
+            token.Secret,
+            WithRevision(claim, deliveryClaimed.Revision),
+            recoveryTime,
+            CancellationToken.None));
+        await AssertTerminalDeliveryAndCleanupAsync(
+            recoveryHost,
+            token,
+            WithRevision(deliveryClaim, deliveryClaimed.Revision),
+            deliveryClaimed,
+            recoveryTime);
+    }
+
+    [Fact]
+    public async Task Pending_cancellation_delivers_and_clears_protected_input()
+    {
+        var host = new StoreBackedContinuationHost(
+            new TestDurableContinuationStore(),
+            retentionPeriod: TimeSpan.FromSeconds(1));
+        var now = DateTimeOffset.UtcNow;
+        var request = Request(now, ContinuationExecutionStage.BeforeTerminal);
+        var token = await host.CreateAsync(request, CancellationToken.None);
+        var pending = await host.GetAsync(token.TokenId, CancellationToken.None);
+        var claim = Claim("operator", now.AddMinutes(1), 1, pending!.Revision, request.ContractHash);
+        var cancelled = await host.CancelAsync(
+            token.TokenId,
+            token.Secret,
+            claim,
+            now,
+            CancellationToken.None);
+
+        Assert.Equal(ContinuationState.Cancelled, cancelled!.State);
+        Assert.Equal(ContinuationExecutionStage.OutcomePersisted, cancelled.ExecutionStage);
+        Assert.Contains("cancelled", cancelled.CompletedOutcome, StringComparison.Ordinal);
+        await AssertTerminalDeliveryAndCleanupAsync(
+            host,
+            token,
+            WithRevision(claim, cancelled.Revision),
+            cancelled,
+            now);
+    }
+
+    [Fact]
+    public async Task Recovered_cancellation_delivers_and_clears_protected_input()
+    {
+        var store = new TestDurableContinuationStore();
+        var now = DateTimeOffset.UtcNow;
+        var firstHost = new StoreBackedContinuationHost(store, TimeSpan.FromSeconds(1));
+        var recoveryHost = new StoreBackedContinuationHost(
+            store,
+            TimeSpan.FromSeconds(1),
+            retentionPeriod: TimeSpan.FromSeconds(1));
+        var request = Request(now, ContinuationExecutionStage.BeforeTerminal);
+        var token = await firstHost.CreateAsync(request, CancellationToken.None);
+        var pending = await firstHost.GetAsync(token.TokenId, CancellationToken.None);
+        var claim = Claim("worker-a", now.AddSeconds(1), 1, pending!.Revision, request.ContractHash);
+        var claimed = await firstHost.ClaimAsync(
+            token.TokenId,
+            token.Secret,
+            claim,
+            now,
+            CancellationToken.None);
+        claim = WithRevision(claim, claimed!.Revision);
+        var cancelRequested = await firstHost.CancelAsync(
+            token.TokenId,
+            token.Secret,
+            claim,
+            now,
+            CancellationToken.None);
+        var recoveryTime = now.AddSeconds(2);
+        var abandoned = await recoveryHost.ExpireAsync(
+            token.TokenId,
+            recoveryTime,
+            CancellationToken.None);
+        var recoveryClaim = Claim(
+            "worker-b",
+            recoveryTime.AddMinutes(1),
+            abandoned!.Generation + 1,
+            abandoned.Revision,
+            request.ContractHash);
+        var recoveryClaimed = await recoveryHost.ClaimContinuationRecoveryAsync(
+            token.TokenId,
+            token.Secret,
+            recoveryClaim,
+            recoveryTime,
+            CancellationToken.None);
+        recoveryClaim = WithRevision(recoveryClaim, recoveryClaimed!.Revision);
+        var recovered = await recoveryHost.RecoverContinuationAsync(
+            token.TokenId,
+            token.Secret,
+            recoveryClaim,
+            recoveryTime,
+            CancellationToken.None);
+
+        Assert.Equal(ContinuationState.CancelRequested, cancelRequested!.State);
+        Assert.Equal(ContinuationState.Cancelled, recovered!.State);
+        Assert.Contains("cancelled", recovered.CompletedOutcome, StringComparison.Ordinal);
+        await AssertTerminalDeliveryAndCleanupAsync(
+            recoveryHost,
+            token,
+            WithRevision(recoveryClaim, recovered.Revision),
+            recovered,
+            recoveryTime);
+    }
+
+    [Fact]
+    public async Task Unclaimed_expiry_delivers_and_clears_protected_input()
+    {
+        var host = new StoreBackedContinuationHost(
+            new TestDurableContinuationStore(),
+            retentionPeriod: TimeSpan.FromSeconds(1));
+        var now = DateTimeOffset.UtcNow;
+        var request = Request(now, ContinuationExecutionStage.BeforeTerminal) with
+        {
+            Defer = new ActionDeferRequest(now.AddSeconds(1), "wait")
+        };
+        var token = await host.CreateAsync(request, CancellationToken.None);
+        var expired = await host.ExpireAsync(
+            token.TokenId,
+            now.AddSeconds(2),
+            CancellationToken.None);
+        var deliveryClaim = Claim(
+            "delivery-worker",
+            now.AddMinutes(1),
+            expired!.Generation + 1,
+            expired.Revision,
+            request.ContractHash);
+        var deliveryClaimed = await host.ClaimContinuationDeliveryAsync(
+            token.TokenId,
+            token.Secret,
+            deliveryClaim,
+            now.AddSeconds(2),
+            CancellationToken.None);
+
+        Assert.Equal(ContinuationState.Expired, deliveryClaimed!.State);
+        Assert.Contains("expired", deliveryClaimed.CompletedOutcome, StringComparison.Ordinal);
+        await AssertTerminalDeliveryAndCleanupAsync(
+            host,
+            token,
+            WithRevision(deliveryClaim, deliveryClaimed.Revision),
+            deliveryClaimed,
+            now.AddSeconds(2));
+    }
+
     [Theory]
     [InlineData(ContinuationExecutionStage.BeforeTerminal, ContinuationState.Pending)]
     [InlineData(ContinuationExecutionStage.TerminalStarted, ContinuationState.OutcomeUncertain)]
@@ -637,6 +916,33 @@ public sealed class KernelContinuationRecoveryTests
             token.TokenId,
             recoveryTime,
             CancellationToken.None);
+        if (stage == ContinuationExecutionStage.DeliveryStarted)
+        {
+            Assert.Equal(ContinuationState.Completed, abandoned!.State);
+            Assert.Equal(ContinuationExecutionStage.OutcomePersisted, abandoned.ExecutionStage);
+            Assert.Null(abandoned.RecoveryReference);
+            Assert.Equal("persisted-outcome", abandoned.CompletedOutcome);
+            var deliveryClaim = Claim(
+                "worker-b",
+                recoveryTime.AddMinutes(1),
+                abandoned.Generation + 1,
+                abandoned.Revision,
+                request.ContractHash);
+            var deliveryClaimed = await recoveryHost.ClaimContinuationDeliveryAsync(
+                token.TokenId,
+                token.Secret,
+                deliveryClaim,
+                recoveryTime,
+                CancellationToken.None);
+            Assert.NotNull(deliveryClaimed);
+            await AssertDestinationOnlyDeliveryAsync(
+                recoveryHost,
+                token,
+                WithRevision(deliveryClaim, deliveryClaimed!.Revision),
+                recoveryTime);
+            return;
+        }
+
         Assert.Equal(ContinuationState.OutcomeUncertain, abandoned!.State);
         Assert.Equal(stage, abandoned.ExecutionStage);
         Assert.NotNull(abandoned.RecoveryReference);
@@ -704,16 +1010,62 @@ public sealed class KernelContinuationRecoveryTests
                 Assert.Equal("persisted-outcome", recovered.CompletedOutcome);
                 Assert.Equal(ActionOutcomeCertainty.Certain, recovered.OutcomeCertainty);
                 break;
-            case ContinuationExecutionStage.DeliveryStarted:
-                await AssertDestinationOnlyDeliveryAsync(
-                    recoveryHost,
-                    token,
-                    WithRevision(recoveryClaim, recovered.Revision),
-                    recoveryTime);
-                break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(stage), stage, null);
         }
+    }
+
+    private static async ValueTask AssertTerminalDeliveryAndCleanupAsync(
+        StoreBackedContinuationHost host,
+        ContinuationToken token,
+        KernelContinuationClaim claim,
+        KernelContinuationState terminal,
+        DateTimeOffset now)
+    {
+        var deliveryStarted = await host.BeginDeliveryAsync(
+            token.TokenId,
+            token.Secret,
+            claim,
+            now,
+            CancellationToken.None);
+        Assert.Equal(terminal.State, deliveryStarted!.State);
+        Assert.Equal(terminal.CompletedOutcome, deliveryStarted.CompletedOutcome);
+        Assert.Equal(ContinuationExecutionStage.DeliveryStarted, deliveryStarted.ExecutionStage);
+        claim = WithRevision(claim, deliveryStarted.Revision);
+        var delivered = await host.DeliverAsync(
+            token.TokenId,
+            token.Secret,
+            claim,
+            now,
+            CancellationToken.None);
+        Assert.Equal(ContinuationState.Delivered, delivered!.State);
+        Assert.Equal(terminal.CompletedOutcome, delivered.CompletedOutcome);
+        claim = WithRevision(claim, delivered.Revision);
+        var acknowledged = await host.AcknowledgeAsync(
+            token.TokenId,
+            token.Secret,
+            claim,
+            now,
+            CancellationToken.None);
+        Assert.NotNull(acknowledged!.DeliveryAcknowledgedAt);
+        claim = WithRevision(claim, acknowledged.Revision);
+        Assert.False(await host.DeleteAsync(
+            token.TokenId,
+            token.Secret,
+            claim,
+            terminal.RetainUntil.AddTicks(-1),
+            CancellationToken.None));
+        Assert.True(await host.DeleteAsync(
+            token.TokenId,
+            token.Secret,
+            claim,
+            terminal.RetainUntil,
+            CancellationToken.None));
+        var deleted = await host.GetAsync(token.TokenId, CancellationToken.None);
+        Assert.Equal(ContinuationState.Deleted, deleted!.State);
+        Assert.Null(deleted.ProtectedInput);
+        Assert.Null(deleted.Request.ProtectedInput);
+        Assert.Null(deleted.CompletedOutcome);
     }
 
     private static async ValueTask AssertDestinationOnlyDeliveryAsync(
@@ -728,7 +1080,7 @@ public sealed class KernelContinuationRecoveryTests
             claim,
             now,
             CancellationToken.None);
-        Assert.Equal(ContinuationState.Claimed, deliveryStarted!.State);
+        Assert.Equal(ContinuationState.Completed, deliveryStarted!.State);
         Assert.Equal(ContinuationExecutionStage.DeliveryStarted, deliveryStarted.ExecutionStage);
         claim = WithRevision(claim, deliveryStarted.Revision);
         var delivered = await host.DeliverAsync(

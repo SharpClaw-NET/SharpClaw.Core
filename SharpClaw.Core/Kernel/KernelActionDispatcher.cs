@@ -1044,6 +1044,14 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                     backoff = policy.MinimumBackoff;
                 if (backoff > TimeSpan.Zero)
                     await Task.Delay(backoff, cancellationToken);
+                if (!ValidEvidence(evidenceRequest, evidence, DateTimeOffset.UtcNow))
+                {
+                    return Issue(KernelActionOutcome<TResult>.FailedBy(
+                        new ExecutionError(
+                            "ACTION_REPEAT_EVIDENCE_INVALID",
+                            "The host evidence expired before the next action attempt started."),
+                        _authority));
+                }
                 var outcome = await owner.InvokeAttemptAsync(
                     request.Value,
                     new ActionAttempt(
