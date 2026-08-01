@@ -10,9 +10,9 @@ public sealed class DirectTurnRunner
     private readonly IConversationResolver _conversationResolver;
     private readonly IChatProfileResolver _profileResolver;
     private readonly IConversationStore _conversationStore;
-    private readonly IChatContextAssembler _contextAssembler;
-    private readonly IProviderRoundLoop _providerLoop;
-    private readonly IUnifiedToolPipeline _toolPipeline;
+    private readonly KernelChatContextAssembler _contextAssembler;
+    private readonly ProviderRoundLoop _providerLoop;
+    private readonly UnifiedToolPipeline _toolPipeline;
 
     public DirectTurnRunner(
         KernelGraph graph,
@@ -20,9 +20,9 @@ public sealed class DirectTurnRunner
         IConversationResolver conversationResolver,
         IChatProfileResolver profileResolver,
         IConversationStore conversationStore,
-        IChatContextAssembler contextAssembler,
-        IProviderRoundLoop providerLoop,
-        IUnifiedToolPipeline toolPipeline)
+        KernelChatContextAssembler contextAssembler,
+        ProviderRoundLoop providerLoop,
+        UnifiedToolPipeline toolPipeline)
     {
         _graph = graph ?? throw new ArgumentNullException(nameof(graph));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
@@ -55,6 +55,14 @@ public sealed class DirectTurnRunner
                 cancellationToken);
             return stage.Result;
         }
+        catch (KernelActionCancelledException)
+        {
+            await TryDispatchTerminalAsync(
+                new SharpClawActionKey("chat.turn.cancel"),
+                effectiveInput,
+                snapshot.Actions);
+            throw;
+        }
         catch (OperationCanceledException)
         {
             await TryDispatchTerminalAsync(
@@ -63,11 +71,23 @@ public sealed class DirectTurnRunner
                 snapshot.Actions);
             throw;
         }
-        catch (Exception)
+        catch (KernelActionDeferredException)
+        {
+            throw;
+        }
+        catch (ActionOutcomeUncertainException)
+        {
+            throw;
+        }
+        catch (Exception exception)
         {
             await TryDispatchTerminalAsync(
                 new SharpClawActionKey("chat.turn.fail"),
-                effectiveInput,
+                new KernelChatFailure(
+                    exception is KernelActionFailedException failed
+                        ? failed.Error.Code
+                        : "CHAT_TURN_FAILED",
+                    exception.Message),
                 snapshot.Actions);
             throw;
         }
@@ -87,6 +107,18 @@ public sealed class DirectTurnRunner
         var effectiveInput = conversationStage.Input;
         var conversation = conversationStage.Result;
         var turn = new ChatTurnContext(Guid.NewGuid(), effectiveInput, conversation);
+        var userMessage = await RunStageAsync(
+            new SharpClawActionKey("chat.user_message.prepare"),
+            new KernelChatUserMessage(turn, effectiveInput.Message),
+            static (value, _) => ValueTask.FromResult(value),
+            snapshot.Actions,
+            cancellationToken);
+        await RunStageAsync(
+            new SharpClawActionKey("chat.user_message.commit"),
+            userMessage,
+            static (value, _) => ValueTask.FromResult(value),
+            snapshot.Actions,
+            cancellationToken);
         var profileStage = await RunStageWithInputAsync(
             SharpClawActions.Chat.ResolveProfile,
             turn,
@@ -98,23 +130,28 @@ public sealed class DirectTurnRunner
         var historyStage = await RunStageWithInputAsync(
             SharpClawActions.Chat.LoadHistory,
             turn,
-            (effectiveTurn, ct) => _conversationStore.LoadHistoryAsync(
+            (effectiveTurn, ct) => RunStageAsync(
+                new SharpClawActionKey("conversation.history.query"),
                 effectiveTurn.Conversation.ConversationId,
+                (conversationId, queryCt) => _conversationStore.LoadHistoryAsync(conversationId, queryCt),
+                snapshot.Actions,
                 ct),
             snapshot.Actions,
             cancellationToken);
         turn = historyStage.Input;
         var history = historyStage.Result;
-        var contextStage = await RunStageWithInputAsync(
-            SharpClawActions.Chat.AssembleContext,
+        var context = await _contextAssembler.BuildAsync(
             new ChatContextRequest(turn.Conversation.ConversationId, profile, history, turn),
-            (effectiveRequest, ct) => _contextAssembler.BuildAsync(effectiveRequest, ct),
+            cancellationToken);
+        var collectedTools = await RunInputStageAsync(
+            new SharpClawActionKey("chat.tools.collect"),
+            snapshot.Tools,
+            (tools, _) => ValueTask.FromResult<IReadOnlyList<ToolDescriptor>>(tools),
             snapshot.Actions,
             cancellationToken);
-        var context = contextStage.Result;
         var selectedTools = await RunInputStageAsync(
             SharpClawActions.Chat.SelectTools,
-            snapshot.Tools,
+            collectedTools,
             (tools, _) => ValueTask.FromResult<IReadOnlyList<ToolDescriptor>>(tools),
             snapshot.Actions,
             cancellationToken);
@@ -126,7 +163,16 @@ public sealed class DirectTurnRunner
         var providerStage = await RunStageWithInputAsync(
             SharpClawActions.Chat.ProviderRound,
             request,
-            (effectiveRequest, ct) => _providerLoop.RunAsync(effectiveRequest, _toolPipeline, ct),
+            async (effectiveRequest, ct) =>
+            {
+                var value = await _providerLoop.RunAsync(effectiveRequest, _toolPipeline, ct);
+                return await RunStageAsync(
+                    new SharpClawActionKey("chat.provider_round.complete"),
+                    value,
+                    static (completion, _) => ValueTask.FromResult(completion),
+                    snapshot.Actions,
+                    ct);
+            },
             snapshot.Actions,
             cancellationToken);
         request = providerStage.Input;
@@ -134,13 +180,33 @@ public sealed class DirectTurnRunner
         profile = request.Profile;
         context = request.Context;
         var completion = providerStage.Result;
-        var exchange = new ChatExchange(turn, turn.Input.Message, completion);
+        var exchange = await RunStageAsync(
+            new SharpClawActionKey("chat.assistant_message.prepare"),
+            new ChatExchange(turn, turn.Input.Message, completion),
+            static (value, _) => ValueTask.FromResult(value),
+            snapshot.Actions,
+            cancellationToken);
+        exchange = await RunStageAsync(
+            new SharpClawActionKey("conversation.message.prepare"),
+            exchange,
+            static (value, _) => ValueTask.FromResult(value),
+            snapshot.Actions,
+            cancellationToken);
         await RunStageAsync(
             SharpClawActions.Chat.CommitExchange,
             exchange,
             async (effectiveExchange, ct) =>
             {
-                await _conversationStore.CommitExchangeAsync(effectiveExchange, ct);
+                await RunStageAsync(
+                    new SharpClawActionKey("conversation.message.commit"),
+                    effectiveExchange,
+                    async (value, commitCt) =>
+                    {
+                        await _conversationStore.CommitExchangeAsync(value, commitCt);
+                        return true;
+                    },
+                    snapshot.Actions,
+                    ct);
                 return true;
             },
             snapshot.Actions,
@@ -204,28 +270,28 @@ public sealed class DirectTurnRunner
         CancellationToken cancellationToken)
     {
         var descriptor = _graph.GetStandardAction(key);
+        var effectiveInput = input;
         var result = await _dispatcher.RunRequiredAsync(
             descriptor,
             new KernelActionEnvelope(key, input),
             async (envelope, ct) =>
             {
-                var effectiveInput = envelope.Payload switch
+                effectiveInput = envelope.Payload switch
                 {
                     TInput typed => typed,
                     KernelActionEnvelope nested when nested.Payload is TInput typed => typed,
                     _ => throw new KernelActionExecutionException(
                         $"Action '{key.Value}' returned an invalid replacement input.")
                 };
-                var value = await operation(effectiveInput, ct);
-                return (object)new StageResult<TInput, TResult>(effectiveInput, value);
+                return (object)(await operation(effectiveInput, ct))!;
             },
             snapshot,
             cancellationToken);
-        return result is StageResult<TInput, TResult> stage
-            ? stage
+        return result is TResult value
+            ? new StageResult<TInput, TResult>(effectiveInput, value)
             : throw new KernelActionExecutionException(
                 $"Action '{key.Value}' returned '{result?.GetType().FullName ?? "null"}' " +
-                $"instead of a stage result for '{typeof(TResult).FullName}'.");
+                $"instead of '{typeof(TResult).FullName}'.");
     }
 
     private sealed record StageResult<TInput, TResult>(TInput Input, TResult Result);
@@ -256,10 +322,20 @@ public sealed class DirectTurnRunner
 
 public sealed class KernelChatContextAssembler : IChatContextAssembler
 {
+    private static readonly SharpClawActionKey AssembleStart = new("chat.context.assemble.start");
+    private static readonly SharpClawActionKey ContributorInvoke = new("chat.context.contributor.invoke");
+    private static readonly SharpClawActionKey AssembleComplete = new("chat.context.assemble.complete");
+    private readonly KernelGraph _graph;
+    private readonly KernelActionDispatcher _dispatcher;
     private readonly IReadOnlyList<IChatContextContributor> _contributors;
 
-    public KernelChatContextAssembler(IEnumerable<IChatContextContributor> contributors)
+    public KernelChatContextAssembler(
+        KernelGraph graph,
+        KernelActionDispatcher dispatcher,
+        IEnumerable<IChatContextContributor> contributors)
     {
+        _graph = graph ?? throw new ArgumentNullException(nameof(graph));
+        _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _contributors = contributors?.ToArray()
             ?? throw new ArgumentNullException(nameof(contributors));
     }
@@ -268,19 +344,100 @@ public sealed class KernelChatContextAssembler : IChatContextAssembler
         ChatContextRequest request,
         CancellationToken cancellationToken)
     {
+        var descriptor = _graph.GetStandardAction(AssembleStart);
+        var result = await _dispatcher.RunRequiredAsync(
+            descriptor,
+            new KernelActionEnvelope(AssembleStart, request),
+            async (envelope, ct) => (object)await BuildCoreAsync(
+                ExtractContextRequest(envelope),
+                ct),
+            _graph.ActionSnapshot,
+            cancellationToken);
+        return result as ChatContextContribution
+            ?? throw new KernelActionExecutionException(
+                "The context assembly action returned an invalid contribution.");
+    }
+
+    private async ValueTask<ChatContextContribution> BuildCoreAsync(
+        ChatContextRequest request,
+        CancellationToken cancellationToken)
+    {
         var systemPromptSegments = new List<SystemPromptSegment>();
         var messages = new List<ChatCompletionMessage>(request.History);
         if (!string.IsNullOrWhiteSpace(request.Profile.SystemPrompt))
             systemPromptSegments.Add(new SystemPromptSegment("profile.system", request.Profile.SystemPrompt));
         var features = new List<ExtensionFeature>();
-        foreach (var contributor in _contributors)
+        for (var index = 0; index < _contributors.Count; index++)
         {
-            var contribution = await contributor.ContributeAsync(request, cancellationToken);
+            var contributor = _contributors[index];
+            var invocation = new KernelChatContributorInvocation(
+                request,
+                index,
+                contributor.GetType().AssemblyQualifiedName ?? contributor.GetType().FullName ?? contributor.GetType().Name);
+            var descriptor = _graph.GetStandardAction(ContributorInvoke);
+            var result = await _dispatcher.RunRequiredAsync(
+                descriptor,
+                new KernelActionEnvelope(ContributorInvoke, invocation),
+                async (envelope, ct) =>
+                {
+                    var effective = ExtractContributorInvocation(envelope);
+                    if (effective.ContributorIndex != index ||
+                        !string.Equals(effective.ContributorType, invocation.ContributorType, StringComparison.Ordinal))
+                        throw new KernelActionExecutionException(
+                            "A context contributor replacement cannot select a different contributor.");
+                    return (object)await contributor.ContributeAsync(effective.Request, ct);
+                },
+                _graph.ActionSnapshot,
+                cancellationToken);
+            var contribution = result as ChatContextContribution
+                ?? throw new KernelActionExecutionException(
+                    "The context contributor action returned an invalid contribution.");
             systemPromptSegments.AddRange(contribution.SystemPromptSegments);
             messages.AddRange(contribution.Messages);
             features.AddRange(contribution.Features);
         }
 
-        return new ChatContextContribution(systemPromptSegments, messages, features);
+        var assembled = new ChatContextContribution(systemPromptSegments, messages, features);
+        var completeDescriptor = _graph.GetStandardAction(AssembleComplete);
+        var completed = await _dispatcher.RunRequiredAsync(
+            completeDescriptor,
+            new KernelActionEnvelope(AssembleComplete, assembled),
+            static (envelope, _) => ValueTask.FromResult<object>(
+                envelope.Payload is ChatContextContribution value
+                    ? value
+                    : throw new KernelActionExecutionException(
+                        "The context completion action received an invalid contribution.")),
+            _graph.ActionSnapshot,
+            cancellationToken);
+        return completed as ChatContextContribution
+            ?? throw new KernelActionExecutionException(
+                "The context completion action returned an invalid contribution.");
     }
+
+    private static ChatContextRequest ExtractContextRequest(KernelActionEnvelope envelope) =>
+        envelope.Payload switch
+        {
+            ChatContextRequest request => request,
+            KernelActionEnvelope nested when nested.Payload is ChatContextRequest request => request,
+            _ => throw new KernelActionExecutionException(
+                "The context assembly action received an invalid request.")
+        };
+
+    private static KernelChatContributorInvocation ExtractContributorInvocation(KernelActionEnvelope envelope) =>
+        envelope.Payload switch
+        {
+            KernelChatContributorInvocation invocation => invocation,
+            KernelActionEnvelope nested when nested.Payload is KernelChatContributorInvocation invocation => invocation,
+            _ => throw new KernelActionExecutionException(
+                "The context contributor action received an invalid invocation.")
+        };
 }
+
+public sealed record KernelChatUserMessage(ChatTurnContext Turn, string Message);
+
+public sealed record KernelChatContributorInvocation(
+    ChatContextRequest Request,
+    int ContributorIndex,
+    string ContributorType);
+
+public sealed record KernelChatFailure(string Code, string Message);

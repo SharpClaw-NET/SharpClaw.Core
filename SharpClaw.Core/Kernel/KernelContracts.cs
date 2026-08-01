@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.DependencyInjection;
 using SharpClaw.Contracts.Modules;
 using SharpClaw.Contracts.Providers;
@@ -8,6 +9,65 @@ using SharpClaw.Contracts.Providers;
 namespace SharpClaw.Core.Kernel;
 
 public sealed record KernelActionEnvelope(SharpClawActionKey Key, object? Payload);
+
+public sealed record KernelActionLifecycleEvent(
+    Guid InvocationId,
+    Guid? ParentInvocationId,
+    Guid TraceId,
+    SharpClawActionKey ActionKey,
+    int ActionVersion,
+    ActionOutcomeKind? OutcomeKind,
+    ExecutionError? Error,
+    ContinuationToken? Continuation,
+    ActionUncertainty? Uncertainty,
+    DateTimeOffset Timestamp);
+
+public static class KernelActionLifecycleEvents
+{
+    private static readonly IReadOnlyDictionary<string, EventDescriptor<KernelActionLifecycleEvent>>
+        DescriptorMap = new ReadOnlyDictionary<string, EventDescriptor<KernelActionLifecycleEvent>>(
+            new Dictionary<string, EventDescriptor<KernelActionLifecycleEvent>>(StringComparer.Ordinal)
+            {
+                [SharpClawEvents.ActionStarting.Value] = Create(SharpClawEvents.ActionStarting),
+                [SharpClawEvents.ActionCompleted.Value] = Create(SharpClawEvents.ActionCompleted),
+                [SharpClawEvents.ActionDeferred.Value] = Create(SharpClawEvents.ActionDeferred),
+                [SharpClawEvents.ActionFailed.Value] = Create(SharpClawEvents.ActionFailed),
+                [SharpClawEvents.ActionCancelled.Value] = Create(SharpClawEvents.ActionCancelled)
+            });
+
+    public static IReadOnlyList<EventDescriptor<KernelActionLifecycleEvent>> Descriptors { get; } =
+        DescriptorMap.Values.OrderBy(value => value.Key.Value, StringComparer.Ordinal).ToArray();
+
+    public static EventDescriptor<KernelActionLifecycleEvent> DescriptorFor(SharpClawEventKey key) =>
+        DescriptorMap.TryGetValue(key.Value, out var descriptor)
+            ? descriptor
+            : throw new KernelActionExecutionException(
+                $"Action lifecycle event '{key.Value}' is not registered.");
+
+    public static EventDescriptor<KernelActionLifecycleEvent> ForOutcome(ActionOutcomeKind kind) =>
+        DescriptorFor(kind switch
+        {
+            ActionOutcomeKind.Completed => SharpClawEvents.ActionCompleted,
+            ActionOutcomeKind.Cancelled => SharpClawEvents.ActionCancelled,
+            ActionOutcomeKind.Deferred => SharpClawEvents.ActionDeferred,
+            ActionOutcomeKind.Failed or ActionOutcomeKind.Uncertain => SharpClawEvents.ActionFailed,
+            _ => SharpClawEvents.ActionFailed
+        });
+
+    private static EventDescriptor<KernelActionLifecycleEvent> Create(SharpClawEventKey key) =>
+        new(
+            key,
+            1,
+            "action.lifecycle",
+            EventInterceptionCapabilities.Inspect |
+            EventInterceptionCapabilities.Observe,
+            false,
+            false)
+        {
+            ProtocolVersionRange = ContractVersionRange.Exact(1),
+            DeliveryClasses = [EventDelivery.Inline, EventDelivery.Queued, EventDelivery.Durable]
+        };
+}
 
 public sealed record KernelCoverageEntry(string Id, string Boundary, SharpClawActionKey ActionKey);
 
@@ -38,6 +98,12 @@ public static class KernelActionCatalog
             .. SharpClawActionCatalog.Kernel
         ]);
 
+    public static IReadOnlyList<KernelStandardActionManifestEntry> Descriptors =>
+        KernelStandardActionManifest.Entries;
+
+    public static KernelStandardActionManifestEntry DescriptorFor(SharpClawActionKey key) =>
+        KernelStandardActionManifest.Get(key);
+
     public static string CategoryFor(SharpClawActionKey key) =>
         key.Value switch
         {
@@ -62,28 +128,7 @@ public static class KernelActionCatalog
         };
 
     public static ActionInterceptionCapabilities StandardCapabilities(SharpClawActionKey key) =>
-        key.Value switch
-        {
-            var value when value.StartsWith("security.secret.", StringComparison.Ordinal) =>
-                ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap |
-                ActionInterceptionCapabilities.Cancel | ActionInterceptionCapabilities.Observe,
-            var value when value.StartsWith("storage.", StringComparison.Ordinal) =>
-                ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap |
-                ActionInterceptionCapabilities.ReplaceInput | ActionInterceptionCapabilities.ReplaceResult |
-                ActionInterceptionCapabilities.Cancel | ActionInterceptionCapabilities.Observe,
-            var value when value.StartsWith("provider.", StringComparison.Ordinal) =>
-                ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap |
-                ActionInterceptionCapabilities.ReplaceInput | ActionInterceptionCapabilities.ReplaceResult |
-                ActionInterceptionCapabilities.Cancel | ActionInterceptionCapabilities.Observe,
-            var value when value.StartsWith("runtime.request.", StringComparison.Ordinal) ||
-                          value.StartsWith("gateway.request.", StringComparison.Ordinal) =>
-                ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap |
-                ActionInterceptionCapabilities.ReplaceInput | ActionInterceptionCapabilities.ReplaceResult |
-                ActionInterceptionCapabilities.Cancel | ActionInterceptionCapabilities.Observe,
-            _ => ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap |
-                 ActionInterceptionCapabilities.ReplaceInput | ActionInterceptionCapabilities.ReplaceResult |
-                 ActionInterceptionCapabilities.Cancel | ActionInterceptionCapabilities.Observe
-        };
+        DescriptorFor(key).Capabilities;
 
     public static bool StandardSensitive(SharpClawActionKey key) =>
         key.Value.StartsWith("security.", StringComparison.Ordinal) ||
@@ -118,14 +163,16 @@ public sealed class KernelGraphCompileOptions
 
     /// <summary>Module manifest grants keyed by module id and action key.</summary>
     public IReadOnlyDictionary<string, IReadOnlyDictionary<string, ActionInterceptionCapabilities>>?
-        ActionModuleCapabilityGrants { get; init; }
+        ActionModuleCapabilityGrants
+    { get; init; }
 
     /// <summary>Administrator grants keyed by event key. A missing key uses the descriptor grant.</summary>
     public IReadOnlyDictionary<string, EventInterceptionCapabilities>? EventCapabilityGrants { get; init; }
 
     /// <summary>Module manifest grants keyed by module id and event key.</summary>
     public IReadOnlyDictionary<string, IReadOnlyDictionary<string, EventInterceptionCapabilities>>?
-        EventModuleCapabilityGrants { get; init; }
+        EventModuleCapabilityGrants
+    { get; init; }
 
     /// <summary>Exact sensitive action approvals bound to module, version, and schema identity.</summary>
     public IReadOnlyList<KernelSensitiveActionApproval> SensitiveActionApprovals { get; init; } = [];
@@ -471,6 +518,39 @@ public sealed class KernelActionExecutionException(string message) : InvalidOper
 
 public sealed class KernelCapabilityException(string message) : InvalidOperationException(message);
 
+public sealed class KernelActionCancelledException : OperationCanceledException
+{
+    public KernelActionCancelledException(ExecutionError error)
+        : base(error.Message)
+    {
+        Error = error;
+    }
+
+    public ExecutionError Error { get; }
+}
+
+public sealed class KernelActionDeferredException : Exception
+{
+    public KernelActionDeferredException(ContinuationToken continuation)
+        : base("The action was deferred to a durable continuation.")
+    {
+        Continuation = continuation;
+    }
+
+    public ContinuationToken Continuation { get; }
+}
+
+public sealed class KernelActionFailedException : Exception
+{
+    public KernelActionFailedException(ExecutionError error)
+        : base(error.Message)
+    {
+        Error = error;
+    }
+
+    public ExecutionError Error { get; }
+}
+
 internal static class KernelServiceResolution
 {
     public static object Resolve(Type serviceType, IServiceProvider? serviceProvider)
@@ -481,8 +561,10 @@ internal static class KernelServiceResolution
 
         try
         {
-            return Activator.CreateInstance(serviceType)
-                ?? throw new KernelGraphCompilationException($"Cannot create service '{serviceType.FullName}'.");
+            return serviceProvider is null
+                ? (Activator.CreateInstance(serviceType)
+                   ?? throw new KernelGraphCompilationException($"Cannot create service '{serviceType.FullName}'."))
+                : ActivatorUtilities.CreateInstance(serviceProvider, serviceType);
         }
         catch (Exception exception) when (exception is MissingMethodException or MemberAccessException)
         {
@@ -497,7 +579,7 @@ internal static class KernelServiceResolution
 
 internal static class KernelJson
 {
-    public static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.General);
+    public static readonly JsonSerializerOptions Options = CreateOptions();
 
     public static JsonElement Serialize(object? value) =>
         JsonSerializer.SerializeToElement(value, Options);
@@ -508,6 +590,16 @@ internal static class KernelJson
             : value.Deserialize<T>(Options)
               ?? throw new KernelActionExecutionException(
                   $"The action input cannot deserialize as '{typeof(T).FullName}'.");
+
+    public static object? Deserialize(JsonElement value, Type type)
+    {
+        ArgumentNullException.ThrowIfNull(type);
+        if (type == typeof(object))
+            return DeserializeObject(value);
+        return value.Deserialize(type, Options)
+               ?? throw new KernelActionExecutionException(
+                   $"The action input cannot deserialize as '{type.FullName}'.");
+    }
 
     private static T DeserializeObjectValue<T>(JsonElement value)
     {
@@ -525,4 +617,43 @@ internal static class KernelJson
         JsonValueKind.Number when value.TryGetDecimal(out var decimalValue) => decimalValue,
         _ => value.Clone()
     };
+
+    private static JsonSerializerOptions CreateOptions()
+    {
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.General);
+        options.Converters.Add(new ReadOnlySetJsonConverterFactory());
+        return options;
+    }
+}
+
+internal sealed class ReadOnlySetJsonConverterFactory : JsonConverterFactory
+{
+    public override bool CanConvert(Type typeToConvert) =>
+        typeToConvert.IsGenericType &&
+        typeToConvert.GetGenericTypeDefinition() == typeof(IReadOnlySet<>);
+
+    public override JsonConverter CreateConverter(Type typeToConvert, JsonSerializerOptions options)
+    {
+        var itemType = typeToConvert.GetGenericArguments()[0];
+        return (JsonConverter)(Activator.CreateInstance(
+            typeof(ReadOnlySetJsonConverter<>).MakeGenericType(itemType))
+            ?? throw new KernelActionExecutionException(
+                $"The read-only set codec for '{itemType.FullName}' cannot be created."));
+    }
+}
+
+internal sealed class ReadOnlySetJsonConverter<T> : JsonConverter<IReadOnlySet<T>>
+    where T : notnull
+{
+    public override IReadOnlySet<T> Read(
+        ref Utf8JsonReader reader,
+        Type typeToConvert,
+        JsonSerializerOptions options) =>
+        new HashSet<T>(JsonSerializer.Deserialize<T[]>(ref reader, options) ?? []);
+
+    public override void Write(
+        Utf8JsonWriter writer,
+        IReadOnlySet<T> value,
+        JsonSerializerOptions options) =>
+        JsonSerializer.Serialize(writer, value.ToArray(), options);
 }

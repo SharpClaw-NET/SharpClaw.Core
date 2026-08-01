@@ -84,7 +84,7 @@ public class StoreBackedContinuationHost : IActionContinuationHost
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
-        if (!ValidClaimRequest(claim) || !VerifySecret(secret, await ReadAsync(tokenId, cancellationToken)))
+        if (!ValidClaimRequest(claim, now) || !VerifySecret(secret, await ReadAsync(tokenId, cancellationToken)))
             return null;
 
         while (await ReadAsync(tokenId, cancellationToken) is { } current)
@@ -103,9 +103,22 @@ public class StoreBackedContinuationHost : IActionContinuationHost
             }
 
             var leaseExpired = current.LeaseExpiresAt is { } expiry && expiry <= now;
+            if (current.State == ContinuationState.CancelRequested)
+            {
+                if (!leaseExpired)
+                    return null;
+                var cancelled = current with
+                {
+                    State = ContinuationState.Cancelled,
+                    Revision = current.Revision + 1
+                };
+                if (await _store.TryUpdateAsync(tokenId, current, cancelled, cancellationToken))
+                    return null;
+                continue;
+            }
             if (current.State == ContinuationState.Claimed && !leaseExpired)
                 return null;
-            if (current.Request.Policy.SingleClaim && current.Generation > 0)
+            if (current.State is not (ContinuationState.Pending or ContinuationState.Claimed))
                 return null;
             if (claim.ExpectedRevision != current.Revision ||
                 claim.Generation != current.Generation + 1)
@@ -191,23 +204,52 @@ public class StoreBackedContinuationHost : IActionContinuationHost
             cancellationToken);
     }
 
-    public ValueTask<KernelContinuationState?> CancelAsync(
+    public async ValueTask<KernelContinuationState?> CancelAsync(
         Guid tokenId,
         string secret,
         KernelContinuationClaim claim,
         DateTimeOffset now,
-        CancellationToken cancellationToken) =>
-        MutateClaimAsync(
-            tokenId,
-            secret,
-            claim,
-            now,
-            state => state with
+        CancellationToken cancellationToken)
+    {
+        if (!ValidClaimRequest(claim, now) || !VerifySecret(secret, await ReadAsync(tokenId, cancellationToken)))
+            return null;
+        while (await ReadAsync(tokenId, cancellationToken) is { } current)
+        {
+            if (!IsValidContinuationState(current) || current.Request.ContractHash != claim.ContractHash ||
+                current.ExpiresAt <= now || current.Revision != claim.ExpectedRevision)
+                return null;
+            KernelContinuationState? next = current.State switch
             {
-                State = ContinuationState.Cancelled,
-                Revision = state.Revision + 1
-            },
-            cancellationToken);
+                ContinuationState.Pending when claim.Generation == current.Generation + 1 => current with
+                {
+                    State = ContinuationState.Cancelled,
+                    ClaimOwner = claim.Owner,
+                    Generation = claim.Generation,
+                    Revision = current.Revision + 1
+                },
+                ContinuationState.Claimed when current.ClaimOwner == claim.Owner &&
+                                                   current.Generation == claim.Generation &&
+                                                   current.LeaseExpiresAt > now => current with
+                                                   {
+                                                       State = ContinuationState.CancelRequested,
+                                                       Revision = current.Revision + 1
+                                                   },
+                ContinuationState.CancelRequested when current.ClaimOwner == claim.Owner &&
+                                                       current.Generation == claim.Generation => current with
+                                                       {
+                                                           State = ContinuationState.Cancelled,
+                                                           Revision = current.Revision + 1
+                                                       },
+                _ => null
+            };
+            if (next is null)
+                return null;
+            if (await _store.TryUpdateAsync(tokenId, current, next, cancellationToken))
+                return next;
+        }
+
+        return null;
+    }
 
     public ValueTask<KernelContinuationState?> DeliverAsync(
         Guid tokenId,
@@ -262,7 +304,9 @@ public class StoreBackedContinuationHost : IActionContinuationHost
                 return current;
             var next = current with
             {
-                State = ContinuationState.Expired,
+                State = current.State is ContinuationState.Claimed or ContinuationState.CancelRequested
+                    ? ContinuationState.OutcomeUncertain
+                    : ContinuationState.Expired,
                 Revision = current.Revision + 1
             };
             if (await _store.TryUpdateAsync(tokenId, current, next, cancellationToken))
@@ -297,6 +341,12 @@ public class StoreBackedContinuationHost : IActionContinuationHost
     {
         ArgumentNullException.ThrowIfNull(request);
         cancellationToken.ThrowIfCancellationRequested();
+        if (!SupportsDurableState)
+            throw new KernelActionExecutionException(
+                "An uncertain action outcome requires a durable persistence store.");
+        if (request.Policy is { Durable: false })
+            throw new KernelActionExecutionException(
+                "An uncertain action outcome cannot use a non-durable continuation policy.");
         if (string.IsNullOrWhiteSpace(request.ContractHash))
             throw new KernelActionExecutionException("An uncertain outcome requires a non-empty contract hash.");
         if (request.ActionVersion < 1 || request.IdempotencyKey == Guid.Empty)
@@ -313,7 +363,7 @@ public class StoreBackedContinuationHost : IActionContinuationHost
             request.Code,
             request.Message,
             request.Stage,
-            request.ReceiptReference ?? string.Empty,
+            request.ReceiptReference,
             recovery,
             recordedAt);
         var token = new KernelRecoveryToken(
@@ -366,7 +416,7 @@ public class StoreBackedContinuationHost : IActionContinuationHost
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
-        if (!ValidClaimRequest(claim) ||
+        if (!ValidClaimRequest(claim, now) ||
             !VerifySecret(secret, await ReadRecoveryAsync(recoveryId, cancellationToken)))
             return null;
 
@@ -386,12 +436,23 @@ public class StoreBackedContinuationHost : IActionContinuationHost
             }
 
             var leaseExpired = current.LeaseExpiresAt is { } expiry && expiry <= now;
+            if (current.State == ContinuationState.CancelRequested)
+            {
+                if (!leaseExpired)
+                    return null;
+                var cancelled = current with
+                {
+                    State = ContinuationState.Cancelled,
+                    Revision = current.Revision + 1
+                };
+                if (await _store.TryUpdateRecoveryAsync(recoveryId, current, cancelled, cancellationToken))
+                    return null;
+                continue;
+            }
             if (current.State != ContinuationState.OutcomeUncertain &&
                 !(current.State == ContinuationState.Claimed && leaseExpired))
                 return null;
             if (current.State == ContinuationState.Claimed && !leaseExpired)
-                return null;
-            if ((current.Request.Policy?.SingleClaim ?? true) && current.Generation > 0)
                 return null;
             if (claim.ExpectedRevision != current.Revision ||
                 claim.Generation != current.Generation + 1)
@@ -479,23 +540,53 @@ public class StoreBackedContinuationHost : IActionContinuationHost
             cancellationToken);
     }
 
-    public ValueTask<KernelRecoveryState?> CancelRecoveryAsync(
+    public async ValueTask<KernelRecoveryState?> CancelRecoveryAsync(
         Guid recoveryId,
         string secret,
         KernelContinuationClaim claim,
         DateTimeOffset now,
-        CancellationToken cancellationToken) =>
-        MutateRecoveryClaimAsync(
-            recoveryId,
-            secret,
-            claim,
-            now,
-            state => state with
+        CancellationToken cancellationToken)
+    {
+        if (!ValidClaimRequest(claim, now) ||
+            !VerifySecret(secret, await ReadRecoveryAsync(recoveryId, cancellationToken)))
+            return null;
+        while (await ReadRecoveryAsync(recoveryId, cancellationToken) is { } current)
+        {
+            if (!IsValidRecoveryState(current) || current.Request.ContractHash != claim.ContractHash ||
+                current.ExpiresAt <= now || current.Revision != claim.ExpectedRevision)
+                return null;
+            KernelRecoveryState? next = current.State switch
             {
-                State = ContinuationState.Cancelled,
-                Revision = state.Revision + 1
-            },
-            cancellationToken);
+                ContinuationState.OutcomeUncertain when claim.Generation == current.Generation + 1 => current with
+                {
+                    State = ContinuationState.Cancelled,
+                    ClaimOwner = claim.Owner,
+                    Generation = claim.Generation,
+                    Revision = current.Revision + 1
+                },
+                ContinuationState.Claimed when current.ClaimOwner == claim.Owner &&
+                                                   current.Generation == claim.Generation &&
+                                                   current.LeaseExpiresAt > now => current with
+                                                   {
+                                                       State = ContinuationState.CancelRequested,
+                                                       Revision = current.Revision + 1
+                                                   },
+                ContinuationState.CancelRequested when current.ClaimOwner == claim.Owner &&
+                                                       current.Generation == claim.Generation => current with
+                                                       {
+                                                           State = ContinuationState.Cancelled,
+                                                           Revision = current.Revision + 1
+                                                       },
+                _ => null
+            };
+            if (next is null)
+                return null;
+            if (await _store.TryUpdateRecoveryAsync(recoveryId, current, next, cancellationToken))
+                return next;
+        }
+
+        return null;
+    }
 
     public ValueTask<KernelRecoveryState?> DeliverRecoveryAsync(
         Guid recoveryId,
@@ -546,7 +637,9 @@ public class StoreBackedContinuationHost : IActionContinuationHost
                 return current;
             var next = current with
             {
-                State = ContinuationState.Expired,
+                State = current.State is ContinuationState.Claimed or ContinuationState.CancelRequested
+                    ? ContinuationState.OutcomeUncertain
+                    : ContinuationState.Expired,
                 Revision = current.Revision + 1
             };
             if (await _store.TryUpdateRecoveryAsync(recoveryId, current, next, cancellationToken))
@@ -615,7 +708,7 @@ public class StoreBackedContinuationHost : IActionContinuationHost
         bool allowExpired = false)
     {
         if (state is null || string.IsNullOrWhiteSpace(secret) ||
-            !ValidClaimRequest(claim, allowExpired) || !IsValidRecoveryState(state))
+            !ValidClaimRequest(claim, now, allowExpired) || !IsValidRecoveryState(state))
             return false;
         if (!VerifySecret(secret, state) || state.ClaimOwner != claim.Owner ||
             state.Generation != claim.Generation || state.Revision != claim.ExpectedRevision ||
@@ -687,12 +780,13 @@ public class StoreBackedContinuationHost : IActionContinuationHost
 
     private static bool ValidClaimRequest(
         KernelContinuationClaim claim,
+        DateTimeOffset now,
         bool allowExpired = false) =>
         !string.IsNullOrWhiteSpace(claim.ContractHash) &&
         !string.IsNullOrWhiteSpace(claim.Owner) &&
         claim.Generation > 0 &&
         claim.ExpectedRevision > 0 &&
-        (allowExpired || claim.LeaseExpiresAt == default || claim.LeaseExpiresAt > DateTimeOffset.UtcNow);
+        (allowExpired || claim.LeaseExpiresAt == default || claim.LeaseExpiresAt > now);
 
     private static bool IsCurrentClaim(
         KernelContinuationState? state,
@@ -703,7 +797,7 @@ public class StoreBackedContinuationHost : IActionContinuationHost
         bool allowExpired = false)
     {
         if (state is null || string.IsNullOrWhiteSpace(secret) ||
-            !ValidClaimRequest(claim, allowExpired) || !IsValidContinuationState(state))
+            !ValidClaimRequest(claim, now, allowExpired) || !IsValidContinuationState(state))
             return false;
         if (!VerifySecret(secret, state) || state.ClaimOwner != claim.Owner ||
             state.Generation != claim.Generation || state.Revision != claim.ExpectedRevision ||

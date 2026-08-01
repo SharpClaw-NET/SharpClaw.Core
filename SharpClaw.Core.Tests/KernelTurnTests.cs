@@ -24,9 +24,9 @@ public sealed class KernelTurnTests
             conversationResolver,
             profileResolver,
             store,
-            new EmptyContextAssembler(),
-            new CompletionRoundLoop(),
-            new EmptyToolPipeline());
+            new KernelChatContextAssembler(graph, dispatcher, []),
+            new ProviderRoundLoop(new CompletionTransport(), graph, dispatcher),
+            new UnifiedToolPipeline(graph, dispatcher));
         var input = new ChatTurnInput(
             "hello",
             null,
@@ -108,32 +108,29 @@ public sealed class KernelTurnTests
         }
     }
 
-    private sealed class EmptyContextAssembler : IChatContextAssembler
+    private sealed class CompletionTransport : IKernelProviderTransport
     {
-        public ValueTask<ChatContextContribution> BuildAsync(
-            ChatContextRequest request,
-            CancellationToken cancellationToken) =>
-            ValueTask.FromResult(ChatContextContribution.Empty);
-    }
-
-    private sealed class CompletionRoundLoop : IProviderRoundLoop
-    {
-        public ValueTask<ChatCompletionResult> RunAsync(
+        public ValueTask<ChatCompletionResult> CompleteAsync(
             ProviderTurnRequest request,
-            IUnifiedToolPipeline toolPipeline,
+            IReadOnlyList<ToolAwareMessage> messages,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult(new ChatCompletionResult
             {
                 Content = "done",
                 ToolCalls = Array.Empty<ChatToolCall>()
             });
-    }
 
-    private sealed class EmptyToolPipeline : IUnifiedToolPipeline
-    {
-        public ValueTask<ToolInvocationOutcome> InvokeAsync(
-            ToolInvocation invocation,
-            CancellationToken cancellationToken) =>
-            ValueTask.FromResult(ToolInvocationOutcome.Rejected("unused", "unused"));
+        public async IAsyncEnumerable<ChatStreamChunk> StreamAsync(
+            ProviderTurnRequest request,
+            IReadOnlyList<ToolAwareMessage> messages,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await Task.Yield();
+            yield return ChatStreamChunk.Final(new ChatCompletionResult
+            {
+                Content = "done",
+                ToolCalls = Array.Empty<ChatToolCall>()
+            });
+        }
     }
 }

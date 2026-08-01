@@ -55,6 +55,8 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                 .SequenceEqual(KernelGraphHasher.Flatten("descriptor", descriptor)))
             throw new KernelActionExecutionException(
                 $"Event '{descriptor.Key.Value}' does not match the compiled descriptor schema.");
+        if (typed.Interceptors.Count == 0 && typed.Listeners.Count == 0)
+            return KernelEventInterception<TEvent>.Continued(payload);
 
         var invocation = new KernelEventInvocation<TEvent>(
             typed,
@@ -86,6 +88,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
 
     private sealed class KernelEventInvocation<TEvent>
     {
+        private static readonly TimeSpan CancellationObservationWindow = TimeSpan.FromMilliseconds(25);
         private readonly CompiledEventDefinition<TEvent> _definition;
         private readonly ActionPipelineSnapshot _snapshot;
         private readonly RequestPrincipal _caller;
@@ -149,7 +152,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                         _definition.Descriptor.Version,
                         _definition.Descriptor.Category,
                         frame.EffectiveCapabilities,
-                        new JsonSchemaReference("core.event.payload", 1, string.Empty),
+                        _definition.PayloadSchema,
                         _definition.Descriptor.ContainsSensitiveData);
                     var untypedEnvelope = new UntypedEventEnvelope(
                         descriptor,
@@ -222,8 +225,21 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                 }
                 return Failed("EVENT_HOOK_TIMEOUT", exception.Message, control.Authority);
             }
+            catch (KernelEventOperationCancellationException exception)
+            {
+                if (control.TryGetKnownOutcome(out var known))
+                    return control.Reissue(known!);
+                if (control.ContinuationStarted || exception.OperationStillRunning)
+                {
+                    control.ConsumeForUncertainty();
+                    return Failed("EVENT_OUTCOME_UNCERTAIN", exception.Message, control.Authority);
+                }
+                return Failed("EVENT_CANCELLED", "The event was cancelled.", control.Authority);
+            }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
+                if (control.TryGetKnownOutcome(out var known))
+                    return control.Reissue(known!);
                 return Failed("EVENT_CANCELLED", "The event was cancelled.");
             }
             catch (TimeoutException exception)
@@ -267,7 +283,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                         await InvokeListenerAsync(
                             token => ((IAnyEventListener)listener.Listener).OnEventAsync(
                                 new UntypedEventEnvelope(
-                                    CreateUntypedDescriptor(),
+                                    CreateUntypedDescriptor(listener.EffectiveCapabilities),
                                     envelope.EventId,
                                     envelope.ActionInvocationId,
                                     envelope.TraceId,
@@ -287,7 +303,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                     object value = listener.Listener is IEventListener<TEvent>
                         ? envelope
                         : new UntypedEventEnvelope(
-                            CreateUntypedDescriptor(),
+                            CreateUntypedDescriptor(listener.EffectiveCapabilities),
                             envelope.EventId,
                             envelope.ActionInvocationId,
                             envelope.TraceId,
@@ -304,12 +320,13 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
             }
         }
 
-        private UntypedEventDescriptor CreateUntypedDescriptor() => new(
+        private UntypedEventDescriptor CreateUntypedDescriptor(
+            EventInterceptionCapabilities effectiveCapabilities) => new(
             _definition.Descriptor.Key,
             _definition.Descriptor.Version,
             _definition.Descriptor.Category,
-            _definition.EffectiveCapabilities,
-            new JsonSchemaReference("core.event.payload", 1, string.Empty),
+            effectiveCapabilities,
+            _definition.PayloadSchema,
             _definition.Descriptor.ContainsSensitiveData);
 
         private async ValueTask InvokeListenerAsync(
@@ -327,6 +344,16 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                     },
                     ordering,
                     cancellationToken);
+            }
+            catch (KernelEventOperationTimeoutException exception) when (exception.OperationStillRunning)
+            {
+                throw new KernelActionExecutionException(
+                    $"EVENT_OUTCOME_UNCERTAIN: {exception.Message}");
+            }
+            catch (KernelEventOperationCancellationException exception) when (exception.OperationStillRunning)
+            {
+                throw new KernelActionExecutionException(
+                    $"EVENT_OUTCOME_UNCERTAIN: {exception.Message}");
             }
             catch (Exception) when (ordering.FailurePolicy == HookFailurePolicy.BestEffort)
             {
@@ -352,20 +379,50 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
             }
             catch (TimeoutException)
             {
+                linked.Cancel();
+                if (await ObserveCompletionAsync(operationTask))
+                {
+                    try
+                    {
+                        return await operationTask;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw new KernelEventOperationTimeoutException(
+                            "The event hook exceeded its timeout.",
+                            false);
+                    }
+                }
                 throw new KernelEventOperationTimeoutException(
                     "The event hook exceeded its timeout.",
-                    await IsStillRunningAsync(operationTask));
+                    true);
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
                 throw new KernelEventOperationTimeoutException(
                     "The event hook exceeded its timeout.",
-                    await IsStillRunningAsync(operationTask));
+                    false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                linked.Cancel();
+                if (await ObserveCompletionAsync(operationTask))
+                    return await operationTask;
+                throw new KernelEventOperationCancellationException(
+                    "Caller cancellation occurred while the event hook was still running.",
+                    true);
             }
         }
 
-        private static ValueTask<bool> IsStillRunningAsync(Task operationTask) =>
-            ValueTask.FromResult(!operationTask.IsCompleted);
+        private static async ValueTask<bool> ObserveCompletionAsync(Task operationTask)
+        {
+            if (operationTask.IsCompleted)
+                return true;
+            var observed = await Task.WhenAny(
+                operationTask,
+                Task.Delay(CancellationObservationWindow, CancellationToken.None));
+            return ReferenceEquals(observed, operationTask);
+        }
 
         private IEventInterception<TEvent> Validate(
             IEventInterception<TEvent>? outcome,
@@ -586,6 +643,13 @@ public sealed class KernelUntypedEventInterception : IUntypedEventInterception
 internal sealed class KernelEventOperationTimeoutException(
     string message,
     bool operationStillRunning) : TimeoutException(message)
+{
+    public bool OperationStillRunning { get; } = operationStillRunning;
+}
+
+internal sealed class KernelEventOperationCancellationException(
+    string message,
+    bool operationStillRunning) : OperationCanceledException(message)
 {
     public bool OperationStillRunning { get; } = operationStillRunning;
 }

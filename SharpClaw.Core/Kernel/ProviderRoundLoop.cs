@@ -84,14 +84,7 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
                     var invocation = CreateInvocation(request, call);
                     var outcome = await toolPipeline.InvokeAsync(invocation, cancellationToken);
                     if (outcome.Kind != ActionOutcomeKind.Completed)
-                    {
-                        return new ChatCompletionResult
-                        {
-                            Content = outcome.Result?.Content ?? string.Empty,
-                            Refusal = outcome.Error?.Message ?? "The tool invocation did not complete.",
-                            ToolCalls = Array.Empty<ChatToolCall>()
-                        };
-                    }
+                        ThrowToolOutcome(outcome);
 
                     messages.Add(ToolAwareMessage.ToolResult(call.Id, outcome.Result?.Content ?? string.Empty));
                 }
@@ -104,12 +97,27 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
                 ToolCalls = Array.Empty<ChatToolCall>()
             };
         }
-        catch (ProviderActionCancelledException exception)
+        catch (KernelActionCancelledException exception)
         {
             await TryDispatchFailureAsync(RequestCancellation, new KernelProviderFailure(
-                "PROVIDER_ACTION_CANCELLED",
-                exception.Message,
+                exception.Error.Code,
+                exception.Error.Message,
                 true));
+            throw;
+        }
+        catch (KernelActionDeferredException)
+        {
+            throw;
+        }
+        catch (ActionOutcomeUncertainException)
+        {
+            throw;
+        }
+        catch (KernelActionFailedException exception)
+        {
+            await TryDispatchFailureAsync(RequestFailure, new KernelProviderFailure(
+                exception.Error.Code,
+                exception.Error.Message));
             throw;
         }
         catch (OperationCanceledException)
@@ -151,20 +159,43 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
                     state = await PrepareRequestAsync(request, messages, cancellationToken);
                     state = await DispatchInputAsync(StreamOpen, state, static (value, _) =>
                         ValueTask.FromResult(value), cancellationToken);
-                    stream = await DispatchInputAsync(
+                    var streamHandle = await DispatchInputAsync(
                         SharpClawActions.Provider.Send,
                         state,
                         (value, ct) => ValueTask.FromResult(
-                            _transport.StreamAsync(value.Request, value.Messages, ct)),
+                            KernelProviderTransportResult.Streaming(
+                                _transport.StreamAsync(value.Request, value.Messages, ct))),
                         cancellationToken);
+                    stream = streamHandle.IsStreaming && streamHandle.Stream is not null
+                        ? streamHandle.Stream
+                        : throw new KernelActionExecutionException(
+                            "The provider send action returned no stream transport.");
                 }
-                catch (ProviderActionCancelledException exception)
+                catch (KernelActionCancelledException exception)
                 {
                     failureDispatched = true;
                     await TryDispatchFailureAsync(RequestCancellation, new KernelProviderFailure(
-                        "PROVIDER_ACTION_CANCELLED",
-                        exception.Message,
+                        exception.Error.Code,
+                        exception.Error.Message,
                         true));
+                    throw;
+                }
+                catch (KernelActionDeferredException)
+                {
+                    failureDispatched = true;
+                    throw;
+                }
+                catch (ActionOutcomeUncertainException)
+                {
+                    failureDispatched = true;
+                    throw;
+                }
+                catch (KernelActionFailedException exception)
+                {
+                    failureDispatched = true;
+                    await TryDispatchFailureAsync(RequestFailure, new KernelProviderFailure(
+                        exception.Error.Code,
+                        exception.Error.Message));
                     throw;
                 }
 
@@ -172,79 +203,34 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
                 ChatStreamChunk? finalChunk = null;
                 await foreach (var rawChunk in stream.WithCancellation(cancellationToken))
                 {
-                    var received = await DispatchChunkAsync(
+                    var received = await DispatchStreamChunkAsync(
                         new SharpClawActionKey("provider.stream.chunk.receive"),
                         rawChunk,
+                        "receive",
+                        () => failureDispatched = true,
                         cancellationToken);
-                    if (received.Status == ChunkActionStatus.Cancelled)
-                    {
-                        failureDispatched = true;
-                        await TryDispatchFailureAsync(RequestCancellation, new KernelProviderFailure(
-                            "PROVIDER_STREAM_CANCELLED",
-                            "The provider stream was cancelled.",
-                            true));
-                        yield break;
-                    }
-                    if (received.Status == ChunkActionStatus.Failed)
-                    {
-                        failureDispatched = true;
-                        await TryDispatchFailureAsync(RequestFailure, new KernelProviderFailure(
-                            "PROVIDER_STREAM_RECEIVE_FAILED",
-                            "The provider stream receive action failed."));
-                        yield break;
-                    }
                     if (received.Status == ChunkActionStatus.Suppressed)
                         continue;
 
                     foreach (var receivedChunk in received.Chunks)
                     {
-                        var transformed = await DispatchChunkAsync(
+                        var transformed = await DispatchStreamChunkAsync(
                             new SharpClawActionKey("provider.stream.chunk.transform"),
                             receivedChunk,
+                            "transform",
+                            () => failureDispatched = true,
                             cancellationToken);
-                        if (transformed.Status == ChunkActionStatus.Cancelled)
-                        {
-                            failureDispatched = true;
-                            await TryDispatchFailureAsync(RequestCancellation, new KernelProviderFailure(
-                                "PROVIDER_STREAM_CANCELLED",
-                                "The provider stream transform was cancelled.",
-                                true));
-                            yield break;
-                        }
-                        if (transformed.Status == ChunkActionStatus.Failed)
-                        {
-                            failureDispatched = true;
-                            await TryDispatchFailureAsync(RequestFailure, new KernelProviderFailure(
-                                "PROVIDER_STREAM_TRANSFORM_FAILED",
-                                "The provider stream transform action failed."));
-                            yield break;
-                        }
                         if (transformed.Status == ChunkActionStatus.Suppressed)
                             continue;
 
                         foreach (var candidate in transformed.Chunks)
                         {
-                            var sent = await DispatchChunkAsync(
+                            var sent = await DispatchStreamChunkAsync(
                                 new SharpClawActionKey("provider.stream.chunk.send"),
                                 candidate,
+                                "send",
+                                () => failureDispatched = true,
                                 cancellationToken);
-                            if (sent.Status == ChunkActionStatus.Cancelled)
-                            {
-                                failureDispatched = true;
-                                await TryDispatchFailureAsync(RequestCancellation, new KernelProviderFailure(
-                                    "PROVIDER_STREAM_CANCELLED",
-                                    "The provider stream send action was cancelled.",
-                                    true));
-                                yield break;
-                            }
-                            if (sent.Status == ChunkActionStatus.Failed)
-                            {
-                                failureDispatched = true;
-                                await TryDispatchFailureAsync(RequestFailure, new KernelProviderFailure(
-                                    "PROVIDER_STREAM_SEND_FAILED",
-                                    "The provider stream send action failed."));
-                                yield break;
-                            }
                             if (sent.Status == ChunkActionStatus.Emitted)
                             {
                                 foreach (var emitted in sent.Chunks)
@@ -259,15 +245,15 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
                                 }
                             }
 
-                            if (completion is not null)
+                            if (finalChunk is not null)
                                 break;
                         }
 
-                        if (completion is not null)
+                        if (finalChunk is not null)
                             break;
                     }
 
-                    if (completion is not null)
+                    if (finalChunk is not null)
                         break;
                 }
 
@@ -295,13 +281,31 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
                         cancellationToken);
                     streamClosed = true;
                 }
-                catch (ProviderActionCancelledException exception)
+                catch (KernelActionCancelledException exception)
                 {
                     failureDispatched = true;
                     await TryDispatchFailureAsync(RequestCancellation, new KernelProviderFailure(
-                        "PROVIDER_ACTION_CANCELLED",
-                        exception.Message,
+                        exception.Error.Code,
+                        exception.Error.Message,
                         true));
+                    throw;
+                }
+                catch (KernelActionDeferredException)
+                {
+                    failureDispatched = true;
+                    throw;
+                }
+                catch (ActionOutcomeUncertainException)
+                {
+                    failureDispatched = true;
+                    throw;
+                }
+                catch (KernelActionFailedException exception)
+                {
+                    failureDispatched = true;
+                    await TryDispatchFailureAsync(RequestFailure, new KernelProviderFailure(
+                        exception.Error.Code,
+                        exception.Error.Message));
                     throw;
                 }
                 catch
@@ -328,17 +332,35 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
                         static (value, _) => ValueTask.FromResult(value),
                         cancellationToken);
                 }
-                catch (ProviderActionCancelledException exception)
+                catch (KernelActionCancelledException exception)
                 {
                     failureDispatched = true;
                     await TryDispatchFailureAsync(RequestCancellation, new KernelProviderFailure(
-                        "PROVIDER_ACTION_CANCELLED",
-                        exception.Message,
+                        exception.Error.Code,
+                        exception.Error.Message,
                         true));
                     throw;
                 }
+                catch (KernelActionDeferredException)
+                {
+                    failureDispatched = true;
+                    throw;
+                }
+                catch (ActionOutcomeUncertainException)
+                {
+                    failureDispatched = true;
+                    throw;
+                }
+                catch (KernelActionFailedException exception)
+                {
+                    failureDispatched = true;
+                    await TryDispatchFailureAsync(RequestFailure, new KernelProviderFailure(
+                        exception.Error.Code,
+                        exception.Error.Message));
+                    throw;
+                }
                 if (!(finalChunk.IsFinished && finalChunk.Finished?.HasToolCalls == true))
-                    yield return finalChunk;
+                    yield return ChatStreamChunk.Final(completion);
                 if (!completion.HasToolCalls || completion.ToolCalls.Count == 0)
                 {
                     completedNormally = true;
@@ -353,19 +375,7 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
                 {
                     var outcome = await toolPipeline.InvokeAsync(CreateInvocation(request, call), cancellationToken);
                     if (outcome.Kind != ActionOutcomeKind.Completed)
-                    {
-                        failureDispatched = true;
-                        await TryDispatchFailureAsync(RequestFailure, new KernelProviderFailure(
-                            "PROVIDER_TOOL_INVOCATION_FAILED",
-                            outcome.Error?.Message ?? "The provider tool invocation did not complete."));
-                        yield return ChatStreamChunk.Final(new ChatCompletionResult
-                        {
-                            Content = outcome.Result?.Content ?? string.Empty,
-                            Refusal = outcome.Error?.Message ?? "The tool invocation did not complete.",
-                            ToolCalls = Array.Empty<ChatToolCall>()
-                        });
-                        yield break;
-                    }
+                        await ThrowStreamToolOutcomeAsync(outcome, () => failureDispatched = true);
 
                     messages.Add(ToolAwareMessage.ToolResult(call.Id, outcome.Result?.Content ?? string.Empty));
                 }
@@ -405,11 +415,16 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
         CancellationToken cancellationToken)
     {
         var state = await PrepareRequestAsync(request, messages, cancellationToken);
-        var raw = await DispatchInputAsync(
+        var transportResult = await DispatchInputAsync(
             SharpClawActions.Provider.Send,
             state,
-            (value, ct) => _transport.CompleteAsync(value.Request, value.Messages, ct),
+            async (value, ct) => KernelProviderTransportResult.Buffered(
+                await _transport.CompleteAsync(value.Request, value.Messages, ct)),
             cancellationToken);
+        var raw = !transportResult.IsStreaming && transportResult.Completion is not null
+            ? transportResult.Completion
+            : throw new KernelActionExecutionException(
+                "The provider send action returned no buffered completion.");
         var deserialized = await DispatchInputAsync(
             ResponseDeserialize,
             new KernelProviderCompletionEnvelope(state, raw),
@@ -463,23 +478,13 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
         CancellationToken cancellationToken)
     {
         var descriptor = _graph.GetStandardAction(key);
-        var outcome = await _dispatcher.RunAsync(
+        var result = await _dispatcher.RunRequiredAsync(
             descriptor,
             new KernelActionEnvelope(key, input),
             async (envelope, ct) => (object)(await terminal(ExtractInput(envelope, input), ct))!,
             _graph.ActionSnapshot,
             cancellationToken);
-        if (outcome.Kind == ActionOutcomeKind.Cancelled)
-            throw new ProviderActionCancelledException(
-                key,
-                outcome.Error?.Message ?? "The provider action was cancelled.");
-        if (outcome.Kind == ActionOutcomeKind.Uncertain && outcome.Uncertainty is not null)
-            throw new ActionOutcomeUncertainException(outcome.Uncertainty);
-        if (outcome.Kind != ActionOutcomeKind.Completed)
-            throw new KernelActionExecutionException(
-                $"Provider action '{key.Value}' did not complete. " +
-                $"{outcome.Error?.Message ?? outcome.Kind.ToString()}.");
-        return outcome.Result is TResult typed
+        return result is TResult typed
             ? typed
             : throw new KernelActionExecutionException(
                 $"Provider action '{key.Value}' returned an invalid result.");
@@ -494,35 +499,80 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
         var outcome = await _dispatcher.RunAsync(
             descriptor,
             new KernelActionEnvelope(key, chunk),
-            (envelope, _) => ValueTask.FromResult<object>(envelope),
+            static (envelope, _) => envelope.Payload is ChatStreamChunk value
+                ? ValueTask.FromResult<object>(new KernelProviderChunkResult([value], false))
+                : throw new KernelActionExecutionException(
+                    "The provider stream action received an invalid chunk."),
             _graph.ActionSnapshot,
             cancellationToken);
         if (outcome.Kind == ActionOutcomeKind.Cancelled)
-            return new ChunkActionResult(ChunkActionStatus.Cancelled, []);
-        if (outcome.Kind != ActionOutcomeKind.Completed)
-            return new ChunkActionResult(ChunkActionStatus.Failed, []);
-        var result = outcome.Result switch
+            throw new KernelActionCancelledException(
+                outcome.Error ?? new ExecutionError(
+                    "PROVIDER_STREAM_CANCELLED",
+                    "The provider stream action was cancelled."));
+        if (outcome.Kind == ActionOutcomeKind.Deferred && outcome.Continuation is not null)
+            throw new KernelActionDeferredException(outcome.Continuation);
+        if (outcome.Kind == ActionOutcomeKind.Uncertain && outcome.Uncertainty is not null)
+            throw new ActionOutcomeUncertainException(outcome.Uncertainty);
+        if (outcome.Kind == ActionOutcomeKind.Failed)
+            throw new KernelActionFailedException(
+                outcome.Error ?? new ExecutionError(
+                    "PROVIDER_STREAM_ACTION_FAILED",
+                    $"Stream action '{key.Value}' failed."));
+        if (outcome.Result is not KernelProviderChunkResult result)
+            throw new KernelActionExecutionException(
+                $"Stream action '{key.Value}' returned an invalid chunk result.");
+        return result.Suppressed || result.Chunks.Count == 0
+            ? new ChunkActionResult(ChunkActionStatus.Suppressed, [])
+            : new ChunkActionResult(ChunkActionStatus.Emitted, result.Chunks);
+    }
+
+    private async ValueTask<ChunkActionResult> DispatchStreamChunkAsync(
+        SharpClawActionKey key,
+        ChatStreamChunk chunk,
+        string phase,
+        Action markFailureHandled,
+        CancellationToken cancellationToken)
+    {
+        try
         {
-            KernelActionEnvelope envelope => envelope.Payload,
-            _ => outcome.Result
-        };
-        if (result is null)
-            return new ChunkActionResult(ChunkActionStatus.Suppressed, []);
-        if (result is ChatStreamChunk value)
-            return new ChunkActionResult(ChunkActionStatus.Emitted, [value]);
-        if (result is IReadOnlyList<ChatStreamChunk> list)
-            return list.Count == 0
-                ? new ChunkActionResult(ChunkActionStatus.Suppressed, [])
-                : new ChunkActionResult(ChunkActionStatus.Emitted, list);
-        if (result is IEnumerable<ChatStreamChunk> sequence)
-        {
-            var chunks = sequence.ToArray();
-            return chunks.Length == 0
-                ? new ChunkActionResult(ChunkActionStatus.Suppressed, [])
-                : new ChunkActionResult(ChunkActionStatus.Emitted, chunks);
+            return await DispatchChunkAsync(key, chunk, cancellationToken);
         }
-        throw new KernelActionExecutionException(
-            $"Stream action '{key.Value}' returned an invalid chunk type.");
+        catch (KernelActionCancelledException exception)
+        {
+            markFailureHandled();
+            await TryDispatchFailureAsync(RequestCancellation, new KernelProviderFailure(
+                exception.Error.Code,
+                exception.Error.Message,
+                true));
+            throw;
+        }
+        catch (KernelActionDeferredException)
+        {
+            markFailureHandled();
+            throw;
+        }
+        catch (ActionOutcomeUncertainException)
+        {
+            markFailureHandled();
+            throw;
+        }
+        catch (KernelActionFailedException exception)
+        {
+            markFailureHandled();
+            await TryDispatchFailureAsync(RequestFailure, new KernelProviderFailure(
+                exception.Error.Code,
+                exception.Error.Message));
+            throw;
+        }
+        catch (Exception exception)
+        {
+            markFailureHandled();
+            await TryDispatchFailureAsync(RequestFailure, new KernelProviderFailure(
+                $"PROVIDER_STREAM_{phase.ToUpperInvariant()}_FAILED",
+                exception.Message));
+            throw;
+        }
     }
 
     private async ValueTask<bool> TryDispatchFailureAsync<TInput>(
@@ -606,20 +656,61 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
             _ => ToolAwareMessage.User(message.Content)
         };
 
+    private static void ThrowToolOutcome(ToolInvocationOutcome outcome)
+    {
+        switch (outcome.Kind)
+        {
+            case ActionOutcomeKind.Cancelled:
+                throw new KernelActionCancelledException(
+                    outcome.Error ?? new ExecutionError(
+                        "TOOL_CANCELLED",
+                        "The provider tool invocation was cancelled."));
+            case ActionOutcomeKind.Deferred when outcome.Continuation is not null:
+                throw new KernelActionDeferredException(outcome.Continuation);
+            case ActionOutcomeKind.Uncertain when outcome.Uncertainty is not null:
+                throw new ActionOutcomeUncertainException(outcome.Uncertainty);
+            case ActionOutcomeKind.Failed:
+                throw new KernelActionFailedException(
+                    outcome.Error ?? new ExecutionError(
+                        "TOOL_FAILED",
+                        "The provider tool invocation failed."));
+            default:
+                throw new KernelActionFailedException(
+                    new ExecutionError(
+                        "TOOL_OUTCOME_INVALID",
+                        "The provider tool invocation returned an incomplete outcome."));
+        }
+    }
+
+    private async ValueTask ThrowStreamToolOutcomeAsync(
+        ToolInvocationOutcome outcome,
+        Action markFailureHandled)
+    {
+        markFailureHandled();
+        if (outcome.Kind == ActionOutcomeKind.Cancelled)
+        {
+            await TryDispatchFailureAsync(RequestCancellation, new KernelProviderFailure(
+                outcome.Error?.Code ?? "TOOL_CANCELLED",
+                outcome.Error?.Message ?? "The provider tool invocation was cancelled.",
+                true));
+        }
+        else if (outcome.Kind == ActionOutcomeKind.Failed)
+        {
+            await TryDispatchFailureAsync(RequestFailure, new KernelProviderFailure(
+                outcome.Error?.Code ?? "TOOL_OUTCOME_FAILED",
+                outcome.Error?.Message ??
+                "The provider tool invocation did not complete."));
+        }
+        ThrowToolOutcome(outcome);
+    }
+
     private enum ChunkActionStatus
     {
         Emitted,
-        Suppressed,
-        Cancelled,
-        Failed
+        Suppressed
     }
 
     private sealed record ChunkActionResult(
         ChunkActionStatus Status,
         IReadOnlyList<ChatStreamChunk> Chunks);
 }
-
-internal sealed class ProviderActionCancelledException(
-    SharpClawActionKey key,
-    string message) : OperationCanceledException(
-        $"Provider action '{key.Value}' was cancelled: {message}");

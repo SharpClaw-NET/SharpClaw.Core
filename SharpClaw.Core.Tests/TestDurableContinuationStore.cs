@@ -10,6 +10,10 @@ internal sealed class TestDurableContinuationStore : IActionContinuationStore
 
     public bool IsDurable => true;
 
+    public int ContinuationCount => _states.Count;
+
+    public int RecoveryCount => _recoveries.Count;
+
     public ValueTask<KernelContinuationState?> ReadAsync(
         Guid tokenId,
         CancellationToken cancellationToken)

@@ -4,6 +4,13 @@ namespace SharpClaw.Core.Kernel;
 
 public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
 {
+    private static readonly SharpClawActionKey Parse = new("tool.call.parse");
+    private static readonly SharpClawActionKey InputTransform = new("tool.call.input.transform");
+    private static readonly SharpClawActionKey Defer = new("tool.call.defer");
+    private static readonly SharpClawActionKey ResultTransform = new("tool.result.transform");
+    private static readonly SharpClawActionKey ResultReturn = new("tool.result.return");
+    private static readonly SharpClawActionKey Failure = new("tool.call.fail");
+    private static readonly SharpClawActionKey Cancellation = new("tool.call.cancel");
     private readonly KernelGraph _graph;
     private readonly KernelActionDispatcher _dispatcher;
     private readonly IReadOnlyList<IToolInvocationGate> _gates;
@@ -21,7 +28,7 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _gates = gates?.ToArray() ?? [];
         _coordinator = coordinator ?? new ImmediateToolExecutionCoordinator();
-        _serviceProvider = serviceProvider;
+        _serviceProvider = serviceProvider ?? graph.Modules.Services;
     }
 
     public IReadOnlyList<ToolDescriptor> Tools =>
@@ -36,78 +43,103 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
             descriptor,
             new KernelActionEnvelope(SharpClawActions.Tools.Invoke, invocation),
             async (envelope, ct) => await ExecutePipelineAsync(
-                ExtractInput(envelope, invocation),
+                ExtractInput<ToolInvocation>(envelope),
                 ct),
             _graph.ActionSnapshot,
             cancellationToken);
 
-        if (outcome.Kind == ActionOutcomeKind.Completed && outcome.Result is ToolInvocationOutcome completed)
-            return completed;
-        return outcome.Kind switch
-        {
-            ActionOutcomeKind.Cancelled => ToolInvocationOutcome.Rejected(
-                outcome.Error?.Code ?? "TOOL_CANCELLED",
-                outcome.Error?.Message ?? "The tool invocation was cancelled."),
-            ActionOutcomeKind.Deferred => new ToolInvocationOutcome(
-                ActionOutcomeKind.Deferred,
-                ToolResult.Text("The tool invocation was deferred."),
-                null,
-                outcome.Continuation,
-                null),
-            ActionOutcomeKind.Uncertain => new ToolInvocationOutcome(
-                ActionOutcomeKind.Uncertain,
-                ToolResult.Error("The tool invocation has an uncertain outcome."),
-                null,
-                null,
-                outcome.Uncertainty),
-            _ => ToolInvocationOutcome.Rejected(
-                outcome.Error?.Code ?? "TOOL_PIPELINE_FAILED",
-                outcome.Error?.Message ?? "The tool pipeline failed.")
-        };
+        var result = outcome.Kind == ActionOutcomeKind.Completed && outcome.Result is ToolInvocationOutcome completed
+            ? completed
+            : outcome.Kind switch
+            {
+                ActionOutcomeKind.Cancelled => new ToolInvocationOutcome(
+                    ActionOutcomeKind.Cancelled,
+                    Error: outcome.Error ?? new ExecutionError(
+                        "TOOL_CANCELLED",
+                        "The tool invocation was cancelled.")),
+                ActionOutcomeKind.Deferred => new ToolInvocationOutcome(
+                    ActionOutcomeKind.Deferred,
+                    Continuation: outcome.Continuation),
+                ActionOutcomeKind.Uncertain => new ToolInvocationOutcome(
+                    ActionOutcomeKind.Uncertain,
+                    Uncertainty: outcome.Uncertainty),
+                _ => new ToolInvocationOutcome(
+                    ActionOutcomeKind.Failed,
+                    Error: outcome.Error ?? new ExecutionError(
+                        "TOOL_PIPELINE_FAILED",
+                        "The tool pipeline failed."))
+            };
+        if (result.Kind == ActionOutcomeKind.Cancelled)
+            await TryDispatchTerminalAsync(Cancellation, result);
+        else if (result.Kind == ActionOutcomeKind.Failed)
+            await TryDispatchTerminalAsync(Failure, result);
+        return result;
     }
 
     private async ValueTask<object> ExecutePipelineAsync(
         ToolInvocation invocation,
         CancellationToken cancellationToken)
     {
+        invocation = (ToolInvocation)await RunPhaseAsync(
+            Parse,
+            invocation,
+            static (value, _) => ValueTask.FromResult<object>(value),
+            cancellationToken);
+        invocation = (ToolInvocation)await RunPhaseAsync(
+            InputTransform,
+            invocation,
+            static (value, _) => ValueTask.FromResult<object>(value),
+            cancellationToken);
         var resolution = await ResolveToolAsync(invocation, cancellationToken);
-        if (resolution.Registration is null)
+        if (resolution.SelectedToolName is null)
             return ToolInvocationOutcome.Rejected(
                 "TOOL_NOT_REGISTERED",
                 $"No handler is registered for tool '{resolution.Invocation.ToolName}'.");
 
-        var holds = new List<ToolHoldRequirement>();
         var checkResult = await RunPhaseAsync(
             SharpClawActions.Tools.Check,
             resolution.Invocation,
             async (effectiveInvocation, ct) =>
             {
+                var holds = new List<ToolHoldRequirement>();
                 foreach (var gate in _gates)
                 {
                     var decision = await gate.EvaluateAsync(effectiveInvocation, ct);
                     switch (decision)
                     {
                         case ToolGateDecision.Reject reject:
-                            return (object)ToolInvocationOutcome.Rejected(reject.Code, reject.Message);
+                            return new KernelToolCheckResult(
+                                effectiveInvocation,
+                                holds.ToArray(),
+                                new ExecutionError(reject.Code, reject.Message));
                         case ToolGateDecision.Hold hold:
                             holds.Add(hold.Requirement);
                             break;
                     }
                 }
 
-                return new ToolCheckResult(effectiveInvocation, holds);
+                return new KernelToolCheckResult(effectiveInvocation, holds.ToArray(), null);
             },
             cancellationToken);
-        if (checkResult is ToolInvocationOutcome rejected)
-            return rejected;
-
-        var checkedInput = checkResult as ToolCheckResult
+        var checkedInput = checkResult as KernelToolCheckResult
             ?? throw new KernelActionExecutionException("The tool check action returned an invalid result.");
+        if (checkedInput.Rejection is { } rejection)
+            return ToolInvocationOutcome.Rejected(rejection.Code, rejection.Message);
         var registration = await ResolveToolAsync(checkedInput.Invocation, cancellationToken);
-        if (registration.Registration is null)
+        if (registration.SelectedToolName is null)
             return ToolInvocationOutcome.Rejected(
                 "TOOL_NOT_REGISTERED",
                 $"No handler is registered for tool '{registration.Invocation.ToolName}'.");
+
+        if (checkedInput.Holds.Count > 0)
+        {
+            var deferred = await RunPhaseAsync(
+                Defer,
+                checkedInput.Invocation,
+                static (value, _) => ValueTask.FromResult<object>(value),
+                cancellationToken);
+            checkedInput = checkedInput with { Invocation = (ToolInvocation)deferred };
+        }
 
         var coordinated = await RunPhaseAsync(
             SharpClawActions.Tools.Coordinate,
@@ -125,21 +157,42 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
                             var handlerResolution = await ResolveToolAsync(
                                 effectiveHandlerInvocation,
                                 handlerCancellationToken);
-                            if (handlerResolution.Registration is null)
+                            if (handlerResolution.SelectedToolName is null)
                                 return (object)ToolResult.Error(
                                     $"No handler is registered for tool '{handlerResolution.Invocation.ToolName}'.");
+                            var handlerRegistration = _graph.Tools.Single(tool =>
+                                string.Equals(
+                                    tool.Descriptor.Name,
+                                    handlerResolution.SelectedToolName,
+                                    StringComparison.Ordinal));
                             var handler = KernelServiceResolution.Resolve(
-                                handlerResolution.Registration.HandlerType,
+                                handlerRegistration.HandlerType,
                                 _serviceProvider);
                             if (handler is not IToolHandler typedHandler)
                                 throw new KernelActionExecutionException(
-                                    $"Tool handler '{handlerResolution.Registration.HandlerType.FullName}' does not implement IToolHandler.");
+                                    $"Tool handler '{handlerRegistration.HandlerType.FullName}' does not implement IToolHandler.");
                             return (object)await typedHandler.InvokeAsync(
                                 effectiveHandlerInvocation,
                                 handlerCancellationToken);
                         },
                         handlerCt);
-                    return handlerResult as ToolResult
+                    var transformed = await RunPhaseAsync(
+                        ResultTransform,
+                        new KernelToolResultStage(
+                            handlerInvocation,
+                            handlerResult as ToolResult
+                            ?? ToolResult.Error("The tool handler returned no result.")),
+                        static (stage, _) => ValueTask.FromResult<object>(stage.Result),
+                        handlerCt);
+                    var returned = await RunPhaseAsync(
+                        ResultReturn,
+                        new KernelToolResultStage(
+                            handlerInvocation,
+                            transformed as ToolResult
+                            ?? ToolResult.Error("The tool result transform returned no result.")),
+                        static (stage, _) => ValueTask.FromResult<object>(stage.Result),
+                        handlerCt);
+                    return returned as ToolResult
                         ?? ToolResult.Error("The tool handler returned no result.");
                 };
                 return (object)await _coordinator.CoordinateAsync(plan, terminal, ct);
@@ -150,68 +203,85 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
             : ToolInvocationOutcome.Rejected("TOOL_COORDINATION_FAILED", "The tool coordinator returned no result.");
     }
 
-    private async ValueTask<ToolResolution> ResolveToolAsync(
+    private async ValueTask<KernelToolResolution> ResolveToolAsync(
         ToolInvocation invocation,
         CancellationToken cancellationToken)
     {
         var result = await RunPhaseAsync(
             SharpClawActions.Tools.Resolve,
             invocation,
-            (effectiveInvocation, _) => new ValueTask<object>(new ToolResolution(
+            (effectiveInvocation, _) => new ValueTask<object>(new KernelToolResolution(
                 effectiveInvocation,
                 _graph.Tools.FirstOrDefault(tool =>
-                    string.Equals(tool.Descriptor.Name, effectiveInvocation.ToolName, StringComparison.Ordinal)))),
+                    string.Equals(tool.Descriptor.Name, effectiveInvocation.ToolName, StringComparison.Ordinal))
+                    ?.Descriptor.Name)),
             cancellationToken);
-        return result as ToolResolution
+        return result as KernelToolResolution
             ?? throw new KernelActionExecutionException("The tool resolve action returned an invalid result.");
     }
 
-    private ValueTask<object> RunPhaseAsync(
+    private ValueTask<object> RunPhaseAsync<TInput>(
         SharpClawActionKey key,
-        ToolInvocation invocation,
-        Func<ToolInvocation, CancellationToken, ValueTask<object>> terminal,
+        TInput input,
+        Func<TInput, CancellationToken, ValueTask<object>> terminal,
         CancellationToken cancellationToken) =>
-        RunPhaseCoreAsync(key, invocation, terminal, cancellationToken);
+        RunPhaseCoreAsync(key, input, terminal, cancellationToken);
 
-    private async ValueTask<object> RunPhaseCoreAsync(
+    private async ValueTask<object> RunPhaseCoreAsync<TInput>(
         SharpClawActionKey key,
-        ToolInvocation invocation,
-        Func<ToolInvocation, CancellationToken, ValueTask<object>> terminal,
+        TInput input,
+        Func<TInput, CancellationToken, ValueTask<object>> terminal,
         CancellationToken cancellationToken)
     {
         var descriptor = _graph.GetStandardAction(key);
-        var outcome = await _dispatcher.RunAsync(
+        return await _dispatcher.RunRequiredAsync(
             descriptor,
-            new KernelActionEnvelope(key, invocation),
-            async (envelope, ct) => await terminal(ExtractInput(envelope, invocation), ct),
+            new KernelActionEnvelope(key, input),
+            async (envelope, ct) => await terminal(ExtractInput<TInput>(envelope), ct),
             _graph.ActionSnapshot,
             cancellationToken);
-        if (outcome.Kind == ActionOutcomeKind.Completed)
-            return outcome.Result!;
-        return ToolInvocationOutcome.Rejected(
-            outcome.Error?.Code ?? "TOOL_PHASE_FAILED",
-            outcome.Error?.Message ?? $"Tool phase '{key.Value}' failed.");
     }
 
-    private static ToolInvocation ExtractInput(
-        KernelActionEnvelope envelope,
-        ToolInvocation original) =>
+    private async ValueTask TryDispatchTerminalAsync(
+        SharpClawActionKey key,
+        ToolInvocationOutcome outcome)
+    {
+        try
+        {
+            var descriptor = _graph.GetStandardAction(key);
+            await _dispatcher.RunAsync(
+                descriptor,
+                new KernelActionEnvelope(key, outcome),
+                static (_, _) => ValueTask.FromResult<object>(true),
+                _graph.ActionSnapshot,
+                CancellationToken.None);
+        }
+        catch
+        {
+        }
+    }
+
+    private static TInput ExtractInput<TInput>(KernelActionEnvelope envelope) =>
         envelope.Payload switch
         {
-            ToolInvocation typed => typed,
-            KernelActionEnvelope nested when nested.Payload is ToolInvocation typed => typed,
+            TInput typed => typed,
+            KernelActionEnvelope nested when nested.Payload is TInput typed => typed,
             _ => throw new KernelActionExecutionException(
-                $"Action '{envelope.Key.Value}' returned an invalid tool invocation replacement.")
+                $"Action '{envelope.Key.Value}' returned an invalid tool input replacement.")
         };
 
-    private sealed record ToolResolution(
-        ToolInvocation Invocation,
-        KernelToolRegistration? Registration);
-
-    private sealed record ToolCheckResult(
-        ToolInvocation Invocation,
-        IReadOnlyList<ToolHoldRequirement> Holds);
 }
+
+public sealed record KernelToolResolution(
+    ToolInvocation Invocation,
+    string? SelectedToolName);
+
+public sealed record KernelToolCheckResult(
+    ToolInvocation Invocation,
+    IReadOnlyList<ToolHoldRequirement> Holds,
+    ExecutionError? Rejection);
+
+public sealed record KernelToolResultStage(ToolInvocation Invocation, ToolResult Result);
 
 public sealed class ImmediateToolExecutionCoordinator : IToolExecutionCoordinator
 {
