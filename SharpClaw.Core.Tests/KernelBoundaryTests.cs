@@ -903,23 +903,14 @@ public sealed class KernelBoundaryTests
         {
             Claim = deliveredClaim.Claim with { ExpectedRevision = deliveryStarted.Revision }
         };
-        var delivered = await host.DeliverAsync(
+        var acknowledged = await host.AcknowledgeAsync(
             token.TokenId,
             token.Secret,
             deliveredClaim,
             now,
             CancellationToken.None);
-        Assert.Equal(ContinuationState.Delivered, delivered!.State);
-        var acknowledged = await host.AcknowledgeAsync(
-            token.TokenId,
-            token.Secret,
-            deliveredClaim with
-            {
-                Claim = deliveredClaim.Claim with { ExpectedRevision = delivered.Revision }
-            },
-            now,
-            CancellationToken.None);
         Assert.Equal(ContinuationState.Delivered, acknowledged!.State);
+        Assert.Equal(now, acknowledged.DeliveryAcknowledgedAt);
         var acknowledgedClaim = deliveredClaim with
         {
             Claim = deliveredClaim.Claim with { ExpectedRevision = acknowledged.Revision }

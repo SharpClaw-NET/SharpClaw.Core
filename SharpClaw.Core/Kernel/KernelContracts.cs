@@ -348,13 +348,6 @@ public interface IActionContinuationHost
         DateTimeOffset now,
         CancellationToken cancellationToken);
 
-    ValueTask<KernelContinuationState?> DeliverAsync(
-        Guid tokenId,
-        string secret,
-        KernelContinuationClaim claim,
-        DateTimeOffset now,
-        CancellationToken cancellationToken);
-
     ValueTask<KernelContinuationState?> AcknowledgeAsync(
         Guid tokenId,
         string secret,
