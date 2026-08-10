@@ -39,7 +39,38 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         Func<TAction, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         CancellationToken cancellationToken)
+        => RunCoreAsync(
+            _executionContext,
+            descriptor,
+            action,
+            terminal,
+            snapshot,
+            cancellationToken);
+
+    public ValueTask<IActionOutcome<TResult>> RunWithContextAsync<TAction, TResult>(
+        KernelActionExecutionContext executionContext,
+        ActionDescriptor<TAction, TResult> descriptor,
+        TAction action,
+        Func<TAction, CancellationToken, ValueTask<TResult>> terminal,
+        ActionPipelineSnapshot snapshot,
+        CancellationToken cancellationToken)
+        => RunCoreAsync(
+            executionContext,
+            descriptor,
+            action,
+            terminal,
+            snapshot,
+            cancellationToken);
+
+    private ValueTask<IActionOutcome<TResult>> RunCoreAsync<TAction, TResult>(
+        KernelActionExecutionContext executionContext,
+        ActionDescriptor<TAction, TResult> descriptor,
+        TAction action,
+        Func<TAction, CancellationToken, ValueTask<TResult>> terminal,
+        ActionPipelineSnapshot snapshot,
+        CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(executionContext);
         ArgumentNullException.ThrowIfNull(descriptor);
         ArgumentNullException.ThrowIfNull(terminal);
         ArgumentNullException.ThrowIfNull(snapshot);
@@ -61,7 +92,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
 
         var parent = CurrentScope.Value;
         var depth = parent is null ? 0 : parent.Depth + 1;
-        var executionContext = parent?.ExecutionContext ?? _executionContext;
+        executionContext = parent?.ExecutionContext ?? executionContext;
         var invocation = new KernelActionInvocation<TAction, TResult>(
             definition,
             terminal,
@@ -83,6 +114,31 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         CancellationToken cancellationToken)
     {
         var outcome = await RunAsync(descriptor, action, terminal, snapshot, cancellationToken);
+        return RequireResult(descriptor, outcome);
+    }
+
+    public async ValueTask<TResult> RunRequiredWithContextAsync<TAction, TResult>(
+        KernelActionExecutionContext executionContext,
+        ActionDescriptor<TAction, TResult> descriptor,
+        TAction action,
+        Func<TAction, CancellationToken, ValueTask<TResult>> terminal,
+        ActionPipelineSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
+        var outcome = await RunWithContextAsync(
+            executionContext,
+            descriptor,
+            action,
+            terminal,
+            snapshot,
+            cancellationToken);
+        return RequireResult(descriptor, outcome);
+    }
+
+    private static TResult RequireResult<TAction, TResult>(
+        ActionDescriptor<TAction, TResult> descriptor,
+        IActionOutcome<TResult> outcome)
+    {
         if (outcome.Kind == ActionOutcomeKind.Completed)
             return outcome.Result!;
 
