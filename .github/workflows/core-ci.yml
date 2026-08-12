@@ -28,8 +28,42 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      - name: Check out exact unpublished Contracts source
+        uses: actions/checkout@v4
+        with:
+          repository: SharpClaw-NET/SharpClaw.Contracts
+          ref: 8bbec9d4764f2e263f1f5af0e5ac0cf2a0eb48fc
+          path: .ci/contracts
+
+      - name: Pack exact Contracts source to the local feed
+        run: >-
+          dotnet pack .ci/contracts/SharpClaw.Contracts/SharpClaw.Contracts.csproj
+          --configuration Release --output "$GITHUB_WORKSPACE/.ci/feed"
+
+      - name: Configure the isolated package source map
+        shell: bash
+        run: |
+          cat > "$GITHUB_WORKSPACE/.ci/NuGet.config" <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local-contracts" value="$GITHUB_WORKSPACE/.ci/feed" />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+            </packageSources>
+            <packageSourceMapping>
+              <packageSource key="local-contracts">
+                <package pattern="SharpClaw.Contracts" />
+              </packageSource>
+              <packageSource key="nuget.org">
+                <package pattern="*" />
+              </packageSource>
+            </packageSourceMapping>
+          </configuration>
+          EOF
+
       - name: Restore
-        run: dotnet restore SharpClaw.Core.slnx
+        run: dotnet restore SharpClaw.Core.slnx --configfile "$GITHUB_WORKSPACE/.ci/NuGet.config"
 
       - name: Build
         run: dotnet build SharpClaw.Core.slnx --configuration Release --no-restore

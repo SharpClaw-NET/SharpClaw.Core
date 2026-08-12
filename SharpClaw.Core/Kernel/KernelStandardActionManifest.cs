@@ -19,7 +19,8 @@ public enum KernelStandardActionProfile
     Stream,
     StreamEffect,
     ReceiptedStreamEffect,
-    Signal
+    Signal,
+    Observe
 }
 
 public sealed record KernelStandardActionManifestEntry(
@@ -58,9 +59,69 @@ public sealed record KernelStandardActionManifestEntry(
 
 internal static class KernelStandardActionManifest
 {
+    private sealed record JobsProfileSet(
+        KernelStandardActionProfile Root,
+        KernelStandardActionProfile Before,
+        KernelStandardActionProfile After);
+
+    private static readonly IReadOnlyDictionary<string, JobsProfileSet> JobsFamilyProfiles =
+        new ReadOnlyDictionary<string, JobsProfileSet>(
+            new Dictionary<string, JobsProfileSet>(StringComparer.Ordinal)
+            {
+                ["jobs.submit"] = new(KernelStandardActionProfile.IdempotentEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.validate"] = new(KernelStandardActionProfile.Pure, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.identity.create"] = new(KernelStandardActionProfile.Pure, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.queue.persist"] = new(KernelStandardActionProfile.IdempotentEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.hold.evaluate"] = new(KernelStandardActionProfile.Pure, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.hold.resolve"] = new(KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.dispatch"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.start"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.handler.invoke"] = new(KernelStandardActionProfile.ReceiptedEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.progress.report"] = new(KernelStandardActionProfile.Signal, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.artifact.seal"] = new(KernelStandardActionProfile.IdempotentEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.complete"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.fail"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.cancel"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.cancel.request"] = new(KernelStandardActionProfile.Signal, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.cancel.apply"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.pause"] = new(KernelStandardActionProfile.Signal, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.stop"] = new(KernelStandardActionProfile.Signal, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.recovery"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.recovery.scan"] = new(KernelStandardActionProfile.Pure, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.recovery.classify"] = new(KernelStandardActionProfile.Pure, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.retry"] = new(KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.retry.evaluate"] = new(KernelStandardActionProfile.Pure, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.retry.schedule"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.resume"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.delete"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.read"] = new(KernelStandardActionProfile.Pure, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.list"] = new(KernelStandardActionProfile.Pure, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.logs.read"] = new(KernelStandardActionProfile.Pure, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.audit.read"] = new(KernelStandardActionProfile.Pure, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.artifact.read"] = new(KernelStandardActionProfile.Pure, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.event.deliver"] = new(KernelStandardActionProfile.ReceiptedEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.state.transition"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.state.transition.prepare"] = new(KernelStandardActionProfile.Pure, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.state.transition.commit"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.state.transition.rollback"] = new(KernelStandardActionProfile.IdempotentEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.persistence"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.persistence.prepare"] = new(KernelStandardActionProfile.Pure, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.persistence.commit"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.persistence.rollback"] = new(KernelStandardActionProfile.IdempotentEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.interruption.check"] = new(KernelStandardActionProfile.Pure, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.external_call"] = new(KernelStandardActionProfile.ReceiptedEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.irreversible_effect"] = new(KernelStandardActionProfile.ReceiptedEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.external_effect.prepare"] = new(KernelStandardActionProfile.Pure, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.external_effect.receipt"] = new(KernelStandardActionProfile.ReceiptedEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
+                ["jobs.external_effect.uncertain"] = new(KernelStandardActionProfile.Effect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe)
+            });
+
     private static readonly IReadOnlyDictionary<string, KernelStandardActionProfile> Profiles =
-        new ReadOnlyDictionary<string, KernelStandardActionProfile>(
-            new Dictionary<string, KernelStandardActionProfile>(StringComparer.Ordinal)
+        BuildProfiles();
+
+    private static IReadOnlyDictionary<string, KernelStandardActionProfile> BuildProfiles()
+    {
+        var profiles = new Dictionary<string, KernelStandardActionProfile>(StringComparer.Ordinal)
             {
                 ["runtime.start.prepare"] = KernelStandardActionProfile.Pure,
                 ["runtime.start.configure"] = KernelStandardActionProfile.Pure,
@@ -234,7 +295,17 @@ internal static class KernelStandardActionManifest
                 ["background.tick.fail"] = KernelStandardActionProfile.Signal,
                 ["background.tick.cancel"] = KernelStandardActionProfile.Signal,
                 ["background.service.stop"] = KernelStandardActionProfile.Effect
-            });
+            };
+
+        foreach (var (family, profile) in JobsFamilyProfiles)
+        {
+            profiles.Add(family, profile.Root);
+            profiles.Add($"{family}.before", profile.Before);
+            profiles.Add($"{family}.after", profile.After);
+        }
+
+        return new ReadOnlyDictionary<string, KernelStandardActionProfile>(profiles);
+    }
 
     public static IReadOnlyList<KernelStandardActionManifestEntry> Entries { get; } =
         BuildEntries();
@@ -246,7 +317,7 @@ internal static class KernelStandardActionManifest
 
     private static IReadOnlyList<KernelStandardActionManifestEntry> BuildEntries()
     {
-        var canonical = SharpClawActionCatalog.Kernel
+        var canonical = SharpClawActionCatalog.All
             .DistinctBy(key => key.Value, StringComparer.Ordinal)
             .ToArray();
         var canonicalNames = canonical.Select(key => key.Value).ToHashSet(StringComparer.Ordinal);
@@ -408,6 +479,15 @@ internal static class KernelStandardActionManifest
                 KernelCapabilities.ObservableActions |
                 ActionInterceptionCapabilities.ReplaceInput |
                 ActionInterceptionCapabilities.ReplaceResult,
+                false,
+                KernelCapabilities.NoRepeat,
+                null,
+                TimeSpan.FromSeconds(15),
+                [ActionSafePoint.BeforeTerminal, ActionSafePoint.AfterTerminal]),
+            KernelStandardActionProfile.Observe => new(
+                ActionInterceptionCapabilities.Inspect |
+                ActionInterceptionCapabilities.Observe |
+                ActionInterceptionCapabilities.PublishEvents,
                 false,
                 KernelCapabilities.NoRepeat,
                 null,

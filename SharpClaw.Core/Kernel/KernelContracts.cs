@@ -95,7 +95,7 @@ public static class KernelActionCatalog
     public static IReadOnlyList<SharpClawActionKey> RequiredKeys { get; } =
         new ReadOnlyCollection<SharpClawActionKey>(
         [
-            .. SharpClawActionCatalog.Kernel
+            .. SharpClawActionCatalog.All
         ]);
 
     public static IReadOnlyList<KernelStandardActionManifestEntry> Descriptors =>
@@ -124,6 +124,7 @@ public static class KernelActionCatalog
             var value when value.StartsWith("conversation.", StringComparison.Ordinal) => "conversation",
             var value when value.StartsWith("continuation.", StringComparison.Ordinal) => "continuation",
             var value when value.StartsWith("action_recovery.", StringComparison.Ordinal) => "action_recovery",
+            var value when value.StartsWith("jobs.", StringComparison.Ordinal) => "jobs",
             _ => "kernel"
         };
 

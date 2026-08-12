@@ -235,7 +235,7 @@ public sealed class KernelAuthorityCorrectionTests
     [Fact]
     public void Standard_manifest_binds_every_key_to_explicit_authority_and_contracts()
     {
-        var keys = SharpClawActionCatalog.Kernel
+        var keys = SharpClawActionCatalog.All
             .DistinctBy(key => key.Value, StringComparer.Ordinal)
             .OrderBy(key => key.Value, StringComparer.Ordinal)
             .ToArray();
@@ -256,7 +256,10 @@ public sealed class KernelAuthorityCorrectionTests
             Assert.True(entry.DefaultTimeout > TimeSpan.Zero);
             Assert.NotEmpty(entry.SafePoints);
             Assert.True(entry.Capabilities.HasFlag(ActionInterceptionCapabilities.Inspect));
-            Assert.True(entry.Capabilities.HasFlag(ActionInterceptionCapabilities.Wrap));
+            if (entry.Profile == KernelStandardActionProfile.Observe)
+                Assert.False(entry.Capabilities.HasFlag(ActionInterceptionCapabilities.Wrap));
+            else
+                Assert.True(entry.Capabilities.HasFlag(ActionInterceptionCapabilities.Wrap));
         });
         Assert.Equal(entries.Length, entries.Select(entry => entry.InputSchema.ContentHash).Distinct().Count());
         Assert.Equal(entries.Length, entries.Select(entry => entry.ResultSchema.ContentHash).Distinct().Count());
@@ -340,7 +343,7 @@ public sealed class KernelAuthorityCorrectionTests
                 ((int)entry.Profile).ToString(CultureInfo.InvariantCulture)));
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join("\n", records))));
 
-        Assert.Equal("DEC22CE0B050701E0022593EB1BC72350423EDB237BB2E37E8D6480C79BE0CCB", hash);
+        Assert.Equal("DA18E367B2364757DFBD9E3354B6451A5B82A67BBB9A3563E94663DEA158AC34", hash);
     }
 
     [Fact]
