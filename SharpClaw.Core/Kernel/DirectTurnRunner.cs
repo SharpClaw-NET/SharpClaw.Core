@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using System.Threading.Channels;
 using SharpClaw.Contracts.Modules;
 using SharpClaw.Contracts.Providers;
 
@@ -98,6 +100,237 @@ public sealed class DirectTurnRunner
         ChatPipelineSnapshot snapshot,
         CancellationToken cancellationToken)
     {
+        var request = await PrepareTurnAsync(input, snapshot, cancellationToken);
+        var providerStage = await RunStageWithInputAsync(
+            SharpClawActions.Chat.ProviderRound,
+            request,
+            async (effectiveRequest, ct) =>
+            {
+                var value = await _providerLoop.RunAsync(effectiveRequest, _toolPipeline, ct);
+                return await RunStageAsync(
+                    new SharpClawActionKey("chat.provider_round.complete"),
+                    value,
+                    static (completion, _) => ValueTask.FromResult(completion),
+                    snapshot.Actions,
+                    ct);
+            },
+            snapshot.Actions,
+            cancellationToken);
+        return await CompleteTurnAsync(
+            providerStage.Input,
+            providerStage.Result,
+            snapshot,
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Streams one direct turn through the same action, provider, tool, and
+    /// conversation pipeline as <see cref="RunAsync"/>.
+    /// </summary>
+    public async IAsyncEnumerable<ChatStreamChunk> StreamAsync(
+        ChatTurnInput input,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        var snapshot = _graph.ChatSnapshot;
+        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var channel = Channel.CreateBounded<ChatStreamChunk>(
+            new BoundedChannelOptions(16)
+            {
+                SingleReader = true,
+                SingleWriter = true,
+                FullMode = BoundedChannelFullMode.Wait,
+                AllowSynchronousContinuations = false
+            });
+        var operation = RunStreamingOperationAsync(
+            input,
+            snapshot,
+            channel.Writer,
+            linkedCancellation.Token);
+        var consumedToCompletion = false;
+        try
+        {
+            while (await channel.Reader.WaitToReadAsync(linkedCancellation.Token))
+            {
+                while (channel.Reader.TryRead(out var chunk))
+                    yield return chunk;
+            }
+
+            await operation;
+            consumedToCompletion = true;
+        }
+        finally
+        {
+            if (!consumedToCompletion)
+                linkedCancellation.Cancel();
+
+            Exception? cleanupFailure = null;
+            try
+            {
+                await operation;
+            }
+            catch (Exception exception)
+            {
+                cleanupFailure = exception;
+            }
+
+            channel.Writer.TryComplete();
+            if (!consumedToCompletion && cleanupFailure is not null &&
+                cleanupFailure is not OperationCanceledException)
+                throw cleanupFailure;
+        }
+    }
+
+    private async Task RunStreamingOperationAsync(
+        ChatTurnInput input,
+        ChatPipelineSnapshot snapshot,
+        ChannelWriter<ChatStreamChunk> writer,
+        CancellationToken cancellationToken)
+    {
+        var effectiveInput = input;
+        var turnCompleted = false;
+        try
+        {
+            var stage = await RunStageWithInputAsync(
+                SharpClawActions.Chat.Turn,
+                input,
+                (replacedInput, ct) =>
+                {
+                    effectiveInput = replacedInput;
+                    return RunStreamingCoreAsync(
+                        replacedInput,
+                        snapshot,
+                        writer,
+                        ct);
+                },
+                snapshot.Actions,
+                cancellationToken);
+            turnCompleted = true;
+            try
+            {
+                await writer.WriteAsync(
+                    ChatStreamChunk.Final(stage.Result.Completion),
+                    cancellationToken);
+            }
+            catch (OperationCanceledException) when (turnCompleted)
+            {
+            }
+            writer.TryComplete();
+        }
+        catch (KernelActionCancelledException)
+        {
+            await TryDispatchTerminalAsync(
+                new SharpClawActionKey("chat.turn.cancel"),
+                effectiveInput,
+                snapshot.Actions);
+            writer.TryComplete();
+            throw;
+        }
+        catch (OperationCanceledException)
+        {
+            if (!turnCompleted)
+            {
+                await TryDispatchTerminalAsync(
+                    new SharpClawActionKey("chat.turn.cancel"),
+                    effectiveInput,
+                    snapshot.Actions);
+            }
+            writer.TryComplete();
+            throw;
+        }
+        catch (KernelActionDeferredException)
+        {
+            writer.TryComplete();
+            throw;
+        }
+        catch (ActionOutcomeUncertainException)
+        {
+            writer.TryComplete();
+            throw;
+        }
+        catch (Exception exception)
+        {
+            if (!turnCompleted)
+            {
+                await TryDispatchTerminalAsync(
+                    new SharpClawActionKey("chat.turn.fail"),
+                    new KernelChatFailure(
+                        exception is KernelActionFailedException failed
+                            ? failed.Error.Code
+                            : "CHAT_TURN_FAILED",
+                        exception.Message),
+                    snapshot.Actions);
+            }
+            writer.TryComplete();
+            throw;
+        }
+    }
+
+    private async ValueTask<ChatTurnResult> RunStreamingCoreAsync(
+        ChatTurnInput input,
+        ChatPipelineSnapshot snapshot,
+        ChannelWriter<ChatStreamChunk> writer,
+        CancellationToken cancellationToken)
+    {
+        var request = await PrepareTurnAsync(input, snapshot, cancellationToken);
+        var providerStage = await RunStageWithInputAsync(
+            SharpClawActions.Chat.ProviderRound,
+            request,
+            (effectiveRequest, ct) => RunStreamingProviderAsync(
+                effectiveRequest,
+                snapshot,
+                writer,
+                ct),
+            snapshot.Actions,
+            cancellationToken);
+        return await CompleteTurnAsync(
+            providerStage.Input,
+            providerStage.Result,
+            snapshot,
+            cancellationToken);
+    }
+
+    private async ValueTask<ChatCompletionResult> RunStreamingProviderAsync(
+        ProviderTurnRequest request,
+        ChatPipelineSnapshot snapshot,
+        ChannelWriter<ChatStreamChunk> writer,
+        CancellationToken cancellationToken)
+    {
+        ChatCompletionResult? completion = null;
+        await foreach (var chunk in _providerLoop.StreamAsync(
+            request,
+            _toolPipeline,
+            cancellationToken))
+        {
+            if (chunk.IsFinished)
+            {
+                completion = chunk.Finished;
+                continue;
+            }
+
+            await writer.WriteAsync(chunk, cancellationToken);
+        }
+
+        if (completion is null || string.Equals(
+                completion.Refusal,
+                "The provider stream ended without a completion.",
+                StringComparison.Ordinal))
+            throw new KernelActionExecutionException(
+                "The provider stream ended without a completion.");
+
+        return await RunStageAsync(
+            new SharpClawActionKey("chat.provider_round.complete"),
+            completion,
+            static (value, _) => ValueTask.FromResult(value),
+            snapshot.Actions,
+            cancellationToken);
+    }
+
+    private async ValueTask<ProviderTurnRequest> PrepareTurnAsync(
+        ChatTurnInput input,
+        ChatPipelineSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
         var conversationStage = await RunStageWithInputAsync(
             SharpClawActions.Chat.ResolveConversation,
             input,
@@ -105,8 +338,10 @@ public sealed class DirectTurnRunner
             snapshot.Actions,
             cancellationToken);
         var effectiveInput = conversationStage.Input;
-        var conversation = conversationStage.Result;
-        var turn = new ChatTurnContext(Guid.NewGuid(), effectiveInput, conversation);
+        var turn = new ChatTurnContext(
+            Guid.NewGuid(),
+            effectiveInput,
+            conversationStage.Result);
         var userMessage = await RunStageAsync(
             new SharpClawActionKey("chat.user_message.prepare"),
             new KernelChatUserMessage(turn, effectiveInput.Message),
@@ -126,7 +361,6 @@ public sealed class DirectTurnRunner
             snapshot.Actions,
             cancellationToken);
         turn = profileStage.Input;
-        var profile = profileStage.Result;
         var historyStage = await RunStageWithInputAsync(
             SharpClawActions.Chat.LoadHistory,
             turn,
@@ -139,9 +373,12 @@ public sealed class DirectTurnRunner
             snapshot.Actions,
             cancellationToken);
         turn = historyStage.Input;
-        var history = historyStage.Result;
         var context = await _contextAssembler.BuildAsync(
-            new ChatContextRequest(turn.Conversation.ConversationId, profile, history, turn),
+            new ChatContextRequest(
+                turn.Conversation.ConversationId,
+                profileStage.Result,
+                historyStage.Result,
+                turn),
             cancellationToken);
         var collectedTools = await RunInputStageAsync(
             new SharpClawActionKey("chat.tools.collect"),
@@ -155,34 +392,22 @@ public sealed class DirectTurnRunner
             (tools, _) => ValueTask.FromResult<IReadOnlyList<ToolDescriptor>>(tools),
             snapshot.Actions,
             cancellationToken);
-        var request = new ProviderTurnRequest(
+        return new ProviderTurnRequest(
             turn,
-            profile,
+            profileStage.Result,
             context,
             selectedTools);
-        var providerStage = await RunStageWithInputAsync(
-            SharpClawActions.Chat.ProviderRound,
-            request,
-            async (effectiveRequest, ct) =>
-            {
-                var value = await _providerLoop.RunAsync(effectiveRequest, _toolPipeline, ct);
-                return await RunStageAsync(
-                    new SharpClawActionKey("chat.provider_round.complete"),
-                    value,
-                    static (completion, _) => ValueTask.FromResult(completion),
-                    snapshot.Actions,
-                    ct);
-            },
-            snapshot.Actions,
-            cancellationToken);
-        request = providerStage.Input;
-        turn = request.Turn;
-        profile = request.Profile;
-        context = request.Context;
-        var completion = providerStage.Result;
+    }
+
+    private async ValueTask<ChatTurnResult> CompleteTurnAsync(
+        ProviderTurnRequest request,
+        ChatCompletionResult completion,
+        ChatPipelineSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
         var exchange = await RunStageAsync(
             new SharpClawActionKey("chat.assistant_message.prepare"),
-            new ChatExchange(turn, turn.Input.Message, completion),
+            new ChatExchange(request.Turn, request.Turn.Input.Message, completion),
             static (value, _) => ValueTask.FromResult(value),
             snapshot.Actions,
             cancellationToken);
@@ -212,10 +437,10 @@ public sealed class DirectTurnRunner
             snapshot.Actions,
             cancellationToken);
         var result = new ChatTurnResult(
-            turn.TurnId,
-            turn.Conversation.ConversationId,
+            request.Turn.TurnId,
+            request.Turn.Conversation.ConversationId,
             completion,
-            context.Features);
+            request.Context.Features);
         return await RunStageAsync(
             new SharpClawActionKey("chat.turn.complete"),
             result,
