@@ -188,6 +188,32 @@ public sealed class KernelDirectTurnStreamingTests
     }
 
     [Fact]
+    public async Task Root_result_replacement_fails_closed_before_commit_and_final_chunk()
+    {
+        var graphBuilder = new KernelGraphBuilder();
+        graphBuilder.Hooks.For(SharpClawActions.Chat.Turn)
+            .Use<RootResultReplacementInterceptor>(Order("replace-root"));
+        var graph = graphBuilder.Compile();
+        var store = new RecordingStore();
+        var chunks = new List<ChatStreamChunk>();
+        var exception = await Record.ExceptionAsync(async () =>
+        {
+            chunks = await CollectAsync(
+                CreateRunner(
+                    graph,
+                    new KernelActionDispatcher(graph, TestContext()),
+                    new ParityTransport(),
+                    store)
+                .StreamAsync(new ChatTurnInput("hello")));
+        });
+
+        var failed = Assert.IsType<KernelActionExecutionException>(exception);
+        Assert.Contains("terminal callback", failed.Message, StringComparison.Ordinal);
+        Assert.Empty(chunks);
+        Assert.Equal(0, store.Commits);
+    }
+
+    [Fact]
     public async Task Concurrent_active_request_contexts_remain_isolated()
     {
         RecordingInterceptor.Clear();
@@ -312,6 +338,26 @@ public sealed class KernelDirectTurnStreamingTests
             CancellationToken cancellationToken) =>
             ValueTask.FromResult<IActionOutcome<object>>(
                 control.Fail(new ExecutionError("REPORT_FAILED", "terminal reporting failed")));
+    }
+
+    private sealed class RootResultReplacementInterceptor : IActionInterceptor<KernelActionEnvelope, object>
+    {
+        public ValueTask<IActionOutcome<object>> InvokeAsync(
+            ActionContext<KernelActionEnvelope> context,
+            IActionControl<KernelActionEnvelope, object> control,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult<IActionOutcome<object>>(
+                control.ReplaceResult(
+                    new ChatTurnResult(
+                        Guid.NewGuid(),
+                        Guid.NewGuid(),
+                        new ChatCompletionResult
+                        {
+                            Content = "replaced",
+                            ToolCalls = []
+                        },
+                        []),
+                    "Replace the root result without running the direct turn."));
     }
 
     private sealed class ConversationResolver : IConversationResolver

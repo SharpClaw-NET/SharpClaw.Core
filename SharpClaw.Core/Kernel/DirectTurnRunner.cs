@@ -188,31 +188,36 @@ public sealed class DirectTurnRunner
         CancellationToken cancellationToken)
     {
         var effectiveInput = input;
-        var turnCompleted = false;
+        var terminalCallbackCompleted = false;
         try
         {
             var stage = await RunStageWithInputAsync(
                 SharpClawActions.Chat.Turn,
                 input,
-                (replacedInput, ct) =>
+                async (replacedInput, ct) =>
                 {
                     effectiveInput = replacedInput;
-                    return RunStreamingCoreAsync(
+                    var result = await RunStreamingCoreAsync(
                         replacedInput,
                         snapshot,
                         writer,
                         ct);
+                    terminalCallbackCompleted = true;
+                    return result;
                 },
                 snapshot.Actions,
                 cancellationToken);
-            turnCompleted = true;
+            if (!terminalCallbackCompleted)
+                throw new KernelActionExecutionException(
+                    "The chat.turn.start action completed without running its terminal callback.");
+
             try
             {
                 await writer.WriteAsync(
                     ChatStreamChunk.Final(stage.Result.Completion),
                     cancellationToken);
             }
-            catch (OperationCanceledException) when (turnCompleted)
+            catch (OperationCanceledException) when (terminalCallbackCompleted)
             {
             }
             writer.TryComplete();
@@ -228,7 +233,7 @@ public sealed class DirectTurnRunner
         }
         catch (OperationCanceledException)
         {
-            if (!turnCompleted)
+            if (!terminalCallbackCompleted)
             {
                 await TryDispatchTerminalAsync(
                     new SharpClawActionKey("chat.turn.cancel"),
@@ -250,7 +255,7 @@ public sealed class DirectTurnRunner
         }
         catch (Exception exception)
         {
-            if (!turnCompleted)
+            if (!terminalCallbackCompleted)
             {
                 await TryDispatchTerminalAsync(
                     new SharpClawActionKey("chat.turn.fail"),

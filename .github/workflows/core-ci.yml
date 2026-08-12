@@ -1,0 +1,46 @@
+name: Core CI
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: Restore, build, and test Core
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore SharpClaw.Core.slnx
+
+      - name: Build
+        run: dotnet build SharpClaw.Core.slnx --configuration Release --no-restore
+
+      - name: Run direct-turn streaming tests
+        run: >-
+          dotnet test SharpClaw.Core.Tests/SharpClaw.Core.Tests.csproj
+          --configuration Release --no-build
+          --filter FullyQualifiedName~KernelDirectTurnStreamingTests
+
+      - name: Run maintained Core tests
+        run: >-
+          dotnet test SharpClaw.Core.slnx
+          --configuration Release --no-build
