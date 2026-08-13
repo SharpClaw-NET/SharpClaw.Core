@@ -216,6 +216,39 @@ public sealed class KernelSnapshotCompiler
                 $"Jobs module must register the catalog exactly once. Missing: " +
                 $"{string.Join(", ", missing)}. Extra: {string.Join(", ", extra)}.");
         }
+
+        var definitions = builder.ActionDefinitions
+            .Where(definition => definition.IsJobsAction)
+            .ToDictionary(definition => definition.Key.Value, StringComparer.Ordinal);
+        foreach (var family in SharpClawActionCatalog.JobsFamilies)
+        {
+            var root = definitions[family];
+            var before = definitions[$"{family}.before"];
+            var after = definitions[$"{family}.after"];
+
+            if (!string.Equals(root.OwnerModuleId, before.OwnerModuleId, StringComparison.Ordinal) ||
+                !string.Equals(root.OwnerModuleId, after.OwnerModuleId, StringComparison.Ordinal))
+            {
+                throw new KernelGraphCompilationException(
+                    $"Jobs family '{family}' must use one module owner for root, before, and after descriptors.");
+            }
+
+            var expectedBeforeType = typeof(JobCheckpoint<>).MakeGenericType(root.ActionType);
+            if (before.ActionType != expectedBeforeType || before.ResultType != expectedBeforeType)
+            {
+                throw new KernelGraphCompilationException(
+                    $"Jobs family '{family}' before checkpoint types must match the root input type " +
+                    $"'{root.ActionType.FullName}'.");
+            }
+
+            var expectedAfterType = typeof(JobCheckpoint<>).MakeGenericType(root.ResultType);
+            if (after.ActionType != expectedAfterType || after.ResultType != expectedAfterType)
+            {
+                throw new KernelGraphCompilationException(
+                    $"Jobs family '{family}' after checkpoint types must match the root result type " +
+                    $"'{root.ResultType.FullName}'.");
+            }
+        }
     }
 
     private static Dictionary<string, ICompiledEventDefinition> CompileEvents(
@@ -720,6 +753,12 @@ internal interface IActionDefinitionRegistration
 
     SharpClawActionKey Key { get; }
 
+    Type ActionType { get; }
+
+    Type ResultType { get; }
+
+    string OwnerModuleId { get; }
+
     bool IsJobsAction { get; }
 
     bool MatchesJobsCatalog { get; }
@@ -739,6 +778,12 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
     public dynamic Descriptor => descriptor;
 
     public SharpClawActionKey Key => descriptor.Key;
+
+    public Type ActionType => typeof(TAction);
+
+    public Type ResultType => typeof(TResult);
+
+    public string OwnerModuleId => ownerModuleId;
 
     public bool IsJobsAction => descriptor.Key.Value.StartsWith("jobs.", StringComparison.Ordinal);
 

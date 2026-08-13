@@ -107,9 +107,7 @@ public sealed record KernelStandardActionManifestEntry(
             resultType.GetGenericTypeDefinition() != typeof(JobCheckpoint<>))
             return false;
 
-        return IsJobsBeforeAction
-            ? actionType.GetGenericArguments()[0] == resultType.GetGenericArguments()[0]
-            : true;
+        return actionType.GetGenericArguments()[0] == resultType.GetGenericArguments()[0];
     }
 
     private static bool ContainsUnboundedType(Type type) =>

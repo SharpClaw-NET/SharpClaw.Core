@@ -245,6 +245,53 @@ public sealed class KernelJobsCatalogTests
     }
 
     [Fact]
+    public void Jobs_family_rejects_a_before_checkpoint_for_the_wrong_root_input_type()
+    {
+        var exception = Assert.Throws<KernelGraphCompilationException>(() =>
+            CreateJobsGraph(JobsDescriptorVariant.WrongBeforeType));
+
+        Assert.Contains("jobs.read", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("before checkpoint types must match the root input type", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Jobs_family_rejects_an_after_checkpoint_for_the_wrong_root_result_type()
+    {
+        var exception = Assert.Throws<KernelGraphCompilationException>(() =>
+            CreateJobsGraph(JobsDescriptorVariant.WrongAfterType));
+
+        Assert.Contains("jobs.read", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("after checkpoint types must match the root result type", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Jobs_family_rejects_unequal_after_checkpoint_types()
+    {
+        var exception = Assert.Throws<KernelGraphCompilationException>(() =>
+            CreateJobsGraph(JobsDescriptorVariant.UnequalAfterTypes));
+
+        Assert.Contains("jobs.read.after", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("does not match the catalog profile", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Jobs_family_requires_one_module_owner()
+    {
+        var registry = new KernelModuleRegistry();
+        var jobs = new JobsDescriptorModule(
+            skippedKeys: new HashSet<string>(StringComparer.Ordinal) { "jobs.read.before" });
+        var other = new ReadBeforeOwnerModule();
+        registry.Add(jobs);
+        registry.Add(other);
+
+        var exception = Assert.Throws<KernelGraphCompilationException>(() =>
+            registry.Compile(null, CreateOptions(jobs, [other], includeHookApprovals: true)));
+
+        Assert.Contains("jobs.read", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("one module owner", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Replace_input_cannot_redirect_the_operation_key()
     {
         var hook = new JobsHookModule<ReadReplaceInputInterceptor, JobsInput<ReadFamily>, JobsResult<ReadFamily>>(
@@ -362,12 +409,27 @@ public sealed class KernelJobsCatalogTests
         return registry.Compile(null, CreateOptions(jobs, hooks, includeHookApprovals: true));
     }
 
+    private static KernelGraph CreateJobsGraph(
+        JobsDescriptorVariant variant,
+        params IJobsHookModule[] hooks)
+    {
+        var (registry, jobs) = BuildJobsRegistry(variant, hooks);
+        return registry.Compile(null, CreateOptions(jobs, hooks, includeHookApprovals: true));
+    }
+
     private static (KernelModuleRegistry Registry, JobsDescriptorModule Jobs) BuildJobsRegistry(
         bool includeHookApprovals,
         params IJobsHookModule[] hooks)
     {
+        return BuildJobsRegistry(JobsDescriptorVariant.Valid, hooks);
+    }
+
+    private static (KernelModuleRegistry Registry, JobsDescriptorModule Jobs) BuildJobsRegistry(
+        JobsDescriptorVariant variant,
+        params IJobsHookModule[] hooks)
+    {
         var registry = new KernelModuleRegistry();
-        var jobs = new JobsDescriptorModule();
+        var jobs = new JobsDescriptorModule(variant);
         registry.Add(jobs);
         foreach (var hook in hooks)
             registry.Add(hook);
@@ -423,6 +485,14 @@ public sealed class KernelJobsCatalogTests
         };
     }
 
+    private enum JobsDescriptorVariant
+    {
+        Valid,
+        WrongBeforeType,
+        WrongAfterType,
+        UnequalAfterTypes
+    }
+
     private interface IJobsGrantSource
     {
         string ModuleId { get; }
@@ -436,8 +506,18 @@ public sealed class KernelJobsCatalogTests
 
     private sealed class JobsDescriptorModule : ISharpClawModule, IJobsGrantSource
     {
+        private readonly JobsDescriptorVariant _variant;
+        private readonly IReadOnlySet<string> _skippedKeys;
         private readonly Dictionary<string, ActionInterceptionCapabilities> _grants = new(StringComparer.Ordinal);
         private readonly List<KernelSensitiveActionApproval> _approvals = [];
+
+        public JobsDescriptorModule(
+            JobsDescriptorVariant variant = JobsDescriptorVariant.Valid,
+            IReadOnlySet<string>? skippedKeys = null)
+        {
+            _variant = variant;
+            _skippedKeys = skippedKeys ?? new HashSet<string>(StringComparer.Ordinal);
+        }
 
         public ModuleIdentity Identity { get; } = new("jobs.module", "Jobs module", "jobs");
 
@@ -503,12 +583,52 @@ public sealed class KernelJobsCatalogTests
                 Descriptor<JobCheckpoint<JobsInput<TFamily>>, JobCheckpoint<JobsInput<TFamily>>>($"{family}.before"),
                 Descriptor<JobsInput<TFamily>, JobsResult<TFamily>>(family),
                 Descriptor<JobCheckpoint<JobsResult<TFamily>>, JobCheckpoint<JobsResult<TFamily>>>($"{family}.after"));
-            module.Actions.Add(contract.Before);
-            module.Actions.Add(contract.Action);
-            module.Actions.Add(contract.After);
-            AddAuthority(contract.Before);
-            AddAuthority(contract.Action);
-            AddAuthority(contract.After);
+
+            if (family == "jobs.read")
+            {
+                switch (_variant)
+                {
+                    case JobsDescriptorVariant.WrongBeforeType:
+                        AddDescriptor(
+                            module,
+                            Descriptor<JobCheckpoint<JobsInput<ProgressFamily>>, JobCheckpoint<JobsInput<ProgressFamily>>>(
+                                $"{family}.before"));
+                        AddDescriptor(module, contract.Action);
+                        AddDescriptor(module, contract.After);
+                        return;
+                    case JobsDescriptorVariant.WrongAfterType:
+                        AddDescriptor(module, contract.Before);
+                        AddDescriptor(module, contract.Action);
+                        AddDescriptor(
+                            module,
+                            Descriptor<JobCheckpoint<JobsResult<ProgressFamily>>, JobCheckpoint<JobsResult<ProgressFamily>>>(
+                                $"{family}.after"));
+                        return;
+                    case JobsDescriptorVariant.UnequalAfterTypes:
+                        AddDescriptor(module, contract.Before);
+                        AddDescriptor(module, contract.Action);
+                        AddDescriptor(
+                            module,
+                            Descriptor<JobCheckpoint<JobsResult<ReadFamily>>, JobCheckpoint<JobsResult<ProgressFamily>>>(
+                                $"{family}.after"));
+                        return;
+                }
+            }
+
+            AddDescriptor(module, contract.Before);
+            AddDescriptor(module, contract.Action);
+            AddDescriptor(module, contract.After);
+        }
+
+        private void AddDescriptor<TAction, TResult>(
+            ISharpClawModuleBuilder module,
+            ActionDescriptor<TAction, TResult> descriptor)
+        {
+            if (_skippedKeys.Contains(descriptor.Key.Value))
+                return;
+
+            module.Actions.Add(descriptor);
+            AddAuthority(descriptor);
         }
 
         private void AddAuthority<TAction, TResult>(ActionDescriptor<TAction, TResult> descriptor)
@@ -522,6 +642,40 @@ public sealed class KernelJobsCatalogTests
                 typeof(TResult).AssemblyQualifiedName!,
                 KernelSchemaIdentity.Action(descriptor)));
         }
+    }
+
+    private sealed class ReadBeforeOwnerModule : IJobsHookModule
+    {
+        private static readonly ActionDescriptor<
+            JobCheckpoint<JobsInput<ReadFamily>>,
+            JobCheckpoint<JobsInput<ReadFamily>>> DescriptorInstance =
+            Descriptor<JobCheckpoint<JobsInput<ReadFamily>>, JobCheckpoint<JobsInput<ReadFamily>>>(
+                "jobs.read.before");
+
+        public ModuleIdentity Identity { get; } =
+            new("jobs.other.module", "Other Jobs module", "jobs-other");
+
+        public string ModuleId => Identity.Id;
+
+        public IReadOnlyDictionary<string, ActionInterceptionCapabilities> Grants { get; } =
+            new Dictionary<string, ActionInterceptionCapabilities>
+            {
+                [DescriptorInstance.Key.Value] = DescriptorInstance.Capabilities
+            };
+
+        public IReadOnlyList<KernelSensitiveActionApproval> Approvals { get; } =
+        [
+            new KernelSensitiveActionApproval(
+                "jobs.other.module",
+                DescriptorInstance.Key,
+                DescriptorInstance.Version,
+                typeof(JobCheckpoint<JobsInput<ReadFamily>>).AssemblyQualifiedName!,
+                typeof(JobCheckpoint<JobsInput<ReadFamily>>).AssemblyQualifiedName!,
+                KernelSchemaIdentity.Action(DescriptorInstance))
+        ];
+
+        public void Configure(ISharpClawModuleBuilder module) =>
+            module.Actions.Add(DescriptorInstance);
     }
 
     private sealed class JobsHookModule<TInterceptor, TAction, TResult>(
