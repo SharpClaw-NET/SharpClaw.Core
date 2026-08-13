@@ -88,13 +88,7 @@ public sealed class KernelGraphBuilder
     {
         foreach (var manifest in KernelActionCatalog.Descriptors)
         {
-            if (manifest.IsJobsBeforeAction)
-                Add(manifest.ToJobsBeforeDescriptor(), KernelCapabilities.CoreOwner);
-            else if (manifest.IsJobsAfterAction)
-                Add(manifest.ToJobsAfterDescriptor(), KernelCapabilities.CoreOwner);
-            else if (manifest.IsJobsAction)
-                Add(manifest.ToJobsActionDescriptor(), KernelCapabilities.CoreOwner);
-            else
+            if (!manifest.IsJobsAction)
                 Add(manifest.ToDescriptor(), KernelCapabilities.CoreOwner);
         }
     }
@@ -171,6 +165,7 @@ public sealed class KernelSnapshotCompiler
         IServiceProvider? serviceProvider,
         KernelGraphCompileOptions options)
     {
+        ValidateJobsCatalog(builder);
         var result = new Dictionary<string, ICompiledActionDefinition>(StringComparer.Ordinal);
         foreach (var definition in builder.ActionDefinitions)
         {
@@ -185,6 +180,42 @@ public sealed class KernelSnapshotCompiler
         }
 
         return result;
+    }
+
+    private static void ValidateJobsCatalog(KernelGraphBuilder builder)
+    {
+        var invalid = builder.ActionDefinitions
+            .Where(definition => definition.IsJobsAction && !definition.MatchesJobsCatalog)
+            .Select(definition => definition.Key.Value)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(key => key, StringComparer.Ordinal)
+            .ToArray();
+        if (invalid.Length > 0)
+        {
+            throw new KernelGraphCompilationException(
+                $"Jobs action(s) use a typed descriptor that does not match the catalog profile: " +
+                $"{string.Join(", ", invalid)}.");
+        }
+
+        var registered = builder.ActionDefinitions
+            .Select(definition => definition.Key.Value)
+            .Where(key => key.StartsWith("jobs.", StringComparison.Ordinal))
+            .ToArray();
+        if (registered.Length == 0)
+            return;
+
+        var expected = SharpClawActionCatalog.Jobs
+            .Select(key => key.Value)
+            .ToHashSet(StringComparer.Ordinal);
+        var actual = registered.ToHashSet(StringComparer.Ordinal);
+        var missing = expected.Except(actual, StringComparer.Ordinal).OrderBy(key => key, StringComparer.Ordinal).ToArray();
+        var extra = actual.Except(expected, StringComparer.Ordinal).OrderBy(key => key, StringComparer.Ordinal).ToArray();
+        if (missing.Length > 0 || extra.Length > 0 || registered.Length != actual.Count)
+        {
+            throw new KernelGraphCompilationException(
+                $"Jobs module must register the catalog exactly once. Missing: " +
+                $"{string.Join(", ", missing)}. Extra: {string.Join(", ", extra)}.");
+        }
     }
 
     private static Dictionary<string, ICompiledEventDefinition> CompileEvents(
@@ -274,8 +305,8 @@ public sealed class KernelSnapshotCompiler
                 var contract = KernelActionCatalog.DescriptorFor(action.Key);
                 records.Add(
                     $"action.payload-contract|{action.Key.Value}|" +
-                    $"{contract.InputPayloadType.AssemblyQualifiedName}|" +
-                    contract.ResultPayloadType.AssemblyQualifiedName);
+                    $"{contract.InputPayloadType?.AssemblyQualifiedName ?? "module-typed"}|" +
+                    $"{contract.ResultPayloadType?.AssemblyQualifiedName ?? "module-typed"}");
             }
             records.Add($"action.signature|{action.Signature}");
         }
@@ -560,23 +591,43 @@ public sealed class KernelGraph
         return GetAction<KernelActionEnvelope, object>(key).Descriptor;
     }
 
-    public ActionDescriptor<JobActionInput<JsonElement>, JobActionResult<JsonElement>>
-        GetStandardJobsAction(SharpClawActionKey key) =>
-        GetAction<JobActionInput<JsonElement>, JobActionResult<JsonElement>>(key).Descriptor;
+    public ActionDescriptor<TAction, TResult> GetJobsAction<TAction, TResult>(SharpClawActionKey key)
+    {
+        EnsureJobsRoot(key);
+        return GetAction<TAction, TResult>(key).Descriptor;
+    }
 
-    public ActionDescriptor<
-        JobCheckpoint<JobActionInput<JsonElement>>,
-        JobCheckpoint<JobActionInput<JsonElement>>> GetStandardJobsBeforeAction(SharpClawActionKey key) =>
-        GetAction<
-            JobCheckpoint<JobActionInput<JsonElement>>,
-            JobCheckpoint<JobActionInput<JsonElement>>>(key).Descriptor;
+    public ActionDescriptor<JobCheckpoint<TValue>, JobCheckpoint<TValue>>
+        GetJobsBeforeAction<TValue>(SharpClawActionKey key)
+    {
+        EnsureJobsCheckpoint(key, before: true);
+        return GetAction<JobCheckpoint<TValue>, JobCheckpoint<TValue>>(key).Descriptor;
+    }
 
-    public ActionDescriptor<
-        JobCheckpoint<JobActionResult<JsonElement>>,
-        JobCheckpoint<JobActionResult<JsonElement>>> GetStandardJobsAfterAction(SharpClawActionKey key) =>
-        GetAction<
-            JobCheckpoint<JobActionResult<JsonElement>>,
-            JobCheckpoint<JobActionResult<JsonElement>>>(key).Descriptor;
+    public ActionDescriptor<JobCheckpoint<TResult>, JobCheckpoint<TResult>>
+        GetJobsAfterAction<TResult>(SharpClawActionKey key)
+    {
+        EnsureJobsCheckpoint(key, before: false);
+        return GetAction<JobCheckpoint<TResult>, JobCheckpoint<TResult>>(key).Descriptor;
+    }
+
+    private static void EnsureJobsRoot(SharpClawActionKey key)
+    {
+        if (!SharpClawActionCatalog.Jobs.Contains(key) ||
+            key.Value.EndsWith(".before", StringComparison.Ordinal) ||
+            key.Value.EndsWith(".after", StringComparison.Ordinal))
+            throw new KernelActionExecutionException(
+                $"Action '{key.Value}' is not a registered Jobs root action.");
+    }
+
+    private static void EnsureJobsCheckpoint(SharpClawActionKey key, bool before)
+    {
+        var valid = SharpClawActionCatalog.Jobs.Contains(key) &&
+                    key.Value.EndsWith(before ? ".before" : ".after", StringComparison.Ordinal);
+        if (!valid)
+            throw new KernelActionExecutionException(
+                $"Action '{key.Value}' is not a registered Jobs {(before ? "before" : "after")} checkpoint.");
+    }
 
     internal CompiledActionDefinition<TAction, TResult> GetAction<TAction, TResult>(
         SharpClawActionKey key)
@@ -669,6 +720,10 @@ internal interface IActionDefinitionRegistration
 
     SharpClawActionKey Key { get; }
 
+    bool IsJobsAction { get; }
+
+    bool MatchesJobsCatalog { get; }
+
     ICompiledActionDefinition Compile(
         IReadOnlyList<KernelActionHookRegistration> hooks,
         IServiceProvider? serviceProvider,
@@ -684,6 +739,13 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
     public dynamic Descriptor => descriptor;
 
     public SharpClawActionKey Key => descriptor.Key;
+
+    public bool IsJobsAction => descriptor.Key.Value.StartsWith("jobs.", StringComparison.Ordinal);
+
+    public bool MatchesJobsCatalog =>
+        !IsJobsAction ||
+        (SharpClawActionCatalog.Jobs.Contains(descriptor.Key) &&
+         KernelActionCatalog.DescriptorFor(descriptor.Key).MatchesDescriptor(descriptor));
 
     public ICompiledActionDefinition Compile(
         IReadOnlyList<KernelActionHookRegistration> hooks,
@@ -1226,7 +1288,10 @@ public static class KernelSchemaIdentity
             SharpClawActionCatalog.Kernel.Contains(descriptor.Key))
         {
             var contract = KernelActionCatalog.DescriptorFor(descriptor.Key);
-            return (contract.InputPayloadType, contract.ResultPayloadType);
+            if (contract.InputPayloadType is { } input && contract.ResultPayloadType is { } result)
+                return (input, result);
+            throw new KernelGraphCompilationException(
+                $"Action '{descriptor.Key.Value}' requires a module-owned typed descriptor.");
         }
         return (actionType, resultType);
     }

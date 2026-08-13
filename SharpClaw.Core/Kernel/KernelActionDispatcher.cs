@@ -868,7 +868,9 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             if (!UsesStandardEnvelope)
                 return KernelJson.Deserialize<TAction>(input);
             var contract = KernelActionCatalog.DescriptorFor(_definition.Descriptor.Key);
-            var payload = KernelJson.Deserialize(input, contract.InputPayloadType);
+            var payloadType = contract.InputPayloadType ?? throw new KernelActionExecutionException(
+                $"Action '{_definition.Descriptor.Key.Value}' has no host envelope payload type.");
+            var payload = KernelJson.Deserialize(input, payloadType);
             return (TAction)(object)new KernelActionEnvelope(_definition.Descriptor.Key, payload);
         }
 
@@ -877,7 +879,9 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             if (!UsesStandardEnvelope)
                 return KernelJson.Deserialize<TResult>(result);
             var contract = KernelActionCatalog.DescriptorFor(_definition.Descriptor.Key);
-            return (TResult)KernelJson.Deserialize(result, contract.ResultPayloadType)!;
+            var resultType = contract.ResultPayloadType ?? throw new KernelActionExecutionException(
+                $"Action '{_definition.Descriptor.Key.Value}' has no host envelope result type.");
+            return (TResult)KernelJson.Deserialize(result, resultType)!;
         }
 
         private bool UsesStandardEnvelope =>

@@ -247,8 +247,16 @@ public sealed class KernelAuthorityCorrectionTests
         Assert.All(entries, entry =>
         {
             Assert.Equal(1, entry.Version);
-            Assert.NotEqual(typeof(KernelActionEnvelope), entry.InputPayloadType);
-            Assert.NotEqual(typeof(object), entry.ResultPayloadType);
+            if (entry.Key.Value.StartsWith("jobs.", StringComparison.Ordinal))
+            {
+                Assert.Null(entry.InputPayloadType);
+                Assert.Null(entry.ResultPayloadType);
+            }
+            else
+            {
+                Assert.NotEqual(typeof(KernelActionEnvelope), entry.InputPayloadType);
+                Assert.NotEqual(typeof(object), entry.ResultPayloadType);
+            }
             Assert.NotEmpty(entry.InputSchema.ContractName);
             Assert.False(string.IsNullOrEmpty(entry.InputSchema.ContentHash));
             Assert.NotEmpty(entry.ResultSchema.ContractName);
@@ -320,8 +328,8 @@ public sealed class KernelAuthorityCorrectionTests
                 entry.Key.Value,
                 entry.Version.ToString(CultureInfo.InvariantCulture),
                 entry.Category,
-                entry.InputPayloadType.AssemblyQualifiedName,
-                entry.ResultPayloadType.AssemblyQualifiedName,
+                entry.InputPayloadType?.AssemblyQualifiedName ?? "module-typed",
+                entry.ResultPayloadType?.AssemblyQualifiedName ?? "module-typed",
                 entry.InputSchema.ContractName,
                 entry.InputSchema.Version.ToString(CultureInfo.InvariantCulture),
                 entry.InputSchema.ContentHash,
@@ -342,7 +350,7 @@ public sealed class KernelAuthorityCorrectionTests
                 string.Join(',', entry.SafePoints.Select(value => ((int)value).ToString(CultureInfo.InvariantCulture))),
                 ((int)entry.Profile).ToString(CultureInfo.InvariantCulture)));
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join("\n", records))));
-        Assert.Equal("7117B533A603CC0811EC688569B347E5C5BA8E0AF4428A4E7D0E6CE5FD613FC6", hash);
+        Assert.Equal("1694E44DFFB1C91251E500579D2AC7A28B86B611EF52EC927383B2B564FA6D7E", hash);
     }
 
     [Fact]

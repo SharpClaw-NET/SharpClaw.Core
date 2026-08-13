@@ -28,8 +28,8 @@ public sealed record KernelStandardActionManifestEntry(
     SharpClawActionKey Key,
     int Version,
     string Category,
-    Type InputPayloadType,
-    Type ResultPayloadType,
+    Type? InputPayloadType,
+    Type? ResultPayloadType,
     JsonSchemaReference InputSchema,
     JsonSchemaReference ResultSchema,
     ActionInterceptionCapabilities Capabilities,
@@ -71,69 +71,11 @@ public sealed record KernelStandardActionManifestEntry(
         };
     }
 
-    public ActionDescriptor<
-        JobActionInput<JsonElement>,
-        JobActionResult<JsonElement>> ToJobsActionDescriptor()
-    {
-        if (!IsJobsAction || IsJobsBeforeAction || IsJobsAfterAction)
-            throw new KernelGraphCompilationException(
-                $"Action '{Key.Value}' is not a Jobs root action.");
-
-        return CreateDescriptor<
-            JobActionInput<JsonElement>,
-            JobActionResult<JsonElement>>();
-    }
-
-    public ActionDescriptor<
-        JobCheckpoint<JobActionInput<JsonElement>>,
-        JobCheckpoint<JobActionInput<JsonElement>>> ToJobsBeforeDescriptor()
-    {
-        if (!IsJobsBeforeAction)
-            throw new KernelGraphCompilationException(
-                $"Action '{Key.Value}' is not a Jobs before checkpoint.");
-
-        return CreateDescriptor<
-            JobCheckpoint<JobActionInput<JsonElement>>,
-            JobCheckpoint<JobActionInput<JsonElement>>>();
-    }
-
-    public ActionDescriptor<
-        JobCheckpoint<JobActionResult<JsonElement>>,
-        JobCheckpoint<JobActionResult<JsonElement>>> ToJobsAfterDescriptor()
-    {
-        if (!IsJobsAfterAction)
-            throw new KernelGraphCompilationException(
-                $"Action '{Key.Value}' is not a Jobs after checkpoint.");
-
-        return CreateDescriptor<
-            JobCheckpoint<JobActionResult<JsonElement>>,
-            JobCheckpoint<JobActionResult<JsonElement>>>();
-    }
-
-    private ActionDescriptor<TAction, TResult> CreateDescriptor<TAction, TResult>() =>
-        new(
-            Key,
-            Version,
-            Category,
-            Capabilities,
-            ContainsSensitiveData,
-            HasIrreversibleEffects,
-            RepeatPolicy,
-            ContinuationPolicy,
-            DefaultTimeout)
-        {
-            ProtocolVersionRange = ContractVersionRange.Exact(1),
-            SafePoints = SafePoints
-        };
-
     public bool MatchesDescriptor<TAction, TResult>(ActionDescriptor<TAction, TResult> descriptor) =>
         descriptor.Key == Key &&
         descriptor.Version == Version &&
         descriptor.Category == Category &&
-        ((typeof(TAction) == InputPayloadType && typeof(TResult) == ResultPayloadType) ||
-         (!IsJobsAction &&
-          typeof(TAction) == typeof(KernelActionEnvelope) &&
-          typeof(TResult) == typeof(object))) &&
+        MatchesPayloadTypes<TAction, TResult>() &&
         descriptor.Capabilities == Capabilities &&
         descriptor.ContainsSensitiveData == ContainsSensitiveData &&
         descriptor.HasIrreversibleEffects == HasIrreversibleEffects &&
@@ -142,6 +84,39 @@ public sealed record KernelStandardActionManifestEntry(
         descriptor.DefaultTimeout == DefaultTimeout &&
         descriptor.ProtocolVersionRange == ContractVersionRange.Exact(1) &&
         descriptor.SafePoints.SequenceEqual(SafePoints);
+
+    private bool MatchesPayloadTypes<TAction, TResult>()
+    {
+        if (!IsJobsAction)
+        {
+            return (typeof(TAction) == InputPayloadType && typeof(TResult) == ResultPayloadType) ||
+                   (typeof(TAction) == typeof(KernelActionEnvelope) &&
+                    typeof(TResult) == typeof(object));
+        }
+
+        if (ContainsUnboundedType(typeof(TAction)) || ContainsUnboundedType(typeof(TResult)))
+            return false;
+
+        if (!IsJobsBeforeAction && !IsJobsAfterAction)
+            return true;
+
+        var actionType = typeof(TAction);
+        var resultType = typeof(TResult);
+        if (!actionType.IsGenericType || !resultType.IsGenericType ||
+            actionType.GetGenericTypeDefinition() != typeof(JobCheckpoint<>) ||
+            resultType.GetGenericTypeDefinition() != typeof(JobCheckpoint<>))
+            return false;
+
+        return IsJobsBeforeAction
+            ? actionType.GetGenericArguments()[0] == resultType.GetGenericArguments()[0]
+            : true;
+    }
+
+    private static bool ContainsUnboundedType(Type type) =>
+        type == typeof(object) ||
+        type == typeof(JsonElement) ||
+        type == typeof(KernelActionEnvelope) ||
+        (type.IsGenericType && type.GetGenericArguments().Any(ContainsUnboundedType));
 }
 
 internal static class KernelStandardActionManifest
@@ -621,20 +596,10 @@ internal static class KernelStandardActionManifest
                 ActionSafePoint.AfterCommit
             ]);
 
-    private static (Type Input, Type Result) ContractTypes(SharpClawActionKey key)
+    private static (Type? Input, Type? Result) ContractTypes(SharpClawActionKey key)
     {
         if (key.Value.StartsWith("jobs.", StringComparison.Ordinal))
-        {
-            if (key.Value.EndsWith(".before", StringComparison.Ordinal))
-                return (
-                    typeof(JobCheckpoint<JobActionInput<JsonElement>>),
-                    typeof(JobCheckpoint<JobActionInput<JsonElement>>));
-            if (key.Value.EndsWith(".after", StringComparison.Ordinal))
-                return (
-                    typeof(JobCheckpoint<JobActionResult<JsonElement>>),
-                    typeof(JobCheckpoint<JobActionResult<JsonElement>>));
-            return (typeof(JobActionInput<JsonElement>), typeof(JobActionResult<JsonElement>));
-        }
+            return (null, null);
 
         return key.Value switch
         {
@@ -693,12 +658,13 @@ internal static class KernelStandardActionManifest
     private static JsonSchemaReference Schema(
         SharpClawActionKey key,
         string role,
-        Type payloadType,
+        Type? payloadType,
         KernelStandardActionProfileData profile)
     {
         var contractName = $"sharpclaw.kernel.action.{key.Value}.{role}";
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
-            $"{contractName}|{KernelGraphHasher.StableScalar(1)}|{payloadType.AssemblyQualifiedName}|" +
+            $"{contractName}|{KernelGraphHasher.StableScalar(1)}|" +
+            $"{payloadType?.AssemblyQualifiedName ?? "module-typed"}|" +
             $"{KernelGraphHasher.StableScalar((int)profile.Capabilities)}|" +
             $"{KernelGraphHasher.StableScalar(profile.HasIrreversibleEffects)}|" +
             $"{KernelGraphHasher.StableScalar(profile.RepeatPolicy.Kind)}|" +
