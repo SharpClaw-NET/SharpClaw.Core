@@ -382,8 +382,19 @@ public sealed class KernelCanonicalJobsTests
                 : (JsonElement?)null;
             lock (_sync)
             {
-                var revision = _records.TryGetValue((storageName, key), out var previous)
-                    ? previous.Revision + 1
+                var hasPrevious = _records.TryGetValue((storageName, key), out var previous);
+                var expectedRevision = parameters.TryGetProperty("expectedRevision", out var expectedElement)
+                    ? expectedElement.GetInt64()
+                    : (long?)null;
+                if (expectedRevision is not null &&
+                    (hasPrevious ? previous!.Revision : 0) != expectedRevision.Value)
+                {
+                    throw new InvalidOperationException(
+                        $"The test storage rejected stale revision {expectedRevision.Value} for '{key}'.");
+                }
+
+                var revision = hasPrevious
+                    ? previous!.Revision + 1
                     : 1;
                 _records[(storageName, key)] = new StoredRecord(value, revision, indexes);
                 return JsonSerializer.SerializeToElement(new { saved = 1 });
@@ -394,8 +405,17 @@ public sealed class KernelCanonicalJobsTests
         {
             var key = parameters.GetProperty("key").GetString()!;
             lock (_sync)
+            {
+                if (parameters.TryGetProperty("expectedRevision", out var expectedElement) &&
+                    (!_records.TryGetValue((storageName, key), out var existing) ||
+                     existing.Revision != expectedElement.GetInt64()))
+                {
+                    throw new InvalidOperationException(
+                        $"The test storage rejected stale delete revision for '{key}'.");
+                }
                 return JsonSerializer.SerializeToElement(
                     new { deleted = _records.Remove((storageName, key)) });
+            }
         }
 
         private sealed record StoredRecord(JsonElement Value, long Revision, JsonElement? Indexes);

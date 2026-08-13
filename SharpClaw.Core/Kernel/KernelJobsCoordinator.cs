@@ -139,6 +139,8 @@ public sealed class KernelJobsCoordinator
             DateTimeOffset.UtcNow.AddMinutes(5),
             null);
         var job = existing;
+        var jobRevision = record.Revision;
+        long? attemptRevision = null;
         try
         {
             job = await RunFamilyAsync<KernelJobsOperationFamilies.Start>(
@@ -153,11 +155,25 @@ public sealed class KernelJobsCoordinator
                         ActiveAttemptId = attempt.AttemptId,
                     };
                     await SaveAttemptAsync(attempt, executionContext, ct);
-                    await SaveJobAsync(started, executionContext, ct);
+                    await SaveJobAsync(started, executionContext, ct, jobRevision);
                     return started;
                 },
                 executionContext,
-                cancellationToken);
+                cancellationToken,
+                jobRevision);
+
+            var startedRecord = await GetJobAsync(job.Id, executionContext, CancellationToken.None);
+            if (startedRecord?.Value is not { } startedJob)
+                throw new KernelActionExecutionException(
+                    $"Jobs record '{job.Id:D}' disappeared after its start transition.");
+            job = startedJob;
+            jobRevision = startedRecord.Revision;
+
+            var startedAttempt = await GetAttemptAsync(attempt.AttemptId, executionContext, CancellationToken.None);
+            if (startedAttempt is null)
+                throw new KernelActionExecutionException(
+                    $"Jobs attempt '{attempt.AttemptId:D}' disappeared after its start transition.");
+            attemptRevision = startedAttempt.Revision;
 
             job = await RunFamilyAsync<KernelJobsOperationFamilies.InterruptionCheck>(
                 new SharpClawActionKey("jobs.interruption.check"),
@@ -168,7 +184,8 @@ public sealed class KernelJobsCoordinator
                     return ValueTask.FromResult(current);
                 },
                 executionContext,
-                cancellationToken);
+                cancellationToken,
+                jobRevision);
 
             JobPayloadEnvelope? output = null;
             job = await RunFamilyAsync<KernelJobsOperationFamilies.HandlerInvoke>(
@@ -193,7 +210,8 @@ public sealed class KernelJobsCoordinator
                     return current with { Result = resultReference };
                 },
                 executionContext,
-                cancellationToken);
+                cancellationToken,
+                jobRevision);
 
             job = await RunFamilyAsync<KernelJobsOperationFamilies.Complete>(
                 new SharpClawActionKey("jobs.complete"),
@@ -209,12 +227,14 @@ public sealed class KernelJobsCoordinator
                     await SaveAttemptAsync(
                         attempt with { FinishedAt = completed.CompletedAt },
                         executionContext,
-                        ct);
-                    await SaveJobAsync(completed, executionContext, ct);
+                        ct,
+                        attemptRevision);
+                    await SaveJobAsync(completed, executionContext, ct, jobRevision);
                     return completed;
                 },
                 executionContext,
-                cancellationToken);
+                cancellationToken,
+                jobRevision);
 
             if (output is null)
                 throw new KernelActionExecutionException(
@@ -299,7 +319,8 @@ public sealed class KernelJobsCoordinator
                 return current;
             },
             executionContext,
-            cancellationToken);
+            cancellationToken,
+            record.Revision);
     }
 
     public async ValueTask<JobDocument> CancelAsync(
@@ -319,7 +340,8 @@ public sealed class KernelJobsCoordinator
             job,
             static (current, _) => ValueTask.FromResult(current with { Status = JobStatus.Paused }),
             executionContext,
-            cancellationToken);
+            cancellationToken,
+            record.Revision);
         return await RunFamilyAsync<KernelJobsOperationFamilies.CancelApply>(
             new SharpClawActionKey("jobs.cancel.apply"),
             requested,
@@ -331,11 +353,12 @@ public sealed class KernelJobsCoordinator
                     CompletedAt = DateTimeOffset.UtcNow,
                     OutcomeCertainty = ActionOutcomeCertainty.Certain,
                 };
-                await SaveJobAsync(cancelled, executionContext, ct);
+                await SaveJobAsync(cancelled, executionContext, ct, record.Revision);
                 return cancelled;
             },
             executionContext,
-            cancellationToken);
+            cancellationToken,
+            record.Revision);
     }
 
     public async ValueTask<JobDocument> RecoverAsync(
@@ -353,7 +376,8 @@ public sealed class KernelJobsCoordinator
             job,
             static (current, _) => ValueTask.FromResult(current),
             executionContext,
-            cancellationToken);
+            cancellationToken,
+            record.Revision);
     }
 
     public async ValueTask<JobDocument?> GetAsync(
@@ -403,7 +427,8 @@ public sealed class KernelJobsCoordinator
                 return current;
             },
             executionContext,
-            cancellationToken);
+            cancellationToken,
+            record.Revision);
         return deleted;
     }
 
@@ -438,9 +463,13 @@ public sealed class KernelJobsCoordinator
     {
         try
         {
+            var record = await GetJobAsync(job.Id, executionContext, CancellationToken.None);
+            if (record?.Value is not { } currentJob)
+                throw new KernelActionExecutionException(
+                    $"Jobs record '{job.Id:D}' disappeared during failure finalization.");
             return await RunFamilyAsync<KernelJobsOperationFamilies.Fail>(
                 new SharpClawActionKey("jobs.fail"),
-                job,
+                currentJob,
                 async (current, ct) =>
                 {
                     var failed = current with
@@ -450,11 +479,12 @@ public sealed class KernelJobsCoordinator
                         OutcomeCertainty = ActionOutcomeCertainty.Certain,
                         Error = error,
                     };
-                    await SaveJobAsync(failed, executionContext, ct);
+                    await SaveJobAsync(failed, executionContext, ct, record.Revision);
                     return failed;
                 },
                 executionContext,
-                CancellationToken.None);
+                CancellationToken.None,
+                record.Revision);
         }
         catch (Exception finalizeException)
         {
@@ -473,9 +503,13 @@ public sealed class KernelJobsCoordinator
         KernelActionExecutionContext executionContext,
         ActionUncertainty uncertainty)
     {
+        var record = await GetJobAsync(job.Id, executionContext, CancellationToken.None);
+        if (record?.Value is not { } currentJob)
+            throw new KernelActionExecutionException(
+                $"Jobs record '{job.Id:D}' disappeared during uncertainty finalization.");
         return await RunFamilyAsync<KernelJobsOperationFamilies.ExternalEffectUncertain>(
             new SharpClawActionKey("jobs.external_effect.uncertain"),
-            job,
+            currentJob,
             async (current, ct) =>
             {
                 var uncertain = current with
@@ -484,28 +518,34 @@ public sealed class KernelJobsCoordinator
                     OutcomeCertainty = ActionOutcomeCertainty.Uncertain,
                     Error = new ExecutionError(uncertainty.Code, uncertainty.Message),
                 };
-                await SaveJobAsync(uncertain, executionContext, ct);
+                await SaveJobAsync(uncertain, executionContext, ct, record.Revision);
                 return uncertain;
             },
             executionContext,
-            CancellationToken.None);
+            CancellationToken.None,
+            record.Revision);
     }
 
     private async ValueTask<JobDocument> FinalizeHeldAsync(
         JobDocument job,
         KernelActionExecutionContext executionContext)
     {
+        var record = await GetJobAsync(job.Id, executionContext, CancellationToken.None);
+        if (record?.Value is not { } currentJob)
+            throw new KernelActionExecutionException(
+                $"Jobs record '{job.Id:D}' disappeared during hold finalization.");
         return await RunFamilyAsync<KernelJobsOperationFamilies.HoldEvaluate>(
             new SharpClawActionKey("jobs.hold.evaluate"),
-            job,
+            currentJob,
             async (current, ct) =>
             {
                 var held = current with { Status = JobStatus.Held };
-                await SaveJobAsync(held, executionContext, ct);
+                await SaveJobAsync(held, executionContext, ct, record.Revision);
                 return held;
             },
             executionContext,
-            CancellationToken.None);
+            CancellationToken.None,
+            record.Revision);
     }
 
     private ValueTask<ModuleDocumentRecord<JobDocument>?> GetJobAsync(
@@ -519,23 +559,42 @@ public sealed class KernelJobsCoordinator
             executionContext,
             cancellationToken);
 
+    private ValueTask<ModuleDocumentRecord<JobAttemptDocument>?> GetAttemptAsync(
+        Guid attemptId,
+        KernelActionExecutionContext executionContext,
+        CancellationToken cancellationToken) =>
+        RunStorageResultAsync<StorageGetAttemptRequest, ModuleDocumentRecord<JobAttemptDocument>?>(
+            new SharpClawActionKey("storage.get"),
+            new StorageGetAttemptRequest(attemptId),
+            (request, ct) => _store.GetAttemptAsync(request.AttemptId, ct),
+            executionContext,
+            cancellationToken);
+
     private ValueTask SaveJobAsync(
         JobDocument job,
         KernelActionExecutionContext executionContext,
-        CancellationToken cancellationToken) =>
+        CancellationToken cancellationToken,
+        long? expectedRevision = null) =>
         RunStorageMutationAsync(
             new StorageSaveJobRequest(job),
-            (request, ct) => _store.SaveJobAsync(request.Job, cancellationToken: ct),
+            (request, ct) => _store.SaveJobAsync(
+                request.Job,
+                expectedRevision,
+                ct),
             executionContext,
             cancellationToken);
 
     private ValueTask SaveAttemptAsync(
         JobAttemptDocument attempt,
         KernelActionExecutionContext executionContext,
-        CancellationToken cancellationToken) =>
+        CancellationToken cancellationToken,
+        long? expectedRevision = null) =>
         RunStorageMutationAsync(
             new StorageSaveAttemptRequest(attempt),
-            (request, ct) => _store.SaveAttemptAsync(request.Attempt, cancellationToken: ct),
+            (request, ct) => _store.SaveAttemptAsync(
+                request.Attempt,
+                expectedRevision,
+                ct),
             executionContext,
             cancellationToken);
 
@@ -571,13 +630,15 @@ public sealed class KernelJobsCoordinator
         JobDocument job,
         Func<JobDocument, CancellationToken, ValueTask<JobDocument>> terminal,
         KernelActionExecutionContext executionContext,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        long expectedRevision = 0)
     {
         return await _actionRunner.RunAsync<TFamily>(
             key,
             job,
             terminal,
             executionContext,
+            expectedRevision,
             cancellationToken: cancellationToken);
     }
 
@@ -733,6 +794,7 @@ public sealed class KernelJobsCoordinator
             .All(value => value);
 
     private sealed record StorageGetRequest(Guid JobId);
+    private sealed record StorageGetAttemptRequest(Guid AttemptId);
     private sealed record StorageGetResultRequest(Guid JobId);
     private sealed record StorageListRequest;
     private sealed record StorageSaveJobRequest(JobDocument Job);
