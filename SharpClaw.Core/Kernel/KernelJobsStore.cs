@@ -46,8 +46,22 @@ public sealed class KernelJobsStore
         _jobs.GetRecordAsync(JobKey(jobId), cancellationToken);
 
     public Task<IReadOnlyList<ModuleDocumentRecord<JobDocument>>> ListJobRecordsAsync(
+        string? callerSubjectId = null,
+        Guid? idempotencyKey = null,
+        CancellationToken cancellationToken = default)
+    {
+        var query = _jobs.Query();
+        if (!string.IsNullOrWhiteSpace(callerSubjectId))
+            query = query.WhereIndex("callerSubject").EqualTo(callerSubjectId);
+        if (idempotencyKey is not null)
+            query = query.WhereIndex("idempotencyKey").EqualTo(idempotencyKey.Value.ToString("D"));
+        return query.OrderByIndex("createdAt").ToRecordsAsync(cancellationToken);
+    }
+
+    public Task<IReadOnlyList<ModuleDocumentRecord<JobDocument>>> FindJobRecordsByIdempotencyAsync(
+        Guid idempotencyKey,
         CancellationToken cancellationToken = default) =>
-        _jobs.Query().OrderByIndex("createdAt").ToRecordsAsync(cancellationToken);
+        ListJobRecordsAsync(idempotencyKey: idempotencyKey, cancellationToken: cancellationToken);
 
     public Task SaveJobAsync(
         JobDocument job,
@@ -82,6 +96,14 @@ public sealed class KernelJobsStore
         CancellationToken cancellationToken = default) =>
         _attempts.GetRecordAsync(AttemptKey(attemptId), cancellationToken);
 
+    public Task<IReadOnlyList<ModuleDocumentRecord<JobAttemptDocument>>> ListAttemptRecordsAsync(
+        Guid jobId,
+        CancellationToken cancellationToken = default) =>
+        _attempts.Query()
+            .WhereIndex("jobId").EqualTo(jobId.ToString("D"))
+            .OrderByIndex("startedAt")
+            .ToRecordsAsync(cancellationToken);
+
     public Task SaveResultAsync(
         Guid jobId,
         JobPayloadEnvelope result,
@@ -97,6 +119,11 @@ public sealed class KernelJobsStore
         CancellationToken cancellationToken = default) =>
         _results.GetRecordAsync(JobKey(jobId), cancellationToken);
 
+    public Task<bool> DeleteResultAsync(
+        Guid jobId,
+        CancellationToken cancellationToken = default) =>
+        _results.DeleteAsync(JobKey(jobId), cancellationToken);
+
     public Task SaveProgressAsync(
         JobProgress progress,
         CancellationToken cancellationToken = default) =>
@@ -111,6 +138,14 @@ public sealed class KernelJobsStore
                 occurredAt = progress.OccurredAt ?? DateTimeOffset.UtcNow,
             },
             cancellationToken);
+
+    public Task<IReadOnlyList<ModuleDocumentRecord<JobProgress>>> ListProgressRecordsAsync(
+        Guid jobId,
+        CancellationToken cancellationToken = default) =>
+        _progress.Query()
+            .WhereIndex("jobId").EqualTo(jobId.ToString("D"))
+            .OrderByIndex("occurredAt")
+            .ToRecordsAsync(cancellationToken);
 
     private static string JobKey(Guid jobId) => jobId.ToString("N");
 
@@ -130,6 +165,7 @@ public sealed class KernelJobsStore
         actionKey = job.ActionKey.Value,
         status = job.Status.ToString(),
         callerSubject = job.Caller.SubjectId,
+        idempotencyKey = job.IdempotencyKey.ToString("D"),
         createdAt = job.CreatedAt,
         attemptId = job.ActiveAttemptId?.ToString("D"),
     };

@@ -103,6 +103,7 @@ public static class KernelJobsStorage
                 new("actionKey", ModuleStorageIndexValueKind.String),
                 new("status", ModuleStorageIndexValueKind.String),
                 new("callerSubject", ModuleStorageIndexValueKind.String),
+                new("idempotencyKey", ModuleStorageIndexValueKind.String),
                 new("createdAt", ModuleStorageIndexValueKind.DateTime, AllowsRange: true),
                 new("attemptId", ModuleStorageIndexValueKind.String)
             ]);

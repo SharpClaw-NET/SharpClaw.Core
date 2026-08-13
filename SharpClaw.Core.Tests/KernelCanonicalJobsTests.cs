@@ -22,6 +22,126 @@ public sealed class KernelCanonicalJobsTests
     }
 
     [Fact]
+    public void Jobs_control_keys_cannot_be_registered_as_workload_handlers()
+    {
+        var graph = CreateGraph();
+
+        var exception = Assert.Throws<ArgumentException>(() => new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(new InMemoryJobsGateway()),
+            [new ControlKeyHandler()]));
+
+        Assert.Contains("cannot identify a workload handler", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Submission_enforces_idempotency_and_job_owner_authority()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway();
+        var coordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [new ReadHandler()]);
+        var owner = CreateContext("owner");
+        var sameKey = Guid.NewGuid();
+        var submission = new JobSubmission<ReadRequest>(
+            new SharpClawActionKey("tool.fetch"),
+            new ReadRequest("same"),
+            owner.Caller,
+            owner.Features,
+            IdempotencyKey: sameKey);
+
+        var first = await coordinator.SubmitAsync(submission, owner);
+        var second = await coordinator.SubmitAsync(submission, owner);
+
+        Assert.Equal(first.Id, second.Id);
+        Assert.Equal(1, gateway.Count(KernelJobsStorage.Jobs));
+
+        var other = CreateContext("other");
+        await Assert.ThrowsAsync<KernelCapabilityException>(async () =>
+            await coordinator.GetAsync(first.Id, other));
+        Assert.Empty(await coordinator.ListAsync(other));
+    }
+
+    [Fact]
+    public async Task Concurrent_dispatch_claims_one_attempt_and_does_not_fail_the_winner()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway();
+        var handler = new BlockingHandler();
+        var coordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [handler]);
+        var context = CreateContext("dispatcher");
+        var job = await coordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.fetch"),
+                new ReadRequest("concurrent"),
+                context.Caller,
+                context.Features),
+            context);
+
+        var firstTask = coordinator.DispatchAsync<ReadResult>(job.Id, context).AsTask();
+        await handler.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var second = await coordinator.DispatchAsync<ReadResult>(job.Id, context);
+        handler.Release.TrySetResult(true);
+        var first = await firstTask;
+
+        Assert.Equal(ActionOutcomeKind.Deferred, second.Outcome);
+        Assert.Equal(ActionOutcomeKind.Completed, first.Outcome);
+        Assert.Equal(1, gateway.Count(KernelJobsStorage.Attempts));
+        Assert.Equal(1, gateway.Count(KernelJobsStorage.Results));
+        Assert.Equal(JobStatus.Completed, first.Job.Status);
+    }
+
+    [Fact]
+    public async Task Lifecycle_reads_recovery_controls_and_event_delivery_use_core_paths()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway();
+        var context = CreateContext("lifecycle-user");
+        var coordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [new ReadHandler()]);
+        var job = await coordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.fetch"),
+                new ReadRequest("lifecycle"),
+                context.Caller,
+                context.Features,
+                IdempotencyKey: Guid.NewGuid()),
+            context);
+
+        Assert.Equal(job.Id, (await coordinator.GetAsync(job.Id, context))!.Id);
+        Assert.Single(await coordinator.ListAsync(context));
+        Assert.Equal(JobStatus.Paused, (await coordinator.PauseAsync(job.Id, context)).Status);
+        Assert.Equal(JobStatus.Queued, (await coordinator.ResumeAsync(job.Id, context)).Status);
+        Assert.Equal(JobStatus.Queued, (await coordinator.RecoverAsync(job.Id, context)).Status);
+
+        await coordinator.ReportProgressAsync(
+            new JobProgress(job.Id, null, "queued", "queued", 0),
+            context);
+        Assert.Single(await coordinator.ReadProgressAsync(job.Id, context));
+        Assert.Empty(await coordinator.ReadAttemptsAsync(job.Id, context));
+        Assert.Null(await coordinator.ReadArtifactAsync(job.Id, context));
+        await coordinator.DeliverEventAsync(
+            new JobProgress(job.Id, null, "ignored", "delivered"),
+            context);
+        Assert.Equal(2, gateway.Count(KernelJobsStorage.Progress));
+
+        Assert.Equal(JobStatus.Cancelled, (await coordinator.StopAsync(job.Id, context)).Status);
+        Assert.True(await coordinator.DeleteAsync(job.Id, context));
+        Assert.Empty(await coordinator.ListAsync(context));
+    }
+
+    [Fact]
     public async Task Typed_handlers_use_one_core_dispatcher_and_keep_request_authority()
     {
         var graph = CreateGraph();
@@ -40,20 +160,24 @@ public sealed class KernelCanonicalJobsTests
             features,
             Guid.NewGuid(),
             Guid.NewGuid());
+        var readIdempotencyKey = Guid.NewGuid();
+        var validateIdempotencyKey = Guid.NewGuid();
 
         var readJob = await coordinator.SubmitAsync(
             new JobSubmission<ReadRequest>(
-                new SharpClawActionKey("jobs.read"),
+                new SharpClawActionKey("tool.fetch"),
                 new ReadRequest("read"),
                 caller,
-                features),
+                features,
+                IdempotencyKey: readIdempotencyKey),
             context);
         var validateJob = await coordinator.SubmitAsync(
             new JobSubmission<ValidateRequest>(
-                new SharpClawActionKey("jobs.validate"),
+                new SharpClawActionKey("tool.validate"),
                 new ValidateRequest("validate"),
                 caller,
-                features),
+                features,
+                IdempotencyKey: validateIdempotencyKey),
             context);
 
         var read = await coordinator.DispatchAsync<ReadResult>(readJob.Id, context);
@@ -67,8 +191,8 @@ public sealed class KernelCanonicalJobsTests
         Assert.Equal(JobStatus.Completed, validate.Job.Status);
         Assert.Equal(context.Caller.SubjectId, read.Job.Caller.SubjectId);
         Assert.Equal(context.Caller.SubjectId, validate.Job.Caller.SubjectId);
-        Assert.Equal(context.IdempotencyKey, read.Job.IdempotencyKey);
-        Assert.Equal(context.IdempotencyKey, validate.Job.IdempotencyKey);
+        Assert.Equal(readIdempotencyKey, read.Job.IdempotencyKey);
+        Assert.Equal(validateIdempotencyKey, validate.Job.IdempotencyKey);
         Assert.Equal(2, gateway.Count(KernelJobsStorage.Jobs));
         Assert.Equal(2, gateway.Count(KernelJobsStorage.Results));
     }
@@ -84,7 +208,7 @@ public sealed class KernelCanonicalJobsTests
         var context = CreateContext("jobs-user");
         var job = await coordinator.SubmitAsync(
             new JobSubmission<ReadRequest>(
-                new SharpClawActionKey("jobs.read"),
+                new SharpClawActionKey("tool.fetch"),
                 new ReadRequest("pending"),
                 context.Caller,
                 context.Features),
@@ -117,7 +241,7 @@ public sealed class KernelCanonicalJobsTests
         var exception = await Assert.ThrowsAsync<KernelCapabilityException>(async () =>
             await coordinator.SubmitAsync(
                 new JobSubmission<ReadRequest>(
-                    new SharpClawActionKey("jobs.read"),
+                    new SharpClawActionKey("tool.fetch"),
                     new ReadRequest("value"),
                     forgedCaller,
                     context.Features),
@@ -139,7 +263,7 @@ public sealed class KernelCanonicalJobsTests
         var context = CreateContext("jobs-user");
         var job = await coordinator.SubmitAsync(
             new JobSubmission<ReadRequest>(
-                new SharpClawActionKey("jobs.external_call"),
+                new SharpClawActionKey("tool.fail"),
                 new ReadRequest("fail"),
                 context.Caller,
                 context.Features),
@@ -167,7 +291,7 @@ public sealed class KernelCanonicalJobsTests
         var context = CreateContext("jobs-user");
         var job = await coordinator.SubmitAsync(
             new JobSubmission<ReadRequest>(
-                new SharpClawActionKey("jobs.read"),
+                new SharpClawActionKey("tool.fetch"),
                 new ReadRequest("cancel"),
                 context.Caller,
                 context.Features),
@@ -192,7 +316,9 @@ public sealed class KernelCanonicalJobsTests
     {
         var registry = new KernelModuleRegistry();
         var jobs = new KernelJobsActionModule();
+        var workload = new WorkloadModule();
         registry.Add(jobs);
+        registry.Add(workload);
         return registry.Compile(
             null,
             new KernelGraphCompileOptions
@@ -202,6 +328,7 @@ public sealed class KernelCanonicalJobsTests
                     IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
                 {
                     [jobs.Identity.Id] = jobs.Grants,
+                    [workload.Identity.Id] = workload.Grants,
                 },
                 SensitiveActionApprovals = jobs.Approvals,
             });
@@ -213,7 +340,7 @@ public sealed class KernelCanonicalJobsTests
 
     private sealed class ReadHandler : IJobHandler<ReadRequest, ReadResult>
     {
-        public SharpClawActionKey ActionKey { get; } = new("jobs.read");
+        public SharpClawActionKey ActionKey { get; } = new("tool.fetch");
 
         public JobExecutionSafety Safety => JobExecutionSafety.Pure;
 
@@ -236,7 +363,7 @@ public sealed class KernelCanonicalJobsTests
 
     private sealed class ValidateHandler : IJobHandler<ValidateRequest, ValidateResult>
     {
-        public SharpClawActionKey ActionKey { get; } = new("jobs.validate");
+        public SharpClawActionKey ActionKey { get; } = new("tool.validate");
 
         public JobExecutionSafety Safety => JobExecutionSafety.Pure;
 
@@ -255,7 +382,7 @@ public sealed class KernelCanonicalJobsTests
 
     private sealed class FailingHandler : IJobHandler<ReadRequest, ReadResult>
     {
-        public SharpClawActionKey ActionKey { get; } = new("jobs.external_call");
+        public SharpClawActionKey ActionKey { get; } = new("tool.fail");
 
         public JobExecutionSafety Safety => JobExecutionSafety.Receipted;
 
@@ -270,6 +397,92 @@ public sealed class KernelCanonicalJobsTests
             ReadRequest input,
             CancellationToken cancellationToken) =>
             throw new InvalidOperationException("The test handler failed.");
+    }
+
+    private sealed class ControlKeyHandler : IJobHandler<ReadRequest, ReadResult>
+    {
+        public SharpClawActionKey ActionKey { get; } = new("jobs.read");
+
+        public JobExecutionSafety Safety => JobExecutionSafety.Pure;
+
+        public IJobPayloadCodec<ReadRequest> InputCodec { get; } =
+            new JsonJobPayloadCodec<ReadRequest>("test.control.request");
+
+        public IJobPayloadCodec<ReadResult> ResultCodec { get; } =
+            new JsonJobPayloadCodec<ReadResult>("test.control.result");
+
+        public ValueTask<ReadResult> ExecuteAsync(
+            JobExecutionContext context,
+            ReadRequest input,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult(new ReadResult(input.Value));
+    }
+
+    private sealed class BlockingHandler : IJobHandler<ReadRequest, ReadResult>
+    {
+        public TaskCompletionSource<bool> Started { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource<bool> Release { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public SharpClawActionKey ActionKey { get; } = new("tool.fetch");
+
+        public JobExecutionSafety Safety => JobExecutionSafety.Idempotent;
+
+        public IJobPayloadCodec<ReadRequest> InputCodec { get; } =
+            new JsonJobPayloadCodec<ReadRequest>("test.blocking.request");
+
+        public IJobPayloadCodec<ReadResult> ResultCodec { get; } =
+            new JsonJobPayloadCodec<ReadResult>("test.blocking.result");
+
+        public async ValueTask<ReadResult> ExecuteAsync(
+            JobExecutionContext context,
+            ReadRequest input,
+            CancellationToken cancellationToken)
+        {
+            Started.TrySetResult(true);
+            await Release.Task.WaitAsync(cancellationToken);
+            return new ReadResult(input.Value);
+        }
+    }
+
+    private sealed class WorkloadModule : ISharpClawModule
+    {
+        private const ActionInterceptionCapabilities WorkloadCapabilities =
+            ActionInterceptionCapabilities.Inspect |
+            ActionInterceptionCapabilities.ReplaceInput |
+            ActionInterceptionCapabilities.ReplaceResult |
+            ActionInterceptionCapabilities.Wrap;
+
+        public ModuleIdentity Identity { get; } =
+            new("test.workloads", "Test workloads", "tests");
+
+        public IReadOnlyDictionary<string, ActionInterceptionCapabilities> Grants { get; } =
+            new Dictionary<string, ActionInterceptionCapabilities>(StringComparer.Ordinal)
+            {
+                ["tool.fetch"] = WorkloadCapabilities,
+                ["tool.validate"] = WorkloadCapabilities,
+                ["tool.fail"] = WorkloadCapabilities,
+            };
+
+        public void Configure(ISharpClawModuleBuilder builder)
+        {
+            foreach (var key in Grants.Keys)
+            {
+                builder.Actions.Add(
+                    new ActionDescriptor<KernelActionEnvelope, object>(
+                        new SharpClawActionKey(key),
+                        1,
+                        "tool",
+                        WorkloadCapabilities,
+                        false,
+                        false,
+                        new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, key),
+                        null,
+                        TimeSpan.FromSeconds(10)));
+            }
+        }
     }
 
     private sealed class InMemoryJobsGateway : IModuleStorageGateway
@@ -297,7 +510,7 @@ public sealed class KernelCanonicalJobsTests
             var response = operation switch
             {
                 ModuleStorageOperations.Get => Get(storageName, parameters),
-                ModuleStorageOperations.List or ModuleStorageOperations.Query => List(storageName),
+                ModuleStorageOperations.List or ModuleStorageOperations.Query => List(storageName, parameters),
                 ModuleStorageOperations.Upsert => Upsert(storageName, parameters),
                 ModuleStorageOperations.Delete => Delete(storageName, parameters),
                 _ => throw new NotSupportedException(operation),
@@ -353,12 +566,13 @@ public sealed class KernelCanonicalJobsTests
             }
         }
 
-        private JsonElement List(string storageName)
+        private JsonElement List(string storageName, JsonElement parameters)
         {
             lock (_sync)
             {
-                var records = _records
+                var candidates = _records
                     .Where(pair => pair.Key.Storage == storageName)
+                    .Where(pair => MatchesFilters(pair.Value.Indexes, parameters))
                     .Select(pair => new
                     {
                         key = pair.Key.Key,
@@ -368,9 +582,38 @@ public sealed class KernelCanonicalJobsTests
                     })
                     .ToArray();
                 return JsonSerializer.SerializeToElement(
-                    new { records },
+                    new { records = candidates },
                     new JsonSerializerOptions(JsonSerializerDefaults.Web));
             }
+        }
+
+        private static bool MatchesFilters(JsonElement? indexes, JsonElement parameters)
+        {
+            if (!parameters.TryGetProperty("filters", out var filters) ||
+                filters.ValueKind != JsonValueKind.Array)
+            {
+                return true;
+            }
+
+            foreach (var filter in filters.EnumerateArray())
+            {
+                var indexName = filter.GetProperty("indexName").GetString()!;
+                var comparison = filter.GetProperty("operator").GetString();
+                if (!string.Equals(comparison, ModuleStorageComparisonOperators.EqualTo, StringComparison.Ordinal))
+                    continue;
+                if (indexes is null || !indexes.Value.TryGetProperty(indexName, out var actual))
+                    return false;
+                var expected = filter.GetProperty("value");
+                if (!string.Equals(
+                        actual.ToString(),
+                        expected.ToString(),
+                        StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private JsonElement Upsert(string storageName, JsonElement parameters)

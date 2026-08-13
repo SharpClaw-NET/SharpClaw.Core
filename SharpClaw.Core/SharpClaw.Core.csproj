@@ -1,8 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <IsPackable>true</IsPackable>
-    <Version>0.5.0-beta.5</Version>
-    <InformationalVersion>0.5.0-beta.5</InformationalVersion>
+    <Version>0.5.0-beta.6</Version>
+    <InformationalVersion>0.5.0-beta.6</InformationalVersion>
     <PackageId>SharpClaw.Core</PackageId>
     <Authors>mkn8rn</Authors>
     <Description>Host-agnostic SharpClaw direct-chat kernel with action, event, provider, and tool dispatch.</Description>
