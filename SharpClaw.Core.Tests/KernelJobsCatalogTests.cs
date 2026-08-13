@@ -93,6 +93,11 @@ public sealed class KernelJobsCatalogTests
             SharpClawActionCatalog.Jobs.Select(key => key.Value),
             jobsEntries.Select(entry => entry.Key.Value));
         Assert.Equal(310, KernelActionCatalog.Descriptors.Select(entry => entry.Key.Value).Distinct().Count());
+        Assert.All(jobsEntries, entry =>
+        {
+            Assert.NotEqual(typeof(JsonElement), entry.InputPayloadType);
+            Assert.NotEqual(typeof(JsonElement), entry.ResultPayloadType);
+        });
 
         AssertProfile("jobs.validate", KernelStandardActionProfile.Pure);
         AssertProfile("jobs.queue.persist", KernelStandardActionProfile.IdempotentEffect);
