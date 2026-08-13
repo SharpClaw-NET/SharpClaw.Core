@@ -342,8 +342,7 @@ public sealed class KernelAuthorityCorrectionTests
                 string.Join(',', entry.SafePoints.Select(value => ((int)value).ToString(CultureInfo.InvariantCulture))),
                 ((int)entry.Profile).ToString(CultureInfo.InvariantCulture)));
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join("\n", records))));
-
-        Assert.Equal("DA18E367B2364757DFBD9E3354B6451A5B82A67BBB9A3563E94663DEA158AC34", hash);
+        Assert.Equal("7117B533A603CC0811EC688569B347E5C5BA8E0AF4428A4E7D0E6CE5FD613FC6", hash);
     }
 
     [Fact]

@@ -20,6 +20,7 @@ public enum KernelStandardActionProfile
     StreamEffect,
     ReceiptedStreamEffect,
     Signal,
+    Progress,
     Observe
 }
 
@@ -40,7 +41,76 @@ public sealed record KernelStandardActionManifestEntry(
     IReadOnlyList<ActionSafePoint> SafePoints,
     KernelStandardActionProfile Profile)
 {
-    public ActionDescriptor<KernelActionEnvelope, object> ToDescriptor() =>
+    public bool IsJobsAction => Key.Value.StartsWith("jobs.", StringComparison.Ordinal);
+
+    public bool IsJobsBeforeAction =>
+        IsJobsAction && Key.Value.EndsWith(".before", StringComparison.Ordinal);
+
+    public bool IsJobsAfterAction =>
+        IsJobsAction && Key.Value.EndsWith(".after", StringComparison.Ordinal);
+
+    public ActionDescriptor<KernelActionEnvelope, object> ToDescriptor()
+    {
+        if (IsJobsAction)
+            throw new KernelGraphCompilationException(
+                $"Jobs action '{Key.Value}' requires its typed standard descriptor.");
+
+        return new(
+            Key,
+            Version,
+            Category,
+            Capabilities,
+            ContainsSensitiveData,
+            HasIrreversibleEffects,
+            RepeatPolicy,
+            ContinuationPolicy,
+            DefaultTimeout)
+        {
+            ProtocolVersionRange = ContractVersionRange.Exact(1),
+            SafePoints = SafePoints
+        };
+    }
+
+    public ActionDescriptor<
+        JobActionInput<JsonElement>,
+        JobActionResult<JsonElement>> ToJobsActionDescriptor()
+    {
+        if (!IsJobsAction || IsJobsBeforeAction || IsJobsAfterAction)
+            throw new KernelGraphCompilationException(
+                $"Action '{Key.Value}' is not a Jobs root action.");
+
+        return CreateDescriptor<
+            JobActionInput<JsonElement>,
+            JobActionResult<JsonElement>>();
+    }
+
+    public ActionDescriptor<
+        JobCheckpoint<JobActionInput<JsonElement>>,
+        JobCheckpoint<JobActionInput<JsonElement>>> ToJobsBeforeDescriptor()
+    {
+        if (!IsJobsBeforeAction)
+            throw new KernelGraphCompilationException(
+                $"Action '{Key.Value}' is not a Jobs before checkpoint.");
+
+        return CreateDescriptor<
+            JobCheckpoint<JobActionInput<JsonElement>>,
+            JobCheckpoint<JobActionInput<JsonElement>>>();
+    }
+
+    public ActionDescriptor<
+        JobCheckpoint<JobActionResult<JsonElement>>,
+        JobCheckpoint<JobActionResult<JsonElement>>> ToJobsAfterDescriptor()
+    {
+        if (!IsJobsAfterAction)
+            throw new KernelGraphCompilationException(
+                $"Action '{Key.Value}' is not a Jobs after checkpoint.");
+
+        return CreateDescriptor<
+            JobCheckpoint<JobActionResult<JsonElement>>,
+            JobCheckpoint<JobActionResult<JsonElement>>>();
+    }
+
+    private ActionDescriptor<TAction, TResult> CreateDescriptor<TAction, TResult>() =>
         new(
             Key,
             Version,
@@ -55,6 +125,23 @@ public sealed record KernelStandardActionManifestEntry(
             ProtocolVersionRange = ContractVersionRange.Exact(1),
             SafePoints = SafePoints
         };
+
+    public bool MatchesDescriptor<TAction, TResult>(ActionDescriptor<TAction, TResult> descriptor) =>
+        descriptor.Key == Key &&
+        descriptor.Version == Version &&
+        descriptor.Category == Category &&
+        ((typeof(TAction) == InputPayloadType && typeof(TResult) == ResultPayloadType) ||
+         (!IsJobsAction &&
+          typeof(TAction) == typeof(KernelActionEnvelope) &&
+          typeof(TResult) == typeof(object))) &&
+        descriptor.Capabilities == Capabilities &&
+        descriptor.ContainsSensitiveData == ContainsSensitiveData &&
+        descriptor.HasIrreversibleEffects == HasIrreversibleEffects &&
+        descriptor.RepeatPolicy == RepeatPolicy &&
+        descriptor.ContinuationPolicy == ContinuationPolicy &&
+        descriptor.DefaultTimeout == DefaultTimeout &&
+        descriptor.ProtocolVersionRange == ContractVersionRange.Exact(1) &&
+        descriptor.SafePoints.SequenceEqual(SafePoints);
 }
 
 internal static class KernelStandardActionManifest
@@ -77,7 +164,7 @@ internal static class KernelStandardActionManifest
                 ["jobs.dispatch"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
                 ["jobs.start"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
                 ["jobs.handler.invoke"] = new(KernelStandardActionProfile.ReceiptedEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
-                ["jobs.progress.report"] = new(KernelStandardActionProfile.Signal, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
+                ["jobs.progress.report"] = new(KernelStandardActionProfile.Progress, KernelStandardActionProfile.Pure, KernelStandardActionProfile.Observe),
                 ["jobs.artifact.seal"] = new(KernelStandardActionProfile.IdempotentEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
                 ["jobs.complete"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
                 ["jobs.fail"] = new(KernelStandardActionProfile.ConflictEffect, KernelStandardActionProfile.Deferrable, KernelStandardActionProfile.Observe),
@@ -484,6 +571,17 @@ internal static class KernelStandardActionManifest
                 null,
                 TimeSpan.FromSeconds(15),
                 [ActionSafePoint.BeforeTerminal, ActionSafePoint.AfterTerminal]),
+            KernelStandardActionProfile.Progress => new(
+                KernelCapabilities.ObservableActions |
+                ActionInterceptionCapabilities.ReplaceInput |
+                ActionInterceptionCapabilities.ReplaceResult |
+                ActionInterceptionCapabilities.Cancel |
+                ActionInterceptionCapabilities.Wrap,
+                false,
+                KernelCapabilities.NoRepeat,
+                null,
+                TimeSpan.FromSeconds(15),
+                [ActionSafePoint.BeforeTerminal, ActionSafePoint.AfterTerminal]),
             KernelStandardActionProfile.Observe => new(
                 ActionInterceptionCapabilities.Inspect |
                 ActionInterceptionCapabilities.Observe |
@@ -523,8 +621,23 @@ internal static class KernelStandardActionManifest
                 ActionSafePoint.AfterCommit
             ]);
 
-    private static (Type Input, Type Result) ContractTypes(SharpClawActionKey key) => key.Value switch
+    private static (Type Input, Type Result) ContractTypes(SharpClawActionKey key)
     {
+        if (key.Value.StartsWith("jobs.", StringComparison.Ordinal))
+        {
+            if (key.Value.EndsWith(".before", StringComparison.Ordinal))
+                return (
+                    typeof(JobCheckpoint<JobActionInput<JsonElement>>),
+                    typeof(JobCheckpoint<JobActionInput<JsonElement>>));
+            if (key.Value.EndsWith(".after", StringComparison.Ordinal))
+                return (
+                    typeof(JobCheckpoint<JobActionResult<JsonElement>>),
+                    typeof(JobCheckpoint<JobActionResult<JsonElement>>));
+            return (typeof(JobActionInput<JsonElement>), typeof(JobActionResult<JsonElement>));
+        }
+
+        return key.Value switch
+        {
         "chat.turn.start" => (typeof(ChatTurnInput), typeof(ChatTurnResult)),
         "chat.conversation.resolve" => (typeof(ChatTurnInput), typeof(ConversationSelection)),
         "chat.profile.resolve" => (typeof(ChatTurnContext), typeof(ChatProfile)),
@@ -573,8 +686,9 @@ internal static class KernelStandardActionManifest
         "tool.call.fail" or "tool.call.cancel" => (typeof(ToolInvocationOutcome), typeof(bool)),
         "module.start" => (typeof(ModuleStartContext), typeof(bool)),
         "module.stop" => (typeof(ModuleIdentity), typeof(bool)),
-        _ => (typeof(JsonElement), typeof(JsonElement))
-    };
+            _ => (typeof(JsonElement), typeof(JsonElement))
+        };
+    }
 
     private static JsonSchemaReference Schema(
         SharpClawActionKey key,

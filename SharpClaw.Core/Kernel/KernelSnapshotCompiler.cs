@@ -87,7 +87,16 @@ public sealed class KernelGraphBuilder
     private void AddStandardDefinitions()
     {
         foreach (var manifest in KernelActionCatalog.Descriptors)
-            Add(manifest.ToDescriptor(), KernelCapabilities.CoreOwner);
+        {
+            if (manifest.IsJobsBeforeAction)
+                Add(manifest.ToJobsBeforeDescriptor(), KernelCapabilities.CoreOwner);
+            else if (manifest.IsJobsAfterAction)
+                Add(manifest.ToJobsAfterDescriptor(), KernelCapabilities.CoreOwner);
+            else if (manifest.IsJobsAction)
+                Add(manifest.ToJobsActionDescriptor(), KernelCapabilities.CoreOwner);
+            else
+                Add(manifest.ToDescriptor(), KernelCapabilities.CoreOwner);
+        }
     }
 
     private void AddLifecycleDefinitions()
@@ -543,8 +552,31 @@ public sealed class KernelGraph
 
     public bool ContainsEvent(SharpClawEventKey key) => _events.ContainsKey(key.Value);
 
-    public ActionDescriptor<KernelActionEnvelope, object> GetStandardAction(SharpClawActionKey key) =>
-        GetAction<KernelActionEnvelope, object>(key).Descriptor;
+    public ActionDescriptor<KernelActionEnvelope, object> GetStandardAction(SharpClawActionKey key)
+    {
+        if (SharpClawActionCatalog.Jobs.Contains(key))
+            throw new KernelActionExecutionException(
+                $"Jobs action '{key.Value}' has a typed descriptor. Use the Jobs descriptor accessor.");
+        return GetAction<KernelActionEnvelope, object>(key).Descriptor;
+    }
+
+    public ActionDescriptor<JobActionInput<JsonElement>, JobActionResult<JsonElement>>
+        GetStandardJobsAction(SharpClawActionKey key) =>
+        GetAction<JobActionInput<JsonElement>, JobActionResult<JsonElement>>(key).Descriptor;
+
+    public ActionDescriptor<
+        JobCheckpoint<JobActionInput<JsonElement>>,
+        JobCheckpoint<JobActionInput<JsonElement>>> GetStandardJobsBeforeAction(SharpClawActionKey key) =>
+        GetAction<
+            JobCheckpoint<JobActionInput<JsonElement>>,
+            JobCheckpoint<JobActionInput<JsonElement>>>(key).Descriptor;
+
+    public ActionDescriptor<
+        JobCheckpoint<JobActionResult<JsonElement>>,
+        JobCheckpoint<JobActionResult<JsonElement>>> GetStandardJobsAfterAction(SharpClawActionKey key) =>
+        GetAction<
+            JobCheckpoint<JobActionResult<JsonElement>>,
+            JobCheckpoint<JobActionResult<JsonElement>>>(key).Descriptor;
 
     internal CompiledActionDefinition<TAction, TResult> GetAction<TAction, TResult>(
         SharpClawActionKey key)
@@ -830,14 +862,9 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
         Type actionType,
         Type resultType) =>
         moduleId == KernelCapabilities.CoreOwner &&
-        actionType == typeof(KernelActionEnvelope) &&
-        resultType == typeof(object) &&
-        SharpClawActionCatalog.Kernel.Contains(descriptor.Key) &&
         descriptor.ContainsSensitiveData &&
-        KernelGraphHasher.Flatten("descriptor", descriptor).SequenceEqual(
-            KernelGraphHasher.Flatten(
-                "descriptor",
-                KernelActionCatalog.DescriptorFor(descriptor.Key).ToDescriptor()));
+        SharpClawActionCatalog.All.Contains(descriptor.Key) &&
+        KernelActionCatalog.DescriptorFor(descriptor.Key).MatchesDescriptor(descriptor);
 
     private static bool Matches(
         KernelHookTargetKind targetKind,

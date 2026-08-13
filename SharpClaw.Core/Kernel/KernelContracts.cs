@@ -136,7 +136,8 @@ public static class KernelActionCatalog
         key.Value.StartsWith("provider.", StringComparison.Ordinal) ||
         key.Value.StartsWith("storage.", StringComparison.Ordinal) ||
         key.Value.StartsWith("runtime.request.", StringComparison.Ordinal) ||
-        key.Value.StartsWith("gateway.request.", StringComparison.Ordinal);
+        key.Value.StartsWith("gateway.request.", StringComparison.Ordinal) ||
+        key.Value.StartsWith("jobs.", StringComparison.Ordinal);
 }
 
 public sealed class KernelGraphCompileOptions
