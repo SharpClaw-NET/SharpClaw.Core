@@ -586,6 +586,11 @@ public sealed class KernelJobsCoordinator
                     current,
                     async (scanned, scanCt) =>
                     {
+                        if (scanned.Status == JobStatus.OutcomeUncertain)
+                        {
+                            await CleanupUncommittedResultAsync(scanned.Id, executionContext);
+                            return scanned;
+                        }
                         if (scanned.Status != JobStatus.Running || scanned.ActiveAttemptId is not { } attemptId)
                             return scanned;
 
@@ -595,6 +600,8 @@ public sealed class KernelJobsCoordinator
                             CancellationToken.None);
                         if (attempt?.Value is { LeaseExpiresAt: { } lease } && lease > DateTimeOffset.UtcNow)
                             return scanned;
+
+                        await CleanupUncommittedResultAsync(scanned.Id, executionContext);
 
                         return await RunFamilyAsync<KernelJobsOperationFamilies.RecoveryClassify>(
                             new SharpClawActionKey("jobs.recovery.classify"),
