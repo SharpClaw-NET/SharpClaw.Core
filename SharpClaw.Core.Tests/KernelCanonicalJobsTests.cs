@@ -400,7 +400,14 @@ public sealed class KernelCanonicalJobsTests
         Assert.NotNull(recovered);
         Assert.Equal(JobStatus.Paused, recovered!.Status);
         Assert.Null(recovered.ActiveAttemptId);
+        gateway.RejectRenewals = false;
         Assert.Equal(JobStatus.Queued, (await secondCoordinator.ResumeAsync(job.Id, context)).Status);
+
+        var redispatched = await firstCoordinator.DispatchAsync<ReadResult>(job.Id, context);
+
+        Assert.Equal(ActionOutcomeKind.Completed, redispatched.Outcome);
+        Assert.Equal(JobStatus.Completed, redispatched.Job.Status);
+        Assert.Equal(2, handler.InvocationCount);
     }
 
     [Fact]

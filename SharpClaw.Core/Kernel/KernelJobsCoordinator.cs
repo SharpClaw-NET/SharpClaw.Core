@@ -1582,14 +1582,27 @@ public sealed class KernelJobsCoordinator
         JobAttemptDocument? attempt,
         KernelActionExecutionContext executionContext)
     {
-        if (active.Claim is not null &&
-            !await RenewActiveClaimAsync(jobId, CancellationToken.None))
+        if (Interlocked.Exchange(ref active.CleanupStarted, 1) != 0)
         {
             return;
         }
 
-        if (Interlocked.Exchange(ref active.CleanupStarted, 1) != 0)
+        if (active.Claim is not null &&
+            !await RenewActiveClaimAsync(jobId, CancellationToken.None))
         {
+            active.LeaseCancellation.Cancel();
+            if (active.RenewalTask is not null)
+            {
+                try
+                {
+                    await active.RenewalTask;
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }
+
+            RemoveActiveExecution(jobId, active);
             return;
         }
 
