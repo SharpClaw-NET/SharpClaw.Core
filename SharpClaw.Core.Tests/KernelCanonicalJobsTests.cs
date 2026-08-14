@@ -303,6 +303,41 @@ public sealed class KernelCanonicalJobsTests
     }
 
     [Fact]
+    public async Task Recovery_does_not_mark_a_job_uncertain_while_another_coordinator_holds_the_claim()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway();
+        var handler = new BlockingHandler();
+        var firstCoordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [handler]);
+        var secondCoordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [new ReadHandler()]);
+        var context = CreateContext("recovery-owner");
+        var job = await firstCoordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.fetch"),
+                new ReadRequest("live-claim"),
+                context.Caller,
+                context.Features),
+            context);
+
+        var dispatch = firstCoordinator.DispatchAsync<ReadResult>(job.Id, context).AsTask();
+        await handler.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var recovered = await secondCoordinator.RecoverAsync(job.Id, context);
+
+        Assert.Equal(JobStatus.Running, recovered.Status);
+        handler.Release.TrySetResult(true);
+        await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
     public async Task Stop_fences_the_active_handler_and_preserves_cancelled_state()
     {
         var graph = CreateGraph();

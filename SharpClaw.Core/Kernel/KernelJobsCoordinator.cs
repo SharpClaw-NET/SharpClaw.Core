@@ -6,6 +6,7 @@ namespace SharpClaw.Core.Kernel;
 /// <summary>Coordinates canonical Jobs lifecycle state through the Core action graph.</summary>
 public sealed class KernelJobsCoordinator
 {
+    private const string ClaimUnavailablePrefix = "JOBS_CLAIM_UNAVAILABLE:";
     private readonly KernelGraph _graph;
     private readonly KernelActionDispatcher _dispatcher;
     private readonly KernelJobsActionRunner _actionRunner;
@@ -718,12 +719,23 @@ public sealed class KernelJobsCoordinator
                             return renewed?.Value ?? scanned;
                         }
 
-                        var recoveryRecord = await AcquireControlClaimAsync(
-                            await GetJobAsync(scanned.Id, executionContext, CancellationToken.None)
-                                ?? throw new KernelActionExecutionException(
-                                    $"Jobs record '{scanned.Id:D}' disappeared during recovery."),
-                            executionContext,
-                            scanCt);
+                        ModuleDocumentRecord<JobDocument>? recoveryRecord;
+                        try
+                        {
+                            recoveryRecord = await AcquireControlClaimAsync(
+                                await GetJobAsync(scanned.Id, executionContext, CancellationToken.None)
+                                    ?? throw new KernelActionExecutionException(
+                                        $"Jobs record '{scanned.Id:D}' disappeared during recovery."),
+                                executionContext,
+                                scanCt);
+                        }
+                        catch (KernelActionExecutionException exception)
+                            when (exception.Message.StartsWith(
+                                ClaimUnavailablePrefix,
+                                StringComparison.Ordinal))
+                        {
+                            return scanned;
+                        }
                         var recoveryAuthority = _claims.TryGetValue(scanned.Id, out var claim)
                             ? claim
                             : null;
@@ -731,7 +743,7 @@ public sealed class KernelJobsCoordinator
                         {
                             return await RunFamilyAsync<KernelJobsOperationFamilies.RecoveryClassify>(
                                 new SharpClawActionKey("jobs.recovery.classify"),
-                                recoveryRecord.Value!,
+                                recoveryRecord!.Value!,
                                 async (classified, classifyCt) => await TransitionJobAsync(
                                     classified,
                                     classified with
@@ -1471,7 +1483,7 @@ public sealed class KernelJobsCoordinator
             when (exception.Failure.Code is ModuleStorageErrors.StaleClaim or ModuleStorageErrors.RevisionConflict)
         {
             throw new KernelActionExecutionException(
-                $"Jobs record '{job.Id:D}' is still controlled by another active execution.");
+                $"{ClaimUnavailablePrefix} Jobs record '{job.Id:D}' is still controlled by another active execution.");
         }
     }
 
