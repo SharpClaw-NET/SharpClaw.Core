@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using SharpClaw.Contracts.Modules;
@@ -213,8 +214,14 @@ public sealed class KernelCanonicalJobsTests
         Assert.Equal(JobStatus.Paused, paused.Status);
         Assert.Equal(JobStatus.Paused, (await coordinator.GetAsync(job.Id, context))!.Status);
         Assert.NotEqual(ActionOutcomeKind.Completed, dispatchResult.Outcome);
-        Assert.True(gateway.RecoverCount > 0);
-        Assert.True(gateway.ClaimCount >= 2);
+        for (var attempt = 0; attempt < 100; attempt++)
+        {
+            if ((await coordinator.GetAsync(job.Id, context))!.ActiveAttemptId is null)
+                break;
+            await Task.Delay(20);
+        }
+        Assert.Null((await coordinator.GetAsync(job.Id, context))!.ActiveAttemptId);
+        Assert.True(gateway.RecoverCount > 0, string.Join(" | ", gateway.CommitLog));
 
         Assert.Equal(JobStatus.Queued, (await coordinator.ResumeAsync(job.Id, context)).Status);
     }
@@ -247,14 +254,24 @@ public sealed class KernelCanonicalJobsTests
         Assert.NotEqual(ActionOutcomeKind.Completed, firstOutcome.Outcome);
         Assert.Equal(JobStatus.Paused, firstOutcome.Job.Status);
 
-        Assert.Equal(JobStatus.Queued, (await coordinator.ResumeAsync(job.Id, context)).Status);
-        var blocked = await coordinator.DispatchAsync<ReadResult>(job.Id, context);
-        Assert.Equal(ActionOutcomeKind.Deferred, blocked.Outcome);
-        Assert.Equal("JOBS_ALREADY_RUNNING", blocked.Error?.Code);
+        var resumeException = await Assert.ThrowsAsync<KernelActionExecutionException>(
+            () => coordinator.ResumeAsync(job.Id, context).AsTask());
+        Assert.Contains("JOBS_ACTIVE_ATTEMPT", resumeException.Message, StringComparison.Ordinal);
         Assert.Equal(1, handler.InvocationCount);
 
         handler.ReleaseFirst.TrySetResult(true);
         await handler.FirstFinished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        for (var attempt = 0; attempt < 100; attempt++)
+        {
+            if ((await coordinator.GetAsync(job.Id, context))!.ActiveAttemptId is null)
+                break;
+            await Task.Delay(20);
+        }
+        Assert.True(
+            (await coordinator.GetAsync(job.Id, context))!.ActiveAttemptId is null,
+            $"Claims={gateway.ClaimCount}; Renews={gateway.RenewCount}; " +
+            $"Recovers={gateway.RecoverCount}; {string.Join(" | ", gateway.CommitLog)}");
+        Assert.Equal(JobStatus.Queued, (await coordinator.ResumeAsync(job.Id, context)).Status);
 
         JobExecutionResult<ReadResult>? completed = null;
         for (var attempt = 0; attempt < 100; attempt++)
@@ -269,6 +286,65 @@ public sealed class KernelCanonicalJobsTests
         Assert.Equal(ActionOutcomeKind.Completed, completed!.Outcome);
         Assert.Equal(2, handler.InvocationCount);
         Assert.Equal(JobStatus.Completed, completed.Job.Status);
+    }
+
+    [Fact]
+    public async Task Two_coordinators_cannot_resume_a_paused_job_while_the_old_attempt_is_running()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway();
+        var handler = new NonCooperativeHandler();
+        var firstCoordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [handler]);
+        var secondCoordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [handler]);
+        var context = CreateContext("cross-coordinator-control-owner");
+        var job = await firstCoordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.fetch"),
+                new ReadRequest("cross-coordinator-control"),
+                context.Caller,
+                context.Features),
+            context);
+
+        var first = firstCoordinator.DispatchAsync<ReadResult>(job.Id, context).AsTask();
+        await handler.FirstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var paused = await firstCoordinator.PauseAsync(job.Id, context);
+        var firstResult = await first.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(JobStatus.Paused, paused.Status);
+        Assert.Equal(JobStatus.Paused, firstResult.Job.Status);
+        Assert.NotNull((await firstCoordinator.GetAsync(job.Id, context))!.ActiveAttemptId);
+
+        var resumeException = await Assert.ThrowsAsync<KernelActionExecutionException>(
+            () => secondCoordinator.ResumeAsync(job.Id, context).AsTask());
+        Assert.Contains("JOBS_ACTIVE_ATTEMPT", resumeException.Message, StringComparison.Ordinal);
+        Assert.Equal(1, handler.InvocationCount);
+
+        handler.ReleaseFirst.TrySetResult(true);
+        await handler.FirstFinished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        for (var attempt = 0; attempt < 100; attempt++)
+        {
+            if ((await firstCoordinator.GetAsync(job.Id, context))!.ActiveAttemptId is null)
+                break;
+            await Task.Delay(20);
+        }
+
+        Assert.True(
+            (await firstCoordinator.GetAsync(job.Id, context))!.ActiveAttemptId is null,
+            $"Claims={gateway.ClaimCount}; Renews={gateway.RenewCount}; " +
+            $"Recovers={gateway.RecoverCount}; {string.Join(" | ", gateway.CommitLog)}");
+        Assert.Equal(JobStatus.Queued, (await secondCoordinator.ResumeAsync(job.Id, context)).Status);
+        var second = await secondCoordinator.DispatchAsync<ReadResult>(job.Id, context);
+
+        Assert.Equal(ActionOutcomeKind.Completed, second.Outcome);
+        Assert.Equal(2, handler.InvocationCount);
     }
 
     [Fact]
@@ -504,6 +580,55 @@ public sealed class KernelCanonicalJobsTests
     }
 
     [Fact]
+    public async Task Jobs_history_is_bounded_before_the_aggregate_reaches_storage_limit()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway();
+        var store = new KernelJobsStore(gateway);
+        var coordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            store,
+            [new ReadHandler()]);
+        var context = CreateContext("bounded-history-owner");
+        var job = await coordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.fetch"),
+                new ReadRequest("bounded-history"),
+                context.Caller,
+                context.Features),
+            context);
+
+        for (var index = 0; index < 200; index++)
+        {
+            await coordinator.ReportProgressAsync(
+                new JobProgress(job.Id, null, "progress", $"progress-{index}", index),
+                context);
+        }
+
+        for (var index = 0; index < 40; index++)
+        {
+            await store.SaveAttemptAsync(
+                new JobAttemptDocument(
+                    Guid.NewGuid(),
+                    job.Id,
+                    job.InvocationId,
+                    job.IdempotencyKey,
+                    index + 1,
+                    JobExecutionSafety.Idempotent,
+                    null,
+                    DateTimeOffset.UtcNow,
+                    null,
+                    null));
+        }
+
+        Assert.Equal(32, gateway.CountAttempts());
+        Assert.Equal(128, gateway.CountProgress());
+        Assert.InRange(gateway.MaxStoredDocumentBytes, 1, 60_000);
+        Assert.Equal(JobStatus.Cancelled, (await coordinator.StopAsync(job.Id, context)).Status);
+    }
+
+    [Fact]
     public async Task Submission_cannot_replace_host_caller_or_features()
     {
         var graph = CreateGraph();
@@ -579,9 +704,54 @@ public sealed class KernelCanonicalJobsTests
         Assert.Equal(ActionOutcomeKind.Completed, result.Outcome);
         Assert.Equal(JobStatus.Completed, result.Job.Status);
         Assert.Single(attempts);
-        Assert.False(string.IsNullOrWhiteSpace(attempts[0].ReceiptId));
+        Assert.Null(attempts[0].ReceiptId);
         Assert.Equal(1, gateway.CountResults());
         Assert.Equal(1, gateway.ExecutionCommitCount);
+    }
+
+    [Fact]
+    public async Task Receipted_retry_is_rejected_without_external_reconciliation_authority()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway();
+        var handler = new ReceiptedHandler();
+        var store = new KernelJobsStore(gateway);
+        var coordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            store,
+            [handler]);
+        var context = CreateContext("receipted-retry-owner");
+        var job = await coordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.receipted"),
+                new ReadRequest("receipt-no-retry"),
+                context.Caller,
+                context.Features),
+            context);
+
+        await coordinator.DispatchAsync<ReadResult>(job.Id, context);
+        var attemptRecord = (await store.ListAttemptRecordsAsync(job.Id)).Single();
+        await store.SaveAttemptAsync(
+            attemptRecord.Value! with { ReceiptId = "external-provider-receipt" },
+            attemptRecord.Revision);
+        var failedRecord = await store.GetJobAsync(job.Id);
+        await store.SaveJobAsync(
+            failedRecord!.Value! with
+            {
+                Status = JobStatus.Failed,
+                CompletedAt = DateTimeOffset.UtcNow,
+                ActiveAttemptId = null,
+                Result = null,
+                Error = new ExecutionError("JOBS_SIMULATED_CRASH", "The test simulates a crash after receipt persistence."),
+            },
+            failedRecord.Revision);
+        var executionCommitsBeforeRetry = gateway.ExecutionCommitCount;
+
+        var retryException = await Assert.ThrowsAsync<KernelActionExecutionException>(
+            () => coordinator.RetryAsync<ReadResult>(job.Id, context).AsTask());
+        Assert.Contains("reconciliation authority", retryException.Message, StringComparison.Ordinal);
+        Assert.Equal(executionCommitsBeforeRetry, gateway.ExecutionCommitCount);
     }
 
     [Fact]
@@ -868,6 +1038,7 @@ public sealed class KernelCanonicalJobsTests
         private int _renewCount;
         private int _recoverCount;
         private int _executionCommitCount;
+        private int _maxStoredDocumentBytes;
         private readonly List<string> _commitLog = [];
 
         public TaskCompletionSource<bool>? ClaimBarrier { get; set; }
@@ -900,6 +1071,8 @@ public sealed class KernelCanonicalJobsTests
         public int RecoverCount => Volatile.Read(ref _recoverCount);
 
         public int ExecutionCommitCount => Volatile.Read(ref _executionCommitCount);
+
+        public int MaxStoredDocumentBytes => Volatile.Read(ref _maxStoredDocumentBytes);
 
         public IReadOnlyList<string> CommitLog
         {
@@ -1015,6 +1188,9 @@ public sealed class KernelCanonicalJobsTests
                         {
                             Interlocked.Increment(ref _executionCommitCount);
                         }
+                        _maxStoredDocumentBytes = Math.Max(
+                            _maxStoredDocumentBytes,
+                            Encoding.UTF8.GetByteCount(value.GetRawText()));
                         _records[storageKey] = new StoredRecord(
                             value.Clone(),
                             revision,

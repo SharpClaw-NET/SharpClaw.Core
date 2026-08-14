@@ -52,15 +52,28 @@ public sealed class KernelJobsCoordinator
     {
         public CancellationTokenSource ControlCancellation { get; } = new();
 
+        public CancellationTokenSource LeaseCancellation { get; } = new();
+
         public ModuleStorageClaimAuthority? Claim { get; set; }
 
         public Task? RenewalTask { get; set; }
 
         public Task? InFlightTask { get; set; }
 
+        public JobAttemptDocument? Attempt { get; set; }
+
+        public KernelActionExecutionContext? ExecutionContext { get; set; }
+
         public bool ControlRequested { get; set; }
 
         public JobStatus? RequestedStatus { get; set; }
+
+        public bool ControlTransitionCompleted { get; set; }
+
+        public TaskCompletionSource<bool> ControlTransitionSignal { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public int CleanupStarted;
     }
 
     public async ValueTask<JobDocument> SubmitAsync<TInput>(
@@ -284,11 +297,13 @@ public sealed class KernelJobsCoordinator
                         jobRevision,
                         ct);
                     active.Claim = claimed.Authority;
+                    active.Attempt = attempt;
+                    active.ExecutionContext = executionContext;
                     _claims[jobId] = claimed.Authority;
                     active.RenewalTask = RenewClaimLoopAsync(
                         jobId,
                         active,
-                        cancellationToken);
+                        active.LeaseCancellation.Token);
                     return claimed.Job.Value!;
                 },
                 executionContext,
@@ -385,7 +400,7 @@ public sealed class KernelJobsCoordinator
                             current,
                             async (receipted, receiptCt) =>
                             {
-                                var receipt = attempt! with { ReceiptId = attempt.AttemptId.ToString("N") };
+                                var receipt = attempt!;
                                 await SaveAttemptAsync(
                                     receipt,
                                     executionContext,
@@ -451,6 +466,9 @@ public sealed class KernelJobsCoordinator
                     if (output is null)
                         throw new KernelActionExecutionException(
                             $"Jobs handler '{handler.ActionKey.Value}' completed without a result payload.");
+                    if (!await RenewActiveClaimAsync(current.Id, ct))
+                        throw new KernelActionExecutionException(
+                            $"Jobs execution '{current.Id:D}' lost its storage claim before completion.");
                     await _store.CommitExecutionAsync(
                         completed,
                         attempt! with { FinishedAt = completed.CompletedAt },
@@ -551,24 +569,22 @@ public sealed class KernelJobsCoordinator
         finally
         {
             active.ControlCancellation.Cancel();
-            if (active.RenewalTask is not null)
-            {
-                try
-                {
-                    await active.RenewalTask;
-                }
-                catch (OperationCanceledException)
-                {
-                }
-            }
             if (active.InFlightTask is { } inFlight && !inFlight.IsCompleted)
             {
-                _ = FinishInFlightExecutionAsync(jobId, active, inFlight);
+                _ = FinishInFlightExecutionAsync(
+                    jobId,
+                    active,
+                    inFlight,
+                    attempt,
+                    executionContext);
+            }
+            else if (active.ControlRequested && !active.ControlTransitionCompleted)
+            {
+                // The control operation still owns the claim and must commit its state.
             }
             else
             {
-                await ReleaseActiveClaimAsync(jobId, active);
-                RemoveActiveExecution(jobId, active);
+                await CleanupActiveExecutionAsync(jobId, active, attempt, executionContext);
             }
         }
     }
@@ -643,13 +659,19 @@ public sealed class KernelJobsCoordinator
         if (job.Status is JobStatus.Completed or JobStatus.Failed or JobStatus.Cancelled or JobStatus.Expired)
             return job;
 
-        if (job.Status == JobStatus.Running)
+        var controlAuthority = GetActiveControlClaim(jobId);
+        var controlledExecution = _activeExecutions.TryGetValue(jobId, out var activeExecution)
+            ? activeExecution
+            : null;
+        if (job.Status == JobStatus.Running && controlAuthority is null)
+        {
             record = await AcquireControlClaimAsync(record, executionContext, cancellationToken);
+            controlAuthority = _claims.TryGetValue(jobId, out var cancelAuthority)
+                ? cancelAuthority
+                : null;
+        }
         if (record.Value is not { } current)
             throw new KernelActionExecutionException($"Jobs record '{jobId:D}' was not found.");
-        var controlAuthority = _claims.TryGetValue(jobId, out var cancelAuthority)
-            ? cancelAuthority
-            : null;
         try
         {
             var requested = await RunFamilyAsync<KernelJobsOperationFamilies.CancelRequest>(
@@ -659,7 +681,7 @@ public sealed class KernelJobsCoordinator
                 executionContext,
                 cancellationToken,
                 record.Revision);
-            return await RunFamilyAsync<KernelJobsOperationFamilies.CancelApply>(
+            var cancelled = await RunFamilyAsync<KernelJobsOperationFamilies.CancelApply>(
                 new SharpClawActionKey("jobs.cancel.apply"),
                 requested,
                 (current, ct) => TransitionJobAsync(
@@ -677,6 +699,8 @@ public sealed class KernelJobsCoordinator
                 executionContext,
                 cancellationToken,
                 record.Revision);
+            await CompleteControlTransitionAsync(jobId, controlledExecution);
+            return cancelled;
         }
         finally
         {
@@ -912,21 +936,20 @@ public sealed class KernelJobsCoordinator
         if (job.Status is not (JobStatus.Failed or JobStatus.OutcomeUncertain or JobStatus.Paused))
             throw new KernelActionExecutionException(
                 $"Jobs record '{jobId:D}' cannot be retried in state '{job.Status}'.");
+        if (job.ActiveAttemptId is not null)
+            throw new KernelActionExecutionException(
+                $"JOBS_ACTIVE_ATTEMPT: Jobs record '{jobId:D}' has an active attempt and " +
+                "cannot be retried before that attempt is fenced and released.");
+        if (handler.Safety is JobExecutionSafety.NonIdempotent or JobExecutionSafety.Receipted)
+            throw new KernelActionExecutionException(
+                $"Jobs action '{handler.ActionKey.Value}' has no Core-owned external-effect " +
+                "reconciliation authority for retry.");
 
-        var attempts = await ListAttemptRecordsAsync(jobId, executionContext, cancellationToken);
-        var currentAttempt = attempts.LastOrDefault()?.Value;
         var evaluated = await RunFamilyAsync<KernelJobsOperationFamilies.RetryEvaluate>(
             new SharpClawActionKey("jobs.retry.evaluate"),
             job,
             (current, _) =>
             {
-                if (handler.Safety == JobExecutionSafety.NonIdempotent ||
-                    (handler.Safety == JobExecutionSafety.Receipted &&
-                     string.IsNullOrWhiteSpace(currentAttempt?.ReceiptId)))
-                {
-                    throw new KernelActionExecutionException(
-                        $"Jobs action '{handler.ActionKey.Value}' has no safe retry authority.");
-                }
                 return ValueTask.FromResult(current);
             },
             executionContext,
@@ -1283,22 +1306,33 @@ public sealed class KernelJobsCoordinator
         if (ownedJob.Status is JobStatus.Completed or JobStatus.Failed or JobStatus.Cancelled or JobStatus.Expired)
             return ownedJob;
 
+        if (status is JobStatus.Queued && ownedJob.ActiveAttemptId is not null)
+            throw new KernelActionExecutionException(
+                $"JOBS_ACTIVE_ATTEMPT: Jobs record '{jobId:D}' cannot resume while attempt " +
+                $"'{ownedJob.ActiveAttemptId:D}' still has durable execution authority.");
+
+        var controlAuthority = GetActiveControlClaim(jobId);
+        var controlledExecution = _activeExecutions.TryGetValue(jobId, out var activeExecution)
+            ? activeExecution
+            : null;
         if (ownedJob.Status == JobStatus.Running &&
-            (status is JobStatus.Paused or JobStatus.Cancelled))
+            (status is JobStatus.Paused or JobStatus.Cancelled) &&
+            controlAuthority is null)
+        {
             record = await AcquireControlClaimAsync(record, executionContext, cancellationToken);
+            controlAuthority = _claims.TryGetValue(jobId, out var acquiredAuthority)
+                ? acquiredAuthority
+                : null;
+        }
 
         ownedJob = record.Value!;
         if (!IsAllowedStatusTransition(ownedJob.Status, status))
             throw new KernelActionExecutionException(
                 $"Jobs record '{jobId:D}' cannot change from '{ownedJob.Status}' to '{status}'.");
 
-        var controlAuthority = ownedJob.Status == JobStatus.Running &&
-            _claims.TryGetValue(jobId, out var acquiredAuthority)
-            ? acquiredAuthority
-            : null;
         try
         {
-            return await RunFamilyAsync<TFamily>(
+            var transitioned = await RunFamilyAsync<TFamily>(
                 new SharpClawActionKey(key),
                 ownedJob,
                 (current, ct) => TransitionJobAsync(
@@ -1320,6 +1354,11 @@ public sealed class KernelJobsCoordinator
                 executionContext,
                 cancellationToken,
                 record.Revision);
+            if (status is (JobStatus.Paused or JobStatus.Cancelled))
+            {
+                await CompleteControlTransitionAsync(jobId, controlledExecution);
+            }
+            return transitioned;
         }
         finally
         {
@@ -1336,31 +1375,17 @@ public sealed class KernelJobsCoordinator
             _ => true,
         };
 
-    private async ValueTask FenceActiveExecutionAsync(
+    private ValueTask FenceActiveExecutionAsync(
         Guid jobId,
         JobStatus? requestedStatus = null)
     {
         if (!_activeExecutions.TryGetValue(jobId, out var active))
-            return;
+            return ValueTask.CompletedTask;
 
         active.ControlRequested = true;
         active.RequestedStatus = requestedStatus;
         active.ControlCancellation.Cancel();
-        if (active.Claim is { } claim)
-        {
-            try
-            {
-                await _store.RecoverJobClaimAsync(
-                    claim,
-                    DateTimeOffset.UtcNow,
-                    CancellationToken.None);
-            }
-            catch (ModuleStorageContractException)
-            {
-                // A completed or expired claim is already fenced by storage.
-            }
-            _claims.TryRemove(jobId, out _);
-        }
+        return ValueTask.CompletedTask;
     }
 
     private async ValueTask ReleaseControlClaimAsync(
@@ -1369,6 +1394,12 @@ public sealed class KernelJobsCoordinator
     {
         if (authority is null)
             return;
+        if (_activeExecutions.TryGetValue(jobId, out var active) &&
+            active.Claim is { } activeClaim &&
+            activeClaim.Matches(authority))
+        {
+            return;
+        }
         if (!_claims.TryGetValue(jobId, out var current) || !current.Matches(authority))
             return;
         try
@@ -1389,8 +1420,11 @@ public sealed class KernelJobsCoordinator
     private async Task FinishInFlightExecutionAsync(
         Guid jobId,
         ActiveJobExecution active,
-        Task inFlight)
+        Task inFlight,
+        JobAttemptDocument? attempt,
+        KernelActionExecutionContext executionContext)
     {
+        var cleanupSucceeded = false;
         try
         {
             while (!inFlight.IsCompleted && active.Claim is not null)
@@ -1417,11 +1451,16 @@ public sealed class KernelJobsCoordinator
             {
                 // The dispatch path already reported the authoritative outcome.
             }
+            if (active.ControlRequested && !active.ControlTransitionCompleted)
+                await active.ControlTransitionSignal.Task;
+            cleanupSucceeded = true;
         }
         finally
         {
-            await ReleaseActiveClaimAsync(jobId, active);
-            RemoveActiveExecution(jobId, active);
+            if (cleanupSucceeded)
+            {
+                await CleanupActiveExecutionAsync(jobId, active, attempt, executionContext);
+            }
         }
     }
 
@@ -1444,6 +1483,93 @@ public sealed class KernelJobsCoordinator
         }
         if (_claims.TryGetValue(jobId, out var current) && current.Matches(claim))
             _claims.TryRemove(jobId, out _);
+    }
+
+    private async ValueTask ClearControlledAttemptAsync(
+        Guid jobId,
+        JobAttemptDocument? attempt,
+        ActiveJobExecution active,
+        KernelActionExecutionContext executionContext)
+    {
+        if (attempt is null || active.Claim is null)
+            return;
+
+        var record = await GetJobAsync(jobId, executionContext, CancellationToken.None);
+        if (record?.Value is not { } current ||
+            current.ActiveAttemptId != attempt.AttemptId ||
+            current.Status is JobStatus.Pending or JobStatus.Queued or JobStatus.Running or
+            JobStatus.Held or JobStatus.Completed)
+        {
+            return;
+        }
+
+        await SaveJobAsync(
+            current with { ActiveAttemptId = null },
+            executionContext,
+            CancellationToken.None,
+            record.Revision,
+            active.Claim);
+    }
+
+    private async ValueTask CompleteControlTransitionAsync(
+        Guid jobId,
+        ActiveJobExecution? expectedActive = null)
+    {
+        if (expectedActive is null &&
+            !_activeExecutions.TryGetValue(jobId, out expectedActive))
+        {
+            return;
+        }
+
+        if (expectedActive is null)
+            return;
+        var active = expectedActive;
+
+        active.ControlTransitionCompleted = true;
+        active.ControlTransitionSignal.TrySetResult(true);
+        if (active.InFlightTask is { } inFlight && !inFlight.IsCompleted)
+            return;
+
+        await CleanupActiveExecutionAsync(
+            jobId,
+            active,
+            active.Attempt,
+            active.ExecutionContext
+                ?? throw new KernelActionExecutionException(
+                    $"Jobs execution '{jobId:D}' has no request context for cleanup."));
+    }
+
+    private async ValueTask CleanupActiveExecutionAsync(
+        Guid jobId,
+        ActiveJobExecution active,
+        JobAttemptDocument? attempt,
+        KernelActionExecutionContext executionContext)
+    {
+        if (active.Claim is not null &&
+            !await RenewActiveClaimAsync(jobId, CancellationToken.None))
+        {
+            return;
+        }
+
+        if (Interlocked.Exchange(ref active.CleanupStarted, 1) != 0)
+        {
+            return;
+        }
+
+        await ClearControlledAttemptAsync(jobId, attempt, active, executionContext);
+        active.LeaseCancellation.Cancel();
+        if (active.RenewalTask is not null)
+        {
+            try
+            {
+                await active.RenewalTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+        await ReleaseActiveClaimAsync(jobId, active);
+        RemoveActiveExecution(jobId, active);
     }
 
     private void RemoveActiveExecution(Guid jobId, ActiveJobExecution active)
@@ -1569,6 +1695,12 @@ public sealed class KernelJobsCoordinator
 
     private bool IsControlRequested(Guid jobId) =>
         _activeExecutions.TryGetValue(jobId, out var active) && active.ControlRequested;
+
+    private ModuleStorageClaimAuthority? GetActiveControlClaim(Guid jobId) =>
+        _activeExecutions.TryGetValue(jobId, out var active) &&
+        active.ControlRequested
+            ? active.Claim
+            : null;
 
     private async ValueTask<ModuleDocumentRecord<JobDocument>> RequireOwnedJobAsync(
         Guid jobId,

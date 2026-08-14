@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using SharpClaw.Contracts.Modules;
@@ -7,6 +8,11 @@ namespace SharpClaw.Core.Kernel;
 /// <summary>Stores the complete Jobs aggregate through the neutral module storage contract.</summary>
 public sealed class KernelJobsStore
 {
+    private const int MaxRetainedAttempts = 32;
+    private const int MaxRetainedProgress = 128;
+    private const int MaxProgressTextBytes = 2048;
+    private const int MaxAggregateDocumentBytes = 60_000;
+
     private readonly IModuleStorageGateway _gateway;
     private readonly ModuleDocumentStore<KernelJobsAggregate> _records;
     private readonly string _ownerModuleId;
@@ -91,10 +97,9 @@ public sealed class KernelJobsStore
         if (current is null)
             throw RevisionConflict(startedJob.IdempotencyKey.ToString("N"), expectedRevision, null);
 
-        var attempts = current.Value!.Attempts
+        var attempts = RetainAttempts(current.Value!.Attempts
             .Where(item => item.AttemptId != attempt.AttemptId)
-            .Append(attempt)
-            .ToArray();
+            .Append(attempt));
         var aggregate = current.Value with
         {
             Job = startedJob,
@@ -167,10 +172,9 @@ public sealed class KernelJobsStore
     {
         var current = await RequireAggregateRecordAsync(attempt.JobId, cancellationToken);
         var expected = expectedRevision ?? current.Revision;
-        var attempts = current.Value!.Attempts
+        var attempts = RetainAttempts(current.Value!.Attempts
             .Where(item => item.AttemptId != attempt.AttemptId)
-            .Append(attempt)
-            .ToArray();
+            .Append(attempt));
         await CommitAggregateAsync(
             current.Key,
             current.Value with { Attempts = attempts },
@@ -218,10 +222,9 @@ public sealed class KernelJobsStore
         CancellationToken cancellationToken = default)
     {
         var current = await RequireAggregateRecordAsync(completedJob.Id, cancellationToken);
-        var attempts = current.Value!.Attempts
+        var attempts = RetainAttempts(current.Value!.Attempts
             .Where(item => item.AttemptId != finishedAttempt.AttemptId)
-            .Append(finishedAttempt)
-            .ToArray();
+            .Append(finishedAttempt));
         await CommitAggregateAsync(
             current.Key,
             current.Value with
@@ -269,8 +272,9 @@ public sealed class KernelJobsStore
         CancellationToken cancellationToken = default,
         ModuleStorageClaimAuthority? authority = null)
     {
+        ValidateProgress(progress);
         var current = await RequireAggregateRecordAsync(progress.JobId, cancellationToken);
-        var next = current.Value!.Progress.Append(progress).ToArray();
+        var next = RetainProgress(current.Value!.Progress.Append(progress));
         await CommitAggregateAsync(
             current.Key,
             current.Value with { Progress = next },
@@ -337,10 +341,25 @@ public sealed class KernelJobsStore
         ModuleStorageClaimAuthority? authority,
         CancellationToken cancellationToken)
     {
+        JsonElement? serializedAggregate = null;
+        if (aggregate is not null)
+        {
+            var serialized = JsonSerializer.SerializeToElement(aggregate, _jsonOptions);
+            var bytes = Encoding.UTF8.GetByteCount(serialized.GetRawText());
+            if (bytes > MaxAggregateDocumentBytes)
+            {
+                throw new KernelActionExecutionException(
+                    $"Jobs aggregate '{key}' is {bytes} bytes and exceeds the bounded " +
+                    $"Core limit of {MaxAggregateDocumentBytes} bytes.");
+            }
+
+            serializedAggregate = serialized;
+        }
+
         var mutation = new ModuleStorageMutation(
             operation,
             key,
-            aggregate is null ? null : JsonSerializer.SerializeToElement(aggregate, _jsonOptions),
+            serializedAggregate,
             null,
             aggregate is null ? null : JobIndexes(aggregate.Job),
             expectedRevision,
@@ -365,6 +384,25 @@ public sealed class KernelJobsStore
                 result.Revisions.Count == 0 ? null : result.Revisions[0].Revision);
         }
         return result.Revisions[0].Revision;
+    }
+
+    private static IReadOnlyList<JobAttemptDocument> RetainAttempts(
+        IEnumerable<JobAttemptDocument> attempts) =>
+        attempts.TakeLast(MaxRetainedAttempts).ToArray();
+
+    private static IReadOnlyList<JobProgress> RetainProgress(
+        IEnumerable<JobProgress> progress) =>
+        progress.TakeLast(MaxRetainedProgress).ToArray();
+
+    private static void ValidateProgress(JobProgress progress)
+    {
+        if (Encoding.UTF8.GetByteCount(progress.Code) > MaxProgressTextBytes ||
+            Encoding.UTF8.GetByteCount(progress.Message) > MaxProgressTextBytes)
+        {
+            throw new KernelActionExecutionException(
+                $"Jobs progress for '{progress.JobId:D}' exceeds the {MaxProgressTextBytes}-byte " +
+                "per-field limit.");
+        }
     }
 
     private static ModuleDocumentRecord<JobDocument> ToJobRecord(
