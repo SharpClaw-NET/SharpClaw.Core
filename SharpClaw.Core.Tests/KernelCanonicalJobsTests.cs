@@ -96,6 +96,63 @@ public sealed class KernelCanonicalJobsTests
     }
 
     [Fact]
+    public async Task Serialized_dispatch_and_jobs_reads_use_only_strict_storage_queries()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway
+        {
+            RejectUnboundedQueries = true,
+        };
+        var handler = new ReadHandler();
+        var coordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [handler]);
+        var context = CreateContext("strict-storage-owner");
+        var input = handler.InputCodec.Encode(new ReadRequest("strict-storage"));
+        var job = await coordinator.SubmitAsync(
+            new JobSubmission<JobPayloadEnvelope>(
+                new SharpClawActionKey("tool.fetch"),
+                input,
+                context.Caller,
+                context.Features),
+            context);
+
+        await coordinator.ReportProgressAsync(
+            new JobProgress(job.Id, null, "started", "strict query test"),
+            context);
+        var first = await coordinator.DispatchAsync(job.Id, context);
+        var replay = await coordinator.DispatchAsync(job.Id, context);
+        var progress = await coordinator.ReadProgressAsync(job.Id, context);
+        var attempts = await coordinator.ReadAttemptsAsync(job.Id, context);
+        var artifact = await coordinator.ReadArtifactAsync(job.Id, context);
+        var recovered = await coordinator.RecoverAsync(job.Id, context);
+        var deleted = await coordinator.DeleteAsync(job.Id, context);
+
+        Assert.Equal(ActionOutcomeKind.Completed, first.Outcome);
+        Assert.Equal(ActionOutcomeKind.Completed, replay.Outcome);
+        Assert.Equal(handler.ResultCodec.ContractName, first.Result!.ContractName);
+        Assert.Equal(first.Result, replay.Result);
+        Assert.Single(progress);
+        Assert.Single(attempts);
+        Assert.Equal(first.Result, artifact);
+        Assert.Equal(JobStatus.Completed, recovered.Status);
+        Assert.True(deleted);
+        Assert.NotEmpty(gateway.QueryPayloads);
+        Assert.All(
+            gateway.QueryPayloads,
+            payload => Assert.True(
+                payload.GetProperty("filters").GetArrayLength() > 0 ||
+                payload.GetProperty("orderBy").ValueKind is not JsonValueKind.Null,
+                "Every Jobs query must use a filter or an order index."));
+        Assert.Contains(
+            gateway.QueryPayloads,
+            payload => payload.GetProperty("filters").EnumerateArray().Any(filter =>
+                filter.GetProperty("indexName").GetString() == "jobId"));
+    }
+
+    [Fact]
     public async Task Concurrent_submission_uses_one_atomic_idempotency_record()
     {
         var graph = CreateGraph();
@@ -1321,12 +1378,24 @@ public sealed class KernelCanonicalJobsTests
         private int _executionCommitCount;
         private int _maxStoredDocumentBytes;
         private readonly List<string> _commitLog = [];
+        private readonly List<JsonElement> _queryPayloads = [];
 
         public TaskCompletionSource<bool>? ClaimBarrier { get; set; }
 
         public bool RejectRenewals { get; set; }
 
         public bool FailNextCommit { get; set; }
+
+        public bool RejectUnboundedQueries { get; set; }
+
+        public IReadOnlyList<JsonElement> QueryPayloads
+        {
+            get
+            {
+                lock (_sync)
+                    return _queryPayloads.Select(payload => payload.Clone()).ToArray();
+            }
+        }
 
         private int _claimWaiters;
 
@@ -1413,6 +1482,19 @@ public sealed class KernelCanonicalJobsTests
             CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
+            if (operation == ModuleStorageOperations.Query)
+            {
+                var filters = parameters.TryGetProperty("filters", out var filterValue) &&
+                    filterValue.ValueKind == JsonValueKind.Array &&
+                    filterValue.GetArrayLength() > 0;
+                var order = parameters.TryGetProperty("orderBy", out var orderValue) &&
+                    orderValue.ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined);
+                if (RejectUnboundedQueries && !filters && !order)
+                    throw new InvalidOperationException(
+                        "Module storage query requires at least one filter or order index.");
+                lock (_sync)
+                    _queryPayloads.Add(parameters.Clone());
+            }
             var response = operation switch
             {
                 ModuleStorageOperations.Get => Get(storageName, parameters),

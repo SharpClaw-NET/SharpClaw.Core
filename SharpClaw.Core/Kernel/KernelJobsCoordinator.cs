@@ -212,10 +212,34 @@ public sealed class KernelJobsCoordinator
         }
     }
 
-    public async ValueTask<JobExecutionResult<TResult>> DispatchAsync<TResult>(
+    public ValueTask<JobExecutionResult<TResult>> DispatchAsync<TResult>(
         Guid jobId,
         KernelActionExecutionContext executionContext,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        DispatchAsyncCoreAsync<TResult>(
+            jobId,
+            executionContext,
+            cancellationToken,
+            allowEnvelopeResult: false);
+
+    /// <summary>
+    /// Dispatches a Jobs record without requiring the host to know the module result CLR type.
+    /// </summary>
+    public ValueTask<JobExecutionResult<JobPayloadEnvelope>> DispatchAsync(
+        Guid jobId,
+        KernelActionExecutionContext executionContext,
+        CancellationToken cancellationToken = default) =>
+        DispatchAsyncCoreAsync<JobPayloadEnvelope>(
+            jobId,
+            executionContext,
+            cancellationToken,
+            allowEnvelopeResult: true);
+
+    private async ValueTask<JobExecutionResult<TResult>> DispatchAsyncCoreAsync<TResult>(
+        Guid jobId,
+        KernelActionExecutionContext executionContext,
+        CancellationToken cancellationToken,
+        bool allowEnvelopeResult)
     {
         ArgumentNullException.ThrowIfNull(executionContext);
         var dispatchRecord = await GetJobAsync(jobId, executionContext, CancellationToken.None);
@@ -239,7 +263,11 @@ public sealed class KernelJobsCoordinator
             dispatchJob,
             async (current, ct) =>
             {
-                dispatchResult = await DispatchCoreAsync<TResult>(jobId, executionContext, ct);
+                dispatchResult = await DispatchCoreAsync<TResult>(
+                    jobId,
+                    executionContext,
+                    ct,
+                    allowEnvelopeResult);
                 Interlocked.Exchange(ref dispatchCompleted, 1);
                 return dispatchResult.Job;
             },
@@ -256,7 +284,8 @@ public sealed class KernelJobsCoordinator
     private async ValueTask<JobExecutionResult<TResult>> DispatchCoreAsync<TResult>(
         Guid jobId,
         KernelActionExecutionContext executionContext,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool allowEnvelopeResult)
     {
         ArgumentNullException.ThrowIfNull(executionContext);
         var record = await GetJobAsync(jobId, executionContext, CancellationToken.None);
@@ -264,9 +293,14 @@ public sealed class KernelJobsCoordinator
             throw new KernelActionExecutionException($"Jobs record '{jobId:D}' was not found.");
         EnsureOwner(existing, executionContext);
 
-        var handler = RequireHandler<TResult>(existing.ActionKey);
+        var handler = RequireHandler<TResult>(existing.ActionKey, allowEnvelopeResult);
         if (existing.Status is JobStatus.Completed or JobStatus.Failed or JobStatus.Cancelled or JobStatus.Expired)
-            return await ReadCompletedResultAsync<TResult>(existing, handler, executionContext, cancellationToken);
+            return await ReadCompletedResultAsync<TResult>(
+                existing,
+                handler,
+                executionContext,
+                cancellationToken,
+                allowEnvelopeResult);
         if (existing.Status is JobStatus.Held or JobStatus.Paused or JobStatus.OutcomeUncertain or JobStatus.Running)
             return new JobExecutionResult<TResult>(
                 existing,
@@ -360,7 +394,11 @@ public sealed class KernelJobsCoordinator
             job = startedJob;
             jobRevision = startedRecord.Revision;
 
-            var startedAttempt = await GetAttemptAsync(attempt!.AttemptId, executionContext, CancellationToken.None);
+            var startedAttempt = await GetAttemptAsync(
+                job.Id,
+                attempt!.AttemptId,
+                executionContext,
+                CancellationToken.None);
             if (startedAttempt is null)
                 throw new KernelActionExecutionException(
                     $"Jobs attempt '{attempt!.AttemptId:D}' disappeared after its start transition.");
@@ -454,6 +492,7 @@ public sealed class KernelJobsCoordinator
                                     throw new KernelActionExecutionException(
                                         $"Jobs attempt '{receipt.AttemptId:D}' lost its storage claim after receipt persistence.");
                                 var receiptRecord = await GetAttemptAsync(
+                                    receipt.JobId,
                                     receipt.AttemptId,
                                     executionContext,
                                     CancellationToken.None);
@@ -534,7 +573,9 @@ public sealed class KernelJobsCoordinator
 
             return new JobExecutionResult<TResult>(
                 job,
-                (TResult)handler.DecodeResult(output),
+                (TResult)(allowEnvelopeResult
+                    ? (object)output
+                    : handler.DecodeResult(output)),
                 ActionOutcomeKind.Completed);
         }
         catch (Exception exception) when (!startClaimed && IsRevisionConflict(exception))
@@ -1146,7 +1187,8 @@ public sealed class KernelJobsCoordinator
         JobDocument job,
         IJobHandler handler,
         KernelActionExecutionContext executionContext,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool allowEnvelopeResult)
     {
         if (job.Status != JobStatus.Completed || job.Result is null)
             return new JobExecutionResult<TResult>(
@@ -1162,7 +1204,11 @@ public sealed class KernelJobsCoordinator
             cancellationToken);
         return new JobExecutionResult<TResult>(
             job,
-            result?.Value is null ? default : (TResult)handler.DecodeResult(result.Value),
+            result?.Value is null
+                ? default
+                : (TResult)(allowEnvelopeResult
+                    ? (object)result.Value
+                    : handler.DecodeResult(result.Value)),
             ActionOutcomeKind.Completed);
     }
 
@@ -1938,13 +1984,14 @@ public sealed class KernelJobsCoordinator
             cancellationToken);
 
     private ValueTask<ModuleDocumentRecord<JobAttemptDocument>?> GetAttemptAsync(
+        Guid jobId,
         Guid attemptId,
         KernelActionExecutionContext executionContext,
         CancellationToken cancellationToken) =>
         RunStorageResultAsync<StorageGetAttemptRequest, ModuleDocumentRecord<JobAttemptDocument>?>(
             new SharpClawActionKey("storage.get"),
-            new StorageGetAttemptRequest(attemptId),
-            (request, ct) => _store.GetAttemptAsync(request.AttemptId, ct),
+            new StorageGetAttemptRequest(jobId, attemptId),
+            (request, ct) => _store.GetAttemptAsync(request.JobId, request.AttemptId, ct),
             executionContext,
             cancellationToken);
 
@@ -2181,10 +2228,12 @@ public sealed class KernelJobsCoordinator
         return handler;
     }
 
-    private IJobHandler RequireHandler<TResult>(SharpClawActionKey key)
+    private IJobHandler RequireHandler<TResult>(
+        SharpClawActionKey key,
+        bool allowEnvelopeResult = false)
     {
         var handler = RequireHandler<object, TResult>(key, allowResultMismatch: true);
-        if (handler.ResultType != typeof(TResult))
+        if (!allowEnvelopeResult && handler.ResultType != typeof(TResult))
             throw new KernelActionExecutionException(
                 $"Jobs action '{key.Value}' returns '{handler.ResultType.FullName}'.");
         return handler;
@@ -2240,7 +2289,7 @@ public sealed class KernelJobsCoordinator
             .All(value => value);
 
     private sealed record StorageGetRequest(Guid JobId);
-    private sealed record StorageGetAttemptRequest(Guid AttemptId);
+    private sealed record StorageGetAttemptRequest(Guid JobId, Guid AttemptId);
     private sealed record StorageGetResultRequest(Guid JobId);
     private sealed record StorageListRequest(string? CallerSubjectId = null);
     private sealed record StorageIdempotencyRequest(Guid IdempotencyKey);

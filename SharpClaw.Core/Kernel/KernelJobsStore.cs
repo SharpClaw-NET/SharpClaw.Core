@@ -213,10 +213,11 @@ public sealed class KernelJobsStore
     }
 
     public async Task<ModuleDocumentRecord<JobAttemptDocument>?> GetAttemptAsync(
+        Guid jobId,
         Guid attemptId,
         CancellationToken cancellationToken = default)
     {
-        var aggregate = await FindAggregateRecordByAttemptIdAsync(attemptId, cancellationToken);
+        var aggregate = await FindAggregateRecordByJobIdAsync(jobId, cancellationToken);
         var attempt = aggregate?.Value?.Attempts.FirstOrDefault(item => item.AttemptId == attemptId);
         return aggregate is null || attempt is null
             ? null
@@ -338,18 +339,10 @@ public sealed class KernelJobsStore
     {
         var records = await _records.Query()
             .WhereIndex("jobId").EqualTo(jobId.ToString("D"))
+            .OrderByIndex("createdAt")
             .Take(1)
             .ToRecordsAsync(cancellationToken);
         return records.FirstOrDefault();
-    }
-
-    private async Task<ModuleDocumentRecord<KernelJobsAggregate>?> FindAggregateRecordByAttemptIdAsync(
-        Guid attemptId,
-        CancellationToken cancellationToken)
-    {
-        var records = await _records.Query().ToRecordsAsync(cancellationToken);
-        return records.FirstOrDefault(record =>
-            record.Value?.Attempts.Any(attempt => attempt.AttemptId == attemptId) == true);
     }
 
     private async Task<ModuleDocumentRecord<KernelJobsAggregate>> RequireAggregateRecordAsync(
