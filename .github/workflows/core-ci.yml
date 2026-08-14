@@ -32,7 +32,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: SharpClaw-NET/SharpClaw.Contracts
-          ref: d7050dad2655d9aa9a16c0b0292345a1c409722f
+          ref: 1763d573a594ab22ec78ba09773dd1f33a6dda76
           path: .ci/contracts
 
       - name: Pack exact Contracts source to the local feed

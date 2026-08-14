@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using SharpClaw.Contracts.Modules;
 using SharpClaw.Core.Kernel;
 
@@ -15,7 +16,7 @@ public sealed class KernelCanonicalJobsTests
             SharpClawActionCatalog.Jobs,
             key => Assert.True(graph.ContainsAction(key), $"Missing action '{key.Value}'."));
         Assert.Equal(
-            [KernelJobsStorage.Jobs, KernelJobsStorage.Attempts, KernelJobsStorage.Results, KernelJobsStorage.Progress],
+            [KernelJobsStorage.Jobs],
             graph.Modules.Storage.Select(contract => contract.StorageName).ToArray());
         Assert.DoesNotContain(typeof(KernelJobsCoordinator).Assembly.GetTypes(),
             type => type.Namespace?.Contains("SharpClaw.Application", StringComparison.Ordinal) == true);
@@ -67,6 +68,33 @@ public sealed class KernelCanonicalJobsTests
     }
 
     [Fact]
+    public async Task Concurrent_submission_uses_one_atomic_idempotency_record()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway();
+        var context = CreateContext("atomic-owner");
+        var coordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [new ReadHandler()]);
+        var key = Guid.NewGuid();
+        var submission = new JobSubmission<ReadRequest>(
+            new SharpClawActionKey("tool.fetch"),
+            new ReadRequest("atomic"),
+            context.Caller,
+            context.Features,
+            IdempotencyKey: key);
+
+        var jobs = await Task.WhenAll(
+            coordinator.SubmitAsync(submission, context).AsTask(),
+            coordinator.SubmitAsync(submission, context).AsTask());
+
+        Assert.Equal(jobs[0].Id, jobs[1].Id);
+        Assert.Equal(1, gateway.Count(KernelJobsStorage.Jobs));
+    }
+
+    [Fact]
     public async Task Concurrent_dispatch_claims_one_attempt_and_does_not_fail_the_winner()
     {
         var graph = CreateGraph();
@@ -87,6 +115,11 @@ public sealed class KernelCanonicalJobsTests
             context);
 
         var firstTask = coordinator.DispatchAsync<ReadResult>(job.Id, context).AsTask();
+        var firstOrStarted = await Task.WhenAny(
+            firstTask,
+            handler.Started.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+        if (firstOrStarted == firstTask)
+            await firstTask;
         await handler.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var second = await coordinator.DispatchAsync<ReadResult>(job.Id, context);
         handler.Release.TrySetResult(true);
@@ -94,9 +127,210 @@ public sealed class KernelCanonicalJobsTests
 
         Assert.Equal(ActionOutcomeKind.Deferred, second.Outcome);
         Assert.Equal(ActionOutcomeKind.Completed, first.Outcome);
-        Assert.Equal(1, gateway.Count(KernelJobsStorage.Attempts));
-        Assert.Equal(1, gateway.Count(KernelJobsStorage.Results));
+        Assert.Equal(1, gateway.CountAttempts());
+        Assert.Equal(1, gateway.CountResults());
+        Assert.Equal(1, gateway.ClaimCount);
         Assert.Equal(JobStatus.Completed, first.Job.Status);
+    }
+
+    [Fact]
+    public async Task Concurrent_coordinators_use_one_storage_claim_for_one_job()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway
+        {
+            ClaimBarrier = new(TaskCreationOptions.RunContinuationsAsynchronously),
+        };
+        var firstHandler = new BlockingHandler();
+        var secondHandler = new BlockingHandler();
+        var firstCoordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [firstHandler]);
+        var secondCoordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [secondHandler]);
+        var context = CreateContext("cross-coordinator-owner");
+        var job = await firstCoordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.fetch"),
+                new ReadRequest("cross-coordinator"),
+                context.Caller,
+                context.Features),
+            context);
+
+        var firstDispatch = firstCoordinator.DispatchAsync<ReadResult>(job.Id, context).AsTask();
+        var secondDispatch = secondCoordinator.DispatchAsync<ReadResult>(job.Id, context).AsTask();
+        await gateway.WaitForClaimWaitersAsync(2);
+        gateway.ClaimBarrier!.TrySetResult(true);
+
+        var firstOrSecond = await Task.WhenAny(
+            firstHandler.Started.Task,
+            secondHandler.Started.Task).WaitAsync(TimeSpan.FromSeconds(5));
+        if (firstOrSecond == firstHandler.Started.Task)
+            firstHandler.Release.TrySetResult(true);
+        else
+            secondHandler.Release.TrySetResult(true);
+
+        var results = await Task.WhenAll(firstDispatch, secondDispatch);
+
+        Assert.Equal(1, results.Count(result => result.Outcome == ActionOutcomeKind.Completed));
+        Assert.Equal(1, results.Count(result => result.Outcome == ActionOutcomeKind.Deferred));
+        Assert.Equal(2, gateway.ClaimCount);
+        Assert.Equal(1, gateway.CountAttempts());
+        Assert.Equal(1, gateway.CountResults());
+    }
+
+    [Fact]
+    public async Task Pause_fences_and_cancels_the_active_handler_before_resume()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway();
+        var handler = new BlockingHandler();
+        var context = CreateContext("control-owner");
+        var coordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [handler]);
+        var job = await coordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.fetch"),
+                new ReadRequest("control"),
+                context.Caller,
+                context.Features),
+            context);
+
+        var dispatch = coordinator.DispatchAsync<ReadResult>(job.Id, context).AsTask();
+        await handler.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var paused = await coordinator.PauseAsync(job.Id, context);
+        var dispatchResult = await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(JobStatus.Paused, paused.Status);
+        Assert.Equal(JobStatus.Paused, (await coordinator.GetAsync(job.Id, context))!.Status);
+        Assert.NotEqual(ActionOutcomeKind.Completed, dispatchResult.Outcome);
+        Assert.True(gateway.RecoverCount > 0);
+        Assert.True(gateway.ClaimCount >= 2);
+
+        Assert.Equal(JobStatus.Queued, (await coordinator.ResumeAsync(job.Id, context)).Status);
+    }
+
+    [Fact]
+    public async Task Resume_does_not_start_a_second_handler_while_the_fenced_handler_is_still_running()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway();
+        var handler = new NonCooperativeHandler();
+        var context = CreateContext("non-cooperative-owner");
+        var coordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [handler]);
+        var job = await coordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.fetch"),
+                new ReadRequest("non-cooperative"),
+                context.Caller,
+                context.Features),
+            context);
+
+        var first = coordinator.DispatchAsync<ReadResult>(job.Id, context).AsTask();
+        await handler.FirstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(JobStatus.Paused, (await coordinator.PauseAsync(job.Id, context)).Status);
+        var firstOutcome = await first.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.NotEqual(ActionOutcomeKind.Completed, firstOutcome.Outcome);
+        Assert.Equal(JobStatus.Paused, firstOutcome.Job.Status);
+
+        Assert.Equal(JobStatus.Queued, (await coordinator.ResumeAsync(job.Id, context)).Status);
+        var blocked = await coordinator.DispatchAsync<ReadResult>(job.Id, context);
+        Assert.Equal(ActionOutcomeKind.Deferred, blocked.Outcome);
+        Assert.Equal("JOBS_ALREADY_RUNNING", blocked.Error?.Code);
+        Assert.Equal(1, handler.InvocationCount);
+
+        handler.ReleaseFirst.TrySetResult(true);
+        await handler.FirstFinished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        JobExecutionResult<ReadResult>? completed = null;
+        for (var attempt = 0; attempt < 100; attempt++)
+        {
+            completed = await coordinator.DispatchAsync<ReadResult>(job.Id, context);
+            if (completed.Outcome != ActionOutcomeKind.Deferred)
+                break;
+            await Task.Delay(20);
+        }
+
+        Assert.NotNull(completed);
+        Assert.Equal(ActionOutcomeKind.Completed, completed!.Outcome);
+        Assert.Equal(2, handler.InvocationCount);
+        Assert.Equal(JobStatus.Completed, completed.Job.Status);
+    }
+
+    [Fact]
+    public async Task Running_claim_is_renewed_and_recovered_before_control_transition()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway(TimeSpan.FromSeconds(6));
+        var handler = new BlockingHandler();
+        var context = CreateContext("claim-owner");
+        var coordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [handler]);
+        var job = await coordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.fetch"),
+                new ReadRequest("claim"),
+                context.Caller,
+                context.Features),
+            context);
+
+        var dispatch = coordinator.DispatchAsync<ReadResult>(job.Id, context).AsTask();
+        await handler.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(TimeSpan.FromMilliseconds(2_500));
+
+        Assert.True(gateway.RenewCount > 0);
+        Assert.Equal(JobStatus.Paused, (await coordinator.PauseAsync(job.Id, context)).Status);
+        handler.Release.TrySetResult(true);
+        await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(gateway.RecoverCount > 0);
+    }
+
+    [Fact]
+    public async Task Stop_fences_the_active_handler_and_preserves_cancelled_state()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway();
+        var handler = new BlockingHandler();
+        var context = CreateContext("stop-owner");
+        var coordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [handler]);
+        var job = await coordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.fetch"),
+                new ReadRequest("stop"),
+                context.Caller,
+                context.Features),
+            context);
+
+        var dispatch = coordinator.DispatchAsync<ReadResult>(job.Id, context).AsTask();
+        await handler.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var stopped = await coordinator.StopAsync(job.Id, context);
+        var dispatchResult = await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(JobStatus.Cancelled, stopped.Status);
+        Assert.Equal(JobStatus.Cancelled, (await coordinator.GetAsync(job.Id, context))!.Status);
+        Assert.NotEqual(ActionOutcomeKind.Completed, dispatchResult.Outcome);
+        Assert.True(gateway.RecoverCount > 0);
     }
 
     [Fact]
@@ -134,11 +368,14 @@ public sealed class KernelCanonicalJobsTests
         await coordinator.DeliverEventAsync(
             new JobProgress(job.Id, null, "ignored", "delivered"),
             context);
-        Assert.Equal(2, gateway.Count(KernelJobsStorage.Progress));
+        Assert.Equal(2, gateway.CountProgress());
 
         Assert.Equal(JobStatus.Cancelled, (await coordinator.StopAsync(job.Id, context)).Status);
         Assert.True(await coordinator.DeleteAsync(job.Id, context));
         Assert.Empty(await coordinator.ListAsync(context));
+        Assert.Equal(0, gateway.CountAttempts());
+        Assert.Equal(0, gateway.CountResults());
+        Assert.Equal(0, gateway.CountProgress());
     }
 
     [Fact]
@@ -183,8 +420,12 @@ public sealed class KernelCanonicalJobsTests
         var read = await coordinator.DispatchAsync<ReadResult>(readJob.Id, context);
         var validate = await coordinator.DispatchAsync<ValidateResult>(validateJob.Id, context);
 
-        Assert.Equal(ActionOutcomeKind.Completed, read.Outcome);
-        Assert.Equal(ActionOutcomeKind.Completed, validate.Outcome);
+        Assert.True(
+            read.Outcome == ActionOutcomeKind.Completed,
+            read.Error?.Message ?? read.Outcome.ToString());
+        Assert.True(
+            validate.Outcome == ActionOutcomeKind.Completed,
+            validate.Error?.Message ?? validate.Outcome.ToString());
         Assert.Equal("read:jobs-user", read.Result!.Value);
         Assert.Equal("validate:jobs-user", validate.Result!.Value);
         Assert.Equal(JobStatus.Completed, read.Job.Status);
@@ -194,7 +435,8 @@ public sealed class KernelCanonicalJobsTests
         Assert.Equal(readIdempotencyKey, read.Job.IdempotencyKey);
         Assert.Equal(validateIdempotencyKey, validate.Job.IdempotencyKey);
         Assert.Equal(2, gateway.Count(KernelJobsStorage.Jobs));
-        Assert.Equal(2, gateway.Count(KernelJobsStorage.Results));
+        Assert.Equal(2, gateway.CountResults());
+        Assert.Equal(2, gateway.ExecutionCommitCount);
     }
 
     [Fact]
@@ -223,7 +465,7 @@ public sealed class KernelCanonicalJobsTests
         Assert.Equal(JobStatus.Queued, progress.Status);
         Assert.Equal(JobStatus.Cancelled, cancelled.Status);
         Assert.Equal(JobStatus.Cancelled, recovered.Status);
-        Assert.Equal(1, gateway.Count(KernelJobsStorage.Progress));
+        Assert.Equal(1, gateway.CountProgress());
     }
 
     [Fact]
@@ -274,7 +516,37 @@ public sealed class KernelCanonicalJobsTests
         Assert.Equal(ActionOutcomeKind.Failed, result.Outcome);
         Assert.Equal(JobStatus.Failed, result.Job.Status);
         Assert.Null(result.Job.Result);
-        Assert.Equal(0, gateway.Count(KernelJobsStorage.Results));
+        Assert.Equal(0, gateway.CountResults());
+    }
+
+    [Fact]
+    public async Task Receipted_handler_persists_receipt_and_result_under_the_active_claim()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway();
+        var coordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [new ReceiptedHandler()]);
+        var context = CreateContext("receipted-user");
+        var job = await coordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.receipted"),
+                new ReadRequest("receipt"),
+                context.Caller,
+                context.Features),
+            context);
+
+        var result = await coordinator.DispatchAsync<ReadResult>(job.Id, context);
+        var attempts = await coordinator.ReadAttemptsAsync(job.Id, context);
+
+        Assert.Equal(ActionOutcomeKind.Completed, result.Outcome);
+        Assert.Equal(JobStatus.Completed, result.Job.Status);
+        Assert.Single(attempts);
+        Assert.False(string.IsNullOrWhiteSpace(attempts[0].ReceiptId));
+        Assert.Equal(1, gateway.CountResults());
+        Assert.Equal(1, gateway.ExecutionCommitCount);
     }
 
     [Fact]
@@ -399,6 +671,25 @@ public sealed class KernelCanonicalJobsTests
             throw new InvalidOperationException("The test handler failed.");
     }
 
+    private sealed class ReceiptedHandler : IJobHandler<ReadRequest, ReadResult>
+    {
+        public SharpClawActionKey ActionKey { get; } = new("tool.receipted");
+
+        public JobExecutionSafety Safety => JobExecutionSafety.Receipted;
+
+        public IJobPayloadCodec<ReadRequest> InputCodec { get; } =
+            new JsonJobPayloadCodec<ReadRequest>("test.receipted.request");
+
+        public IJobPayloadCodec<ReadResult> ResultCodec { get; } =
+            new JsonJobPayloadCodec<ReadResult>("test.receipted.result");
+
+        public ValueTask<ReadResult> ExecuteAsync(
+            JobExecutionContext context,
+            ReadRequest input,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult(new ReadResult($"{input.Value}:{context.Caller.SubjectId}"));
+    }
+
     private sealed class ControlKeyHandler : IJobHandler<ReadRequest, ReadResult>
     {
         public SharpClawActionKey ActionKey { get; } = new("jobs.read");
@@ -447,6 +738,48 @@ public sealed class KernelCanonicalJobsTests
         }
     }
 
+    private sealed class NonCooperativeHandler : IJobHandler<ReadRequest, ReadResult>
+    {
+        private int _invocationCount;
+
+        public TaskCompletionSource<bool> FirstStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource<bool> FirstFinished { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource<bool> ReleaseFirst { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public int InvocationCount => Volatile.Read(ref _invocationCount);
+
+        public SharpClawActionKey ActionKey { get; } = new("tool.fetch");
+
+        public JobExecutionSafety Safety => JobExecutionSafety.Idempotent;
+
+        public IJobPayloadCodec<ReadRequest> InputCodec { get; } =
+            new JsonJobPayloadCodec<ReadRequest>("test.non-cooperative.request");
+
+        public IJobPayloadCodec<ReadResult> ResultCodec { get; } =
+            new JsonJobPayloadCodec<ReadResult>("test.non-cooperative.result");
+
+        public async ValueTask<ReadResult> ExecuteAsync(
+            JobExecutionContext context,
+            ReadRequest input,
+            CancellationToken cancellationToken)
+        {
+            var invocation = Interlocked.Increment(ref _invocationCount);
+            if (invocation == 1)
+            {
+                FirstStarted.TrySetResult(true);
+                await ReleaseFirst.Task;
+                FirstFinished.TrySetResult(true);
+            }
+
+            return new ReadResult($"{input.Value}:{invocation}");
+        }
+    }
+
     private sealed class WorkloadModule : ISharpClawModule
     {
         private const ActionInterceptionCapabilities WorkloadCapabilities =
@@ -464,6 +797,7 @@ public sealed class KernelCanonicalJobsTests
                 ["tool.fetch"] = WorkloadCapabilities,
                 ["tool.validate"] = WorkloadCapabilities,
                 ["tool.fail"] = WorkloadCapabilities,
+                ["tool.receipted"] = WorkloadCapabilities,
             };
 
         public void Configure(ISharpClawModuleBuilder builder)
@@ -487,8 +821,28 @@ public sealed class KernelCanonicalJobsTests
 
     private sealed class InMemoryJobsGateway : IModuleStorageGateway
     {
+        private static readonly JsonSerializerOptions JsonOptions = CreateJsonOptions();
+        private readonly TimeSpan _leaseDuration;
         private readonly Dictionary<(string Storage, string Key), StoredRecord> _records = [];
+        private readonly Dictionary<string, ModuleStorageMutationAndOutboxResult> _commits =
+            new(StringComparer.Ordinal);
+        private readonly Dictionary<(string Storage, string Key), ClaimState> _claims = [];
         private readonly object _sync = new();
+        private int _atomicCommitCount;
+        private int _claimCount;
+        private int _renewCount;
+        private int _recoverCount;
+        private int _executionCommitCount;
+        private readonly List<string> _commitLog = [];
+
+        public TaskCompletionSource<bool>? ClaimBarrier { get; set; }
+
+        private int _claimWaiters;
+
+        public InMemoryJobsGateway(TimeSpan? leaseDuration = null)
+        {
+            _leaseDuration = leaseDuration ?? TimeSpan.FromMinutes(5);
+        }
 
         public int Count(string storageName)
         {
@@ -496,8 +850,67 @@ public sealed class KernelCanonicalJobsTests
                 return _records.Keys.Count(key => key.Storage == storageName);
         }
 
+        public int CountAttempts() => CountAggregateItems("attempts");
+
+        public int CountResults() => CountAggregateValues("result");
+
+        public int CountProgress() => CountAggregateItems("progress");
+
+        public int AtomicCommitCount => Volatile.Read(ref _atomicCommitCount);
+
+        public int ClaimCount => Volatile.Read(ref _claimCount);
+
+        public int RenewCount => Volatile.Read(ref _renewCount);
+
+        public int RecoverCount => Volatile.Read(ref _recoverCount);
+
+        public int ExecutionCommitCount => Volatile.Read(ref _executionCommitCount);
+
+        public IReadOnlyList<string> CommitLog
+        {
+            get
+            {
+                lock (_sync)
+                    return _commitLog.ToArray();
+            }
+        }
+
+        public async Task WaitForClaimWaitersAsync(int expected)
+        {
+            for (var attempt = 0; attempt < 250; attempt++)
+            {
+                if (Volatile.Read(ref _claimWaiters) >= expected)
+                    return;
+                await Task.Delay(20);
+            }
+
+            throw new TimeoutException($"Expected {expected} storage claim waiters.");
+        }
+
         public IReadOnlyList<ModuleStorageContractDescriptor> ListContracts() =>
             KernelJobsStorage.Contracts;
+
+        private int CountAggregateItems(string propertyName)
+        {
+            lock (_sync)
+            {
+                return _records.Values.Sum(record =>
+                    record.Value.TryGetProperty(propertyName, out var values) &&
+                    values.ValueKind == JsonValueKind.Array
+                        ? values.GetArrayLength()
+                        : 0);
+            }
+        }
+
+        private int CountAggregateValues(string propertyName)
+        {
+            lock (_sync)
+            {
+                return _records.Values.Count(record =>
+                    record.Value.TryGetProperty(propertyName, out var value) &&
+                    value.ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined));
+            }
+        }
 
         public Task<JsonElement> InvokeAsync(
             string moduleId,
@@ -522,29 +935,231 @@ public sealed class KernelCanonicalJobsTests
             string moduleId,
             string storageName,
             ModuleStorageMutationAndOutboxRequest request,
-            CancellationToken ct = default) =>
-            throw new NotSupportedException();
+            CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            Interlocked.Increment(ref _atomicCommitCount);
+            lock (_sync)
+            {
+                if (_commits.TryGetValue(request.Commit.IdempotencyKey, out var committed))
+                    return Task.FromResult(committed with { AlreadyCommitted = true });
+
+                var revisions = new List<ModuleStorageRevision>();
+                foreach (var mutation in request.Mutations)
+                {
+                    var storageKey = (storageName, mutation.Key);
+                    var hasPrevious = _records.TryGetValue(storageKey, out var previous);
+                    var actualRevision = hasPrevious ? previous!.Revision : 0;
+                    if (mutation.ExpectedRevision is not null &&
+                        mutation.ExpectedRevision.Value != actualRevision)
+                    {
+                        throw RevisionConflict(mutation.Key, mutation.ExpectedRevision, actualRevision);
+                    }
+
+                    _commitLog.Add(
+                        $"{mutation.Operation}:{mutation.Key}:expected={mutation.ExpectedRevision}:actual={actualRevision}:authority={mutation.Authority}");
+                    ValidateAuthority(storageKey, mutation.Authority, actualRevision);
+                    var revision = actualRevision + 1;
+                    if (mutation.Operation == ModuleStorageOperations.Delete)
+                    {
+                        _records.Remove(storageKey);
+                    }
+                    else
+                    {
+                        if (mutation.Value is not { } value)
+                            throw new InvalidOperationException("An atomic Jobs upsert requires a value.");
+                        if (value.TryGetProperty("job", out var aggregateJob) &&
+                            aggregateJob.TryGetProperty("status", out var status) &&
+                            ((status.ValueKind == JsonValueKind.String &&
+                              string.Equals(status.GetString(), JobStatus.Completed.ToString(), StringComparison.Ordinal)) ||
+                             (status.ValueKind == JsonValueKind.Number &&
+                              status.TryGetInt32(out var statusValue) &&
+                              statusValue == (int)JobStatus.Completed)) &&
+                            value.TryGetProperty("result", out var aggregateResult) &&
+                            aggregateResult.ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined))
+                        {
+                            Interlocked.Increment(ref _executionCommitCount);
+                        }
+                        _records[storageKey] = new StoredRecord(
+                            value.Clone(),
+                            revision,
+                            mutation.Indexes is null
+                                ? null
+                                : JsonSerializer.SerializeToElement(mutation.Indexes));
+                    }
+
+                    if (_claims.TryGetValue(storageKey, out var claim))
+                    {
+                        _claims[storageKey] = claim with
+                        {
+                            Authority = claim.Authority with { Revision = revision },
+                        };
+                    }
+                    revisions.Add(new ModuleStorageRevision(mutation.Key, revision));
+                }
+
+                var result = new ModuleStorageMutationAndOutboxResult(
+                    request.Commit,
+                    revisions,
+                    [],
+                    revisions.Count == 0 ? 0 : revisions[^1].Revision);
+                _commits[request.Commit.IdempotencyKey] = result;
+                return Task.FromResult(result);
+            }
+        }
 
         public Task<ModuleStorageClaimResult<T>> ClaimAsync<T>(
             string moduleId,
             string storageName,
             ModuleStorageClaimRequest request,
-            CancellationToken ct = default) =>
-            throw new NotSupportedException();
+            CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            Interlocked.Increment(ref _claimCount);
+            if (ClaimBarrier is { } barrier)
+            {
+                Interlocked.Increment(ref _claimWaiters);
+                return WaitForClaimBarrierAsync<T>(
+                    moduleId,
+                    storageName,
+                    request,
+                    barrier,
+                    ct);
+            }
+
+            return ClaimCore<T>(storageName, request);
+        }
+
+        private async Task<ModuleStorageClaimResult<T>> WaitForClaimBarrierAsync<T>(
+            string moduleId,
+            string storageName,
+            ModuleStorageClaimRequest request,
+            TaskCompletionSource<bool> barrier,
+            CancellationToken ct)
+        {
+            await barrier.Task.WaitAsync(ct);
+            return await ClaimCore<T>(storageName, request);
+        }
+
+        private Task<ModuleStorageClaimResult<T>> ClaimCore<T>(
+            string storageName,
+            ModuleStorageClaimRequest request)
+        {
+            lock (_sync)
+            {
+                var candidate = _records
+                    .Where(pair => pair.Key.Storage == storageName)
+                    .Where(pair => MatchesFilters(pair.Value.Indexes, request.Filters))
+                    .Select(pair => pair)
+                    .FirstOrDefault();
+                if (candidate.Value is null)
+                {
+                    var emptyAuthority = NewAuthority(0, 1);
+                    return Task.FromResult(
+                        new ModuleStorageClaimResult<T>([], emptyAuthority));
+                }
+
+                if (request.ExpectedRevision is not null &&
+                    candidate.Value.Revision != request.ExpectedRevision.Value)
+                {
+                    throw RevisionConflict(
+                        candidate.Key.Key,
+                        request.ExpectedRevision,
+                        candidate.Value.Revision);
+                }
+
+                if (_claims.TryGetValue(candidate.Key, out var existingClaim) &&
+                    existingClaim.Authority.IsValidAt(DateTimeOffset.UtcNow))
+                {
+                    throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                        ModuleStorageErrors.StaleClaim,
+                        "The Jobs aggregate already has a live storage claim.",
+                        candidate.Key.Key));
+                }
+
+                var value = JsonSerializer.SerializeToElement(request.Patch);
+                var revision = candidate.Value.Revision + 1;
+                _records[candidate.Key] = new StoredRecord(
+                    value,
+                    revision,
+                    request.Indexes is null
+                        ? candidate.Value.Indexes
+                        : JsonSerializer.SerializeToElement(request.Indexes));
+                var authority = NewAuthority(revision, existingClaim?.Authority.Generation + 1 ?? 1);
+                _claims[candidate.Key] = new ClaimState(authority);
+                var typed = value.Deserialize<T>(JsonOptions)!;
+                var record = new ModuleStorageClaimRecord<T>(
+                    candidate.Key.Key,
+                    typed,
+                    revision,
+                    authority,
+                    _records[candidate.Key].Indexes);
+                return Task.FromResult(
+                    new ModuleStorageClaimResult<T>([record], authority));
+            }
+        }
 
         public Task<ModuleStorageClaimRenewalResult> RenewClaimAsync(
             string moduleId,
             string storageName,
             ModuleStorageClaimRenewalRequest request,
-            CancellationToken ct = default) =>
-            throw new NotSupportedException();
+            CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            Interlocked.Increment(ref _renewCount);
+            lock (_sync)
+            {
+                var match = _claims.FirstOrDefault(pair =>
+                    pair.Key.Storage == storageName &&
+                    pair.Value.Authority.HostToken == request.HostToken &&
+                    pair.Value.Authority.Generation == request.Generation);
+                if (match.Value is null ||
+                    !match.Value.Authority.IsValidAt(DateTimeOffset.UtcNow) ||
+                    !_records.TryGetValue(match.Key, out var record))
+                {
+                    return Task.FromResult(new ModuleStorageClaimRenewalResult(
+                        false,
+                        null,
+                        ModuleStorageErrors.StaleClaim));
+                }
+
+                var authority = match.Value.Authority with
+                {
+                    LeaseExpiresAt = request.RequestedLeaseExpiresAt,
+                    Revision = record.Revision,
+                };
+                _claims[match.Key] = new ClaimState(authority);
+                return Task.FromResult(new ModuleStorageClaimRenewalResult(true, authority));
+            }
+        }
 
         public Task<ModuleStorageClaimRecoveryResult> RecoverClaimAsync(
             string moduleId,
             string storageName,
             ModuleStorageClaimRecoveryRequest request,
-            CancellationToken ct = default) =>
-            throw new NotSupportedException();
+            CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            Interlocked.Increment(ref _recoverCount);
+            lock (_sync)
+            {
+                var match = _claims.FirstOrDefault(pair =>
+                    pair.Key.Storage == storageName &&
+                    pair.Value.Authority.HostToken == request.HostToken &&
+                    pair.Value.Authority.Generation == request.Generation);
+                if (match.Value is null)
+                    return Task.FromResult(new ModuleStorageClaimRecoveryResult(
+                        false,
+                        null,
+                        ModuleStorageErrors.StaleClaim));
+
+                _claims.Remove(match.Key);
+                return Task.FromResult(new ModuleStorageClaimRecoveryResult(
+                    true,
+                    match.Value.Authority,
+                    null));
+            }
+        }
 
         private JsonElement Get(string storageName, JsonElement parameters)
         {
@@ -616,6 +1231,70 @@ public sealed class KernelCanonicalJobsTests
             return true;
         }
 
+        private static bool MatchesFilters(
+            JsonElement? indexes,
+            IReadOnlyList<ModuleDocumentIndexFilter> filters)
+        {
+            foreach (var filter in filters)
+            {
+                if (!string.Equals(filter.Operator, ModuleStorageComparisonOperators.EqualTo, StringComparison.Ordinal))
+                    continue;
+                if (indexes is null || !indexes.Value.TryGetProperty(filter.IndexName, out var actual))
+                    return false;
+                if (!string.Equals(actual.ToString(), filter.Value?.ToString(), StringComparison.Ordinal))
+                    return false;
+            }
+            return true;
+        }
+
+        private static JsonSerializerOptions CreateJsonOptions()
+        {
+            var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+            options.Converters.Add(new ReadOnlySetJsonConverterFactory());
+            return options;
+        }
+
+        private void ValidateAuthority(
+            (string Storage, string Key) storageKey,
+            ModuleStorageClaimAuthority? authority,
+            long actualRevision)
+        {
+            if (authority is null)
+                return;
+            if (!_claims.TryGetValue(storageKey, out var claim) ||
+                !claim.Authority.Matches(authority) ||
+                claim.Authority.Revision != actualRevision)
+            {
+                throw new ModuleStorageContractException(new ModuleStorageContractFailure(
+                    ModuleStorageErrors.FencingRejected,
+                    $"The Jobs mutation does not carry the current storage claim. " +
+                    $"Expected={authority}, Current={claim?.Authority}, ActualRevision={actualRevision}, " +
+                    $"History={string.Join(" | ", _commitLog)}.",
+                    storageKey.Key));
+            }
+        }
+
+        private ModuleStorageClaimAuthority NewAuthority(
+            long revision,
+            long generation) =>
+            new(
+                KernelJobsStorage.OwnerModuleId,
+                Guid.NewGuid(),
+                DateTimeOffset.UtcNow.Add(_leaseDuration),
+                generation,
+                revision);
+
+        private static ModuleStorageContractException RevisionConflict(
+            string key,
+            long? expectedRevision,
+            long actualRevision) =>
+            new(new ModuleStorageContractFailure(
+                ModuleStorageErrors.RevisionConflict,
+                $"The test storage rejected stale revision {expectedRevision} for '{key}'.",
+                key,
+                expectedRevision,
+                actualRevision));
+
         private JsonElement Upsert(string storageName, JsonElement parameters)
         {
             var key = parameters.GetProperty("key").GetString()!;
@@ -662,5 +1341,35 @@ public sealed class KernelCanonicalJobsTests
         }
 
         private sealed record StoredRecord(JsonElement Value, long Revision, JsonElement? Indexes);
+
+        private sealed record ClaimState(ModuleStorageClaimAuthority Authority);
+
+        private sealed class ReadOnlySetJsonConverterFactory : JsonConverterFactory
+        {
+            public override bool CanConvert(Type typeToConvert) =>
+                typeToConvert.IsGenericType &&
+                typeToConvert.GetGenericTypeDefinition() == typeof(IReadOnlySet<>);
+
+            public override JsonConverter CreateConverter(
+                Type typeToConvert,
+                JsonSerializerOptions options) =>
+                (JsonConverter)Activator.CreateInstance(
+                    typeof(ReadOnlySetJsonConverter<>).MakeGenericType(typeToConvert.GetGenericArguments()[0]))!;
+        }
+
+        private sealed class ReadOnlySetJsonConverter<T> : JsonConverter<IReadOnlySet<T>>
+        {
+            public override IReadOnlySet<T> Read(
+                ref Utf8JsonReader reader,
+                Type typeToConvert,
+                JsonSerializerOptions options) =>
+                new HashSet<T>(JsonSerializer.Deserialize<T[]>(ref reader, options) ?? []);
+
+            public override void Write(
+                Utf8JsonWriter writer,
+                IReadOnlySet<T> value,
+                JsonSerializerOptions options) =>
+                JsonSerializer.Serialize(writer, value.ToArray(), options);
+        }
     }
 }

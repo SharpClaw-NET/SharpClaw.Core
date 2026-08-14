@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using SharpClaw.Contracts.Modules;
 
 namespace SharpClaw.Core.Kernel;
@@ -10,6 +11,8 @@ public sealed class KernelJobsCoordinator
     private readonly KernelJobsActionRunner _actionRunner;
     private readonly KernelJobsStore _store;
     private readonly IReadOnlyDictionary<string, IJobHandler> _handlers;
+    private readonly ConcurrentDictionary<Guid, ActiveJobExecution> _activeExecutions = new();
+    private readonly ConcurrentDictionary<Guid, ModuleStorageClaimAuthority> _claims = new();
 
     public KernelJobsCoordinator(
         KernelGraph graph,
@@ -42,6 +45,21 @@ public sealed class KernelJobsCoordinator
 
         _handlers = map;
         _actionRunner = new KernelJobsActionRunner(_graph, _dispatcher);
+    }
+
+    private sealed class ActiveJobExecution
+    {
+        public CancellationTokenSource ControlCancellation { get; } = new();
+
+        public ModuleStorageClaimAuthority? Claim { get; set; }
+
+        public Task? RenewalTask { get; set; }
+
+        public Task? InFlightTask { get; set; }
+
+        public bool ControlRequested { get; set; }
+
+        public JobStatus? RequestedStatus { get; set; }
     }
 
     public async ValueTask<JobDocument> SubmitAsync<TInput>(
@@ -109,17 +127,33 @@ public sealed class KernelJobsCoordinator
             static (current, _) => ValueTask.FromResult(current),
             executionContext,
             cancellationToken);
-        return await RunFamilyAsync<KernelJobsOperationFamilies.QueuePersist>(
-            new SharpClawActionKey("jobs.queue.persist"),
-            job,
-            (current, ct) => TransitionJobAsync(
-                current,
-                current with { Status = JobStatus.Queued },
+        try
+        {
+            return await RunFamilyAsync<KernelJobsOperationFamilies.QueuePersist>(
+                new SharpClawActionKey("jobs.queue.persist"),
+                job,
+                (current, ct) => TransitionJobAsync(
+                    current,
+                    current with { Status = JobStatus.Queued },
+                    executionContext,
+                    0,
+                    ct),
                 executionContext,
-                0,
-                ct),
-            executionContext,
-            cancellationToken);
+                cancellationToken);
+        }
+        catch (Exception exception) when (IsRevisionConflict(exception))
+        {
+            var raced = await FindIdempotentSubmissionAsync(
+                idempotencyKey,
+                submission,
+                handler,
+                input,
+                executionContext,
+                cancellationToken);
+            if (raced is not null)
+                return raced;
+            throw;
+        }
     }
 
     public async ValueTask<JobExecutionResult<TResult>> DispatchAsync<TResult>(
@@ -195,18 +229,24 @@ public sealed class KernelJobsCoordinator
                 new ExecutionError("JOBS_CANCELLED", "The Jobs dispatch was cancelled.", true));
         }
 
-        var attemptNumber = await NextAttemptNumberAsync(existing.Id, executionContext, cancellationToken);
-        var attempt = new JobAttemptDocument(
-            Guid.NewGuid(),
-            existing.Id,
-            existing.InvocationId,
-            existing.IdempotencyKey,
-            attemptNumber,
-            handler.Safety,
-            null,
-            DateTimeOffset.UtcNow,
-            DateTimeOffset.UtcNow.AddMinutes(5),
-            null);
+        if (!_activeExecutions.TryAdd(existing.Id, new ActiveJobExecution()))
+        {
+            return new JobExecutionResult<TResult>(
+                existing,
+                default,
+                ActionOutcomeKind.Deferred,
+                new ExecutionError(
+                    "JOBS_ALREADY_RUNNING",
+                    "Another dispatcher owns the active Jobs execution."));
+        }
+
+        var active = _activeExecutions[existing.Id];
+        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            active.ControlCancellation.Token);
+        cancellationToken = linkedCancellation.Token;
+
+        JobAttemptDocument? attempt = null;
         var job = existing;
         var jobRevision = record.Revision;
         long? attemptRevision = null;
@@ -214,6 +254,18 @@ public sealed class KernelJobsCoordinator
         JobPayloadEnvelope? output = null;
         try
         {
+            var attemptNumber = await NextAttemptNumberAsync(existing.Id, executionContext, cancellationToken);
+            attempt = new JobAttemptDocument(
+                Guid.NewGuid(),
+                existing.Id,
+                existing.InvocationId,
+                existing.IdempotencyKey,
+                attemptNumber,
+                handler.Safety,
+                null,
+                DateTimeOffset.UtcNow,
+                null,
+                null);
             job = await RunFamilyAsync<KernelJobsOperationFamilies.Start>(
                 new SharpClawActionKey("jobs.start"),
                 existing,
@@ -223,14 +275,20 @@ public sealed class KernelJobsCoordinator
                     {
                         Status = JobStatus.Running,
                         StartedAt = current.StartedAt ?? DateTimeOffset.UtcNow,
-                        ActiveAttemptId = attempt.AttemptId,
+                        ActiveAttemptId = attempt!.AttemptId,
                     };
-                    return await TransitionJobAsync(
-                        current,
+                    var claimed = await _store.ClaimJobAsync(
                         started,
-                        executionContext,
+                        attempt!,
                         jobRevision,
                         ct);
+                    active.Claim = claimed.Authority;
+                    _claims[jobId] = claimed.Authority;
+                    active.RenewalTask = RenewClaimLoopAsync(
+                        jobId,
+                        active,
+                        cancellationToken);
+                    return claimed.Job.Value!;
                 },
                 executionContext,
                 cancellationToken,
@@ -244,12 +302,10 @@ public sealed class KernelJobsCoordinator
             job = startedJob;
             jobRevision = startedRecord.Revision;
 
-            await SaveAttemptAsync(attempt, executionContext, cancellationToken);
-
-            var startedAttempt = await GetAttemptAsync(attempt.AttemptId, executionContext, CancellationToken.None);
+            var startedAttempt = await GetAttemptAsync(attempt!.AttemptId, executionContext, CancellationToken.None);
             if (startedAttempt is null)
                 throw new KernelActionExecutionException(
-                    $"Jobs attempt '{attempt.AttemptId:D}' disappeared after its start transition.");
+                    $"Jobs attempt '{attempt!.AttemptId:D}' disappeared after its start transition.");
             attemptRevision = startedAttempt.Revision;
 
             job = await RunFamilyAsync<KernelJobsOperationFamilies.InterruptionCheck>(
@@ -270,11 +326,20 @@ public sealed class KernelJobsCoordinator
             {
                 var handlerContext = new JobExecutionContext(
                     current,
-                    attempt,
+                    attempt!,
                     current.Caller,
                     current.Features);
-                output = await handler.ExecuteAsync(handlerContext, current.Input, ct);
-                return current;
+                var handlerTask = handler.ExecuteAsync(handlerContext, current.Input, ct).AsTask();
+                active.InFlightTask = handlerTask;
+                try
+                {
+                    output = await handlerTask;
+                    return current;
+                }
+                finally
+                {
+                    active.InFlightTask = null;
+                }
             }
 
             job = await RunFamilyAsync<KernelJobsOperationFamilies.HandlerInvoke>(
@@ -312,8 +377,6 @@ public sealed class KernelJobsCoordinator
                     if (output is null)
                         throw new KernelActionExecutionException(
                             $"Jobs handler '{handler.ActionKey.Value}' completed without a result payload.");
-                    await SaveResultAsync(current.Id, output, executionContext, ct);
-
                     if (handler.Safety == JobExecutionSafety.Receipted)
                     {
                         current = await RunFamilyAsync<KernelJobsOperationFamilies.ExternalEffectReceipt>(
@@ -321,14 +384,31 @@ public sealed class KernelJobsCoordinator
                             current,
                             async (receipted, receiptCt) =>
                             {
-                                var receipt = attempt with { ReceiptId = attempt.AttemptId.ToString("N") };
-                                await SaveAttemptAsync(receipt, executionContext, receiptCt, attemptRevision);
+                                var receipt = attempt! with { ReceiptId = attempt.AttemptId.ToString("N") };
+                                await SaveAttemptAsync(
+                                    receipt,
+                                    executionContext,
+                                    receiptCt,
+                                    attemptRevision,
+                                    active.Claim);
                                 attempt = receipt;
+                                if (!await RenewActiveClaimAsync(receipt.JobId, receiptCt))
+                                    throw new KernelActionExecutionException(
+                                        $"Jobs attempt '{receipt.AttemptId:D}' lost its storage claim after receipt persistence.");
                                 var receiptRecord = await GetAttemptAsync(
                                     receipt.AttemptId,
                                     executionContext,
                                     CancellationToken.None);
                                 attemptRevision = receiptRecord?.Revision ?? attemptRevision;
+                                var jobRecord = await GetJobAsync(
+                                    receipt.JobId,
+                                    executionContext,
+                                    CancellationToken.None);
+                                if (jobRecord is not null)
+                                {
+                                    jobRevision = jobRecord.Revision;
+                                    job = jobRecord.Value!;
+                                }
                                 return receipted;
                             },
                             executionContext,
@@ -367,17 +447,21 @@ public sealed class KernelJobsCoordinator
                         CompletedAt = DateTimeOffset.UtcNow,
                         OutcomeCertainty = ActionOutcomeCertainty.Certain,
                     };
-                    await SaveAttemptAsync(
-                        attempt with { FinishedAt = completed.CompletedAt },
-                        executionContext,
-                        ct,
-                        attemptRevision);
-                    return await TransitionJobAsync(
-                        current,
+                    if (output is null)
+                        throw new KernelActionExecutionException(
+                            $"Jobs handler '{handler.ActionKey.Value}' completed without a result payload.");
+                    await _store.CommitExecutionAsync(
                         completed,
-                        executionContext,
+                        attempt! with { FinishedAt = completed.CompletedAt },
+                        output,
                         jobRevision,
+                        active.Claim,
                         ct);
+                    var completedRecord = await GetJobAsync(
+                        completed.Id,
+                        executionContext,
+                        CancellationToken.None);
+                    return completedRecord?.Value ?? completed;
                 },
                 executionContext,
                 cancellationToken,
@@ -396,6 +480,7 @@ public sealed class KernelJobsCoordinator
         {
             var competingRecord = await GetJobAsync(jobId, executionContext, CancellationToken.None);
             if (competingRecord?.Value is { } competingJob &&
+                attempt is not null &&
                 competingJob.ActiveAttemptId != attempt.AttemptId &&
                 competingJob.Status is JobStatus.Running or JobStatus.Completed)
             {
@@ -412,7 +497,6 @@ public sealed class KernelJobsCoordinator
         }
         catch (KernelActionCancelledException exception)
         {
-            await CleanupUncommittedResultAsync(job.Id, executionContext);
             var cancelled = await FinalizeCancellationAsync(job, executionContext);
             return new JobExecutionResult<TResult>(
                 cancelled,
@@ -422,7 +506,6 @@ public sealed class KernelJobsCoordinator
         }
         catch (ActionOutcomeUncertainException exception)
         {
-            await CleanupUncommittedResultAsync(job.Id, executionContext);
             var uncertain = await FinalizeUncertaintyAsync(job, executionContext, exception.Uncertainty);
             return new JobExecutionResult<TResult>(
                 uncertain,
@@ -433,7 +516,6 @@ public sealed class KernelJobsCoordinator
         }
         catch (KernelActionDeferredException exception)
         {
-            await CleanupUncommittedResultAsync(job.Id, executionContext);
             var held = await FinalizeHeldAsync(job, executionContext);
             return new JobExecutionResult<TResult>(
                 held,
@@ -443,7 +525,6 @@ public sealed class KernelJobsCoordinator
         }
         catch (OperationCanceledException exception)
         {
-            await CleanupUncommittedResultAsync(job.Id, executionContext);
             var cancelled = await FinalizeCancellationAsync(job, executionContext);
             return new JobExecutionResult<TResult>(
                 cancelled,
@@ -453,7 +534,6 @@ public sealed class KernelJobsCoordinator
         }
         catch (KernelActionFailedException exception)
         {
-            await CleanupUncommittedResultAsync(job.Id, executionContext);
             var failed = await FinalizeFailureAsync(job, executionContext, exception.Error);
             return new JobExecutionResult<TResult>(
                 failed,
@@ -463,10 +543,32 @@ public sealed class KernelJobsCoordinator
         }
         catch (Exception exception)
         {
-            await CleanupUncommittedResultAsync(job.Id, executionContext);
             var error = new ExecutionError("JOBS_FAILED", exception.Message);
             var failed = await FinalizeFailureAsync(job, executionContext, error);
             return new JobExecutionResult<TResult>(failed, default, ActionOutcomeKind.Failed, error);
+        }
+        finally
+        {
+            active.ControlCancellation.Cancel();
+            if (active.RenewalTask is not null)
+            {
+                try
+                {
+                    await active.RenewalTask;
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }
+            if (active.InFlightTask is { } inFlight && !inFlight.IsCompleted)
+            {
+                _ = FinishInFlightExecutionAsync(jobId, active, inFlight);
+            }
+            else
+            {
+                await ReleaseActiveClaimAsync(jobId, active);
+                RemoveActiveExecution(jobId, active);
+            }
         }
     }
 
@@ -532,37 +634,53 @@ public sealed class KernelJobsCoordinator
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(executionContext);
+        await FenceActiveExecutionAsync(jobId, JobStatus.Cancelled);
         var record = await GetJobAsync(jobId, executionContext, cancellationToken);
         if (record?.Value is not { } job)
             throw new KernelActionExecutionException($"Jobs record '{jobId:D}' was not found.");
         EnsureOwner(job, executionContext);
-        if (job.Status is JobStatus.Completed or JobStatus.Failed or JobStatus.Cancelled)
+        if (job.Status is JobStatus.Completed or JobStatus.Failed or JobStatus.Cancelled or JobStatus.Expired)
             return job;
 
-        var requested = await RunFamilyAsync<KernelJobsOperationFamilies.CancelRequest>(
-            new SharpClawActionKey("jobs.cancel.request"),
-            job,
-            static (current, _) => ValueTask.FromResult(current with { Status = JobStatus.Paused }),
-            executionContext,
-            cancellationToken,
-            record.Revision);
-        return await RunFamilyAsync<KernelJobsOperationFamilies.CancelApply>(
-            new SharpClawActionKey("jobs.cancel.apply"),
-            requested,
-            (current, ct) => TransitionJobAsync(
+        if (job.Status == JobStatus.Running)
+            record = await AcquireControlClaimAsync(record, executionContext, cancellationToken);
+        if (record.Value is not { } current)
+            throw new KernelActionExecutionException($"Jobs record '{jobId:D}' was not found.");
+        var controlAuthority = _claims.TryGetValue(jobId, out var cancelAuthority)
+            ? cancelAuthority
+            : null;
+        try
+        {
+            var requested = await RunFamilyAsync<KernelJobsOperationFamilies.CancelRequest>(
+                new SharpClawActionKey("jobs.cancel.request"),
                 current,
-                current with
-                {
-                    Status = JobStatus.Cancelled,
-                    CompletedAt = DateTimeOffset.UtcNow,
-                    OutcomeCertainty = ActionOutcomeCertainty.Certain,
-                },
+                static (current, _) => ValueTask.FromResult(current with { Status = JobStatus.Paused }),
                 executionContext,
-                record.Revision,
-                ct),
-            executionContext,
-            cancellationToken,
-            record.Revision);
+                cancellationToken,
+                record.Revision);
+            return await RunFamilyAsync<KernelJobsOperationFamilies.CancelApply>(
+                new SharpClawActionKey("jobs.cancel.apply"),
+                requested,
+                (current, ct) => TransitionJobAsync(
+                    current,
+                    current with
+                    {
+                        Status = JobStatus.Cancelled,
+                        CompletedAt = DateTimeOffset.UtcNow,
+                        OutcomeCertainty = ActionOutcomeCertainty.Certain,
+                    },
+                    executionContext,
+                    record.Revision,
+                    ct,
+                    controlAuthority),
+                executionContext,
+                cancellationToken,
+                record.Revision);
+        }
+        finally
+        {
+            await ReleaseControlClaimAsync(jobId, controlAuthority);
+        }
     }
 
     public async ValueTask<JobDocument> RecoverAsync(
@@ -587,41 +705,55 @@ public sealed class KernelJobsCoordinator
                     async (scanned, scanCt) =>
                     {
                         if (scanned.Status == JobStatus.OutcomeUncertain)
+                            return scanned;
+                        if (scanned.Status != JobStatus.Running)
+                            return scanned;
+
+                        if (await RenewActiveClaimAsync(scanned.Id, scanCt))
                         {
-                            await CleanupUncommittedResultAsync(scanned.Id, executionContext);
-                            return scanned;
-                        }
-                        if (scanned.Status != JobStatus.Running || scanned.ActiveAttemptId is not { } attemptId)
-                            return scanned;
-
-                        var attempt = await GetAttemptAsync(
-                            attemptId,
-                            executionContext,
-                            CancellationToken.None);
-                        if (attempt?.Value is { LeaseExpiresAt: { } lease } && lease > DateTimeOffset.UtcNow)
-                            return scanned;
-
-                        await CleanupUncommittedResultAsync(scanned.Id, executionContext);
-
-                        return await RunFamilyAsync<KernelJobsOperationFamilies.RecoveryClassify>(
-                            new SharpClawActionKey("jobs.recovery.classify"),
-                            scanned,
-                            async (classified, classifyCt) => await TransitionJobAsync(
-                                classified,
-                                classified with
-                                {
-                                    Status = JobStatus.OutcomeUncertain,
-                                    OutcomeCertainty = ActionOutcomeCertainty.Uncertain,
-                                    Error = new ExecutionError(
-                                        "JOBS_RECOVERY_UNCERTAIN",
-                                        "The active Jobs attempt has no live lease."),
-                                },
+                            var renewed = await GetJobAsync(
+                                scanned.Id,
                                 executionContext,
-                                record.Revision,
-                                classifyCt),
+                                CancellationToken.None);
+                            return renewed?.Value ?? scanned;
+                        }
+
+                        var recoveryRecord = await AcquireControlClaimAsync(
+                            await GetJobAsync(scanned.Id, executionContext, CancellationToken.None)
+                                ?? throw new KernelActionExecutionException(
+                                    $"Jobs record '{scanned.Id:D}' disappeared during recovery."),
                             executionContext,
-                            scanCt,
-                            record.Revision);
+                            scanCt);
+                        var recoveryAuthority = _claims.TryGetValue(scanned.Id, out var claim)
+                            ? claim
+                            : null;
+                        try
+                        {
+                            return await RunFamilyAsync<KernelJobsOperationFamilies.RecoveryClassify>(
+                                new SharpClawActionKey("jobs.recovery.classify"),
+                                recoveryRecord.Value!,
+                                async (classified, classifyCt) => await TransitionJobAsync(
+                                    classified,
+                                    classified with
+                                    {
+                                        Status = JobStatus.OutcomeUncertain,
+                                        OutcomeCertainty = ActionOutcomeCertainty.Uncertain,
+                                        Error = new ExecutionError(
+                                            "JOBS_RECOVERY_UNCERTAIN",
+                                            "The active Jobs claim was recovered without a live execution."),
+                                    },
+                                    executionContext,
+                                    recoveryRecord.Revision,
+                                    classifyCt,
+                                    recoveryAuthority),
+                                executionContext,
+                                scanCt,
+                                recoveryRecord.Revision);
+                        }
+                        finally
+                        {
+                            await ReleaseControlClaimAsync(scanned.Id, recoveryAuthority);
+                        }
                     },
                     executionContext,
                     ct,
@@ -631,7 +763,6 @@ public sealed class KernelJobsCoordinator
             cancellationToken,
             record.Revision);
     }
-
     public async ValueTask<JobDocument?> GetAsync(
         Guid jobId,
         KernelActionExecutionContext executionContext,
@@ -955,9 +1086,9 @@ public sealed class KernelJobsCoordinator
             if (record?.Value is not { } currentJob)
                 throw new KernelActionExecutionException(
                     $"Jobs record '{job.Id:D}' disappeared during failure finalization.");
-            if (currentJob.Status == JobStatus.Completed ||
-                (currentJob.Status == JobStatus.Running &&
-                 currentJob.ActiveAttemptId != job.ActiveAttemptId))
+            if (currentJob.Status != JobStatus.Running ||
+                currentJob.ActiveAttemptId != job.ActiveAttemptId ||
+                IsControlRequested(job.Id))
             {
                 return currentJob;
             }
@@ -987,10 +1118,20 @@ public sealed class KernelJobsCoordinator
         }
     }
 
-    private ValueTask<JobDocument> FinalizeCancellationAsync(
+    private async ValueTask<JobDocument> FinalizeCancellationAsync(
         JobDocument job,
-        KernelActionExecutionContext executionContext) =>
-        CancelAsync(job.Id, executionContext, CancellationToken.None);
+        KernelActionExecutionContext executionContext)
+    {
+        var current = await GetJobAsync(job.Id, executionContext, CancellationToken.None);
+        if (current?.Value is not { } currentJob)
+            throw new KernelActionExecutionException(
+                $"Jobs record '{job.Id:D}' disappeared during cancellation finalization.");
+        if (IsControlRequested(job.Id))
+            return currentJob;
+        if (currentJob.Status is not (JobStatus.Pending or JobStatus.Queued or JobStatus.Running))
+            return currentJob;
+        return await CancelAsync(job.Id, executionContext, CancellationToken.None);
+    }
 
     private async ValueTask<JobDocument> FinalizeUncertaintyAsync(
         JobDocument job,
@@ -1001,6 +1142,8 @@ public sealed class KernelJobsCoordinator
         if (record?.Value is not { } currentJob)
             throw new KernelActionExecutionException(
                 $"Jobs record '{job.Id:D}' disappeared during uncertainty finalization.");
+        if (IsControlRequested(job.Id))
+            return currentJob;
         return await RunFamilyAsync<KernelJobsOperationFamilies.ExternalEffectUncertain>(
             new SharpClawActionKey("jobs.external_effect.uncertain"),
             currentJob,
@@ -1028,6 +1171,8 @@ public sealed class KernelJobsCoordinator
         if (record?.Value is not { } currentJob)
             throw new KernelActionExecutionException(
                 $"Jobs record '{job.Id:D}' disappeared during hold finalization.");
+        if (IsControlRequested(job.Id))
+            return currentJob;
         return await RunFamilyAsync<KernelJobsOperationFamilies.HoldEvaluate>(
             new SharpClawActionKey("jobs.hold.evaluate"),
             currentJob,
@@ -1047,7 +1192,9 @@ public sealed class KernelJobsCoordinator
         JobDocument next,
         KernelActionExecutionContext executionContext,
         long expectedRevision,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ModuleStorageClaimAuthority? authority = null,
+        bool allowUnclaimedControlWrite = false)
     {
         var prepared = await RunFamilyAsync<KernelJobsOperationFamilies.StateTransitionPrepare>(
             new SharpClawActionKey("jobs.state.transition.prepare"),
@@ -1070,7 +1217,13 @@ public sealed class KernelJobsCoordinator
                 transitioned,
                 async (value, ct) =>
                 {
-                    await SaveJobAsync(value, executionContext, ct, expectedRevision);
+                    await SaveJobAsync(
+                        value,
+                        executionContext,
+                        ct,
+                        expectedRevision,
+                        authority,
+                        allowUnclaimedControlWrite);
                     return value;
                 },
                 executionContext,
@@ -1107,30 +1260,303 @@ public sealed class KernelJobsCoordinator
         bool clearError = false)
     {
         var record = await RequireOwnedJobAsync(jobId, executionContext, cancellationToken);
-        var ownedJob = record.Value!;
-        if (ownedJob.Status is JobStatus.Completed or JobStatus.Failed or JobStatus.Cancelled)
+        if (record.Value is not { } ownedJob)
+            throw new KernelActionExecutionException($"Jobs record '{jobId:D}' was not found.");
+
+        if (status is JobStatus.Paused or JobStatus.Cancelled)
+            await FenceActiveExecutionAsync(jobId, status);
+
+        record = await RequireOwnedJobAsync(jobId, executionContext, cancellationToken);
+        ownedJob = record.Value!;
+        if (ownedJob.Status is JobStatus.Completed or JobStatus.Failed or JobStatus.Cancelled or JobStatus.Expired)
             return ownedJob;
-        return await RunFamilyAsync<TFamily>(
-            new SharpClawActionKey(key),
-            ownedJob,
-            (current, ct) => TransitionJobAsync(
-                current,
-                current with
-                {
-                    Status = status,
-                    CompletedAt = status == JobStatus.Cancelled ? DateTimeOffset.UtcNow : null,
-                    Error = clearError ? null : error ?? current.Error,
-                    OutcomeCertainty = status == JobStatus.OutcomeUncertain
-                        ? ActionOutcomeCertainty.Uncertain
-                        : ActionOutcomeCertainty.Certain,
-                },
+
+        if (ownedJob.Status == JobStatus.Running &&
+            (status is JobStatus.Paused or JobStatus.Cancelled))
+            record = await AcquireControlClaimAsync(record, executionContext, cancellationToken);
+
+        ownedJob = record.Value!;
+        if (!IsAllowedStatusTransition(ownedJob.Status, status))
+            throw new KernelActionExecutionException(
+                $"Jobs record '{jobId:D}' cannot change from '{ownedJob.Status}' to '{status}'.");
+
+        var controlAuthority = ownedJob.Status == JobStatus.Running &&
+            _claims.TryGetValue(jobId, out var acquiredAuthority)
+            ? acquiredAuthority
+            : null;
+        try
+        {
+            return await RunFamilyAsync<TFamily>(
+                new SharpClawActionKey(key),
+                ownedJob,
+                (current, ct) => TransitionJobAsync(
+                    current,
+                    current with
+                    {
+                        Status = status,
+                        CompletedAt = status == JobStatus.Cancelled ? DateTimeOffset.UtcNow : null,
+                        Error = clearError ? null : error ?? current.Error,
+                        OutcomeCertainty = status == JobStatus.OutcomeUncertain
+                            ? ActionOutcomeCertainty.Uncertain
+                            : ActionOutcomeCertainty.Certain,
+                    },
+                    executionContext,
+                    record.Revision,
+                    ct,
+                    controlAuthority,
+                    allowUnclaimedControlWrite: true),
                 executionContext,
-                record.Revision,
-                ct),
-            executionContext,
-            cancellationToken,
-            record.Revision);
+                cancellationToken,
+                record.Revision);
+        }
+        finally
+        {
+            await ReleaseControlClaimAsync(jobId, controlAuthority);
+        }
     }
+
+    private static bool IsAllowedStatusTransition(JobStatus current, JobStatus next) =>
+        next switch
+        {
+            JobStatus.Paused => current is JobStatus.Pending or JobStatus.Queued or JobStatus.Running,
+            JobStatus.Cancelled => current is not (JobStatus.Completed or JobStatus.Failed or JobStatus.Cancelled or JobStatus.Expired),
+            JobStatus.Queued => current is JobStatus.Paused or JobStatus.Held,
+            _ => true,
+        };
+
+    private async ValueTask FenceActiveExecutionAsync(
+        Guid jobId,
+        JobStatus? requestedStatus = null)
+    {
+        if (!_activeExecutions.TryGetValue(jobId, out var active))
+            return;
+
+        active.ControlRequested = true;
+        active.RequestedStatus = requestedStatus;
+        active.ControlCancellation.Cancel();
+        if (active.Claim is { } claim)
+        {
+            try
+            {
+                await _store.RecoverJobClaimAsync(
+                    claim,
+                    DateTimeOffset.UtcNow,
+                    CancellationToken.None);
+            }
+            catch (ModuleStorageContractException)
+            {
+                // A completed or expired claim is already fenced by storage.
+            }
+            _claims.TryRemove(jobId, out _);
+        }
+    }
+
+    private async ValueTask ReleaseControlClaimAsync(
+        Guid jobId,
+        ModuleStorageClaimAuthority? authority)
+    {
+        if (authority is null)
+            return;
+        if (!_claims.TryGetValue(jobId, out var current) || !current.Matches(authority))
+            return;
+        try
+        {
+            await _store.RecoverJobClaimAsync(
+                authority,
+                DateTimeOffset.UtcNow,
+                CancellationToken.None);
+        }
+        catch (ModuleStorageContractException)
+        {
+            // Storage already fenced or released this control claim.
+        }
+        if (_claims.TryGetValue(jobId, out var remaining) && remaining.Matches(authority))
+            _claims.TryRemove(jobId, out _);
+    }
+
+    private async Task FinishInFlightExecutionAsync(
+        Guid jobId,
+        ActiveJobExecution active,
+        Task inFlight)
+    {
+        try
+        {
+            while (!inFlight.IsCompleted && active.Claim is not null)
+            {
+                var claim = active.Claim;
+                var remaining = claim.LeaseExpiresAt - DateTimeOffset.UtcNow;
+                var delay = TimeSpan.FromTicks(Math.Clamp(
+                    remaining.Ticks / 3,
+                    TimeSpan.FromMilliseconds(50).Ticks,
+                    TimeSpan.FromSeconds(30).Ticks));
+                var completed = await Task.WhenAny(
+                    inFlight,
+                    Task.Delay(delay, CancellationToken.None));
+                if (ReferenceEquals(completed, inFlight))
+                    break;
+                if (!await RenewActiveClaimAsync(jobId, CancellationToken.None))
+                    break;
+            }
+            try
+            {
+                await inFlight;
+            }
+            catch
+            {
+                // The dispatch path already reported the authoritative outcome.
+            }
+        }
+        finally
+        {
+            await ReleaseActiveClaimAsync(jobId, active);
+            RemoveActiveExecution(jobId, active);
+        }
+    }
+
+    private async ValueTask ReleaseActiveClaimAsync(
+        Guid jobId,
+        ActiveJobExecution active)
+    {
+        if (active.Claim is not { } claim)
+            return;
+        try
+        {
+            await _store.RecoverJobClaimAsync(
+                claim,
+                DateTimeOffset.UtcNow,
+                CancellationToken.None);
+        }
+        catch (ModuleStorageContractException)
+        {
+            // Storage already fenced or released this execution claim.
+        }
+        if (_claims.TryGetValue(jobId, out var current) && current.Matches(claim))
+            _claims.TryRemove(jobId, out _);
+    }
+
+    private void RemoveActiveExecution(Guid jobId, ActiveJobExecution active)
+    {
+        if (_activeExecutions.TryGetValue(jobId, out var current) && ReferenceEquals(current, active))
+            _activeExecutions.TryRemove(jobId, out _);
+    }
+
+    private async ValueTask<ModuleDocumentRecord<JobDocument>> AcquireControlClaimAsync(
+        ModuleDocumentRecord<JobDocument> record,
+        KernelActionExecutionContext executionContext,
+        CancellationToken cancellationToken)
+    {
+        if (record.Value is not { } job || job.Status != JobStatus.Running)
+            return record;
+        if (job.ActiveAttemptId is not { } attemptId)
+            throw new KernelActionExecutionException(
+                $"Running Jobs record '{job.Id:D}' has no active attempt.");
+
+        var attempts = await ListAttemptRecordsAsync(job.Id, executionContext, cancellationToken);
+        var attempt = attempts.FirstOrDefault(item => item.Value?.AttemptId == attemptId)?.Value;
+        if (attempt is null)
+            throw new KernelActionExecutionException(
+                $"Running Jobs record '{job.Id:D}' has no durable active attempt.");
+
+        try
+        {
+            var claimed = await _store.ClaimJobAsync(
+                job,
+                attempt,
+                record.Revision,
+                cancellationToken);
+            _claims[job.Id] = claimed.Authority;
+            return claimed.Job;
+        }
+        catch (ModuleStorageContractException exception)
+            when (exception.Failure.Code is ModuleStorageErrors.StaleClaim or ModuleStorageErrors.RevisionConflict)
+        {
+            throw new KernelActionExecutionException(
+                $"Jobs record '{job.Id:D}' is still controlled by another active execution.");
+        }
+    }
+
+    private async ValueTask<bool> RenewActiveClaimAsync(
+        Guid jobId,
+        CancellationToken cancellationToken)
+    {
+        if (!_activeExecutions.TryGetValue(jobId, out var active) || active.Claim is not { } claim)
+            return false;
+
+        try
+        {
+            var renewed = await _store.RenewJobClaimAsync(
+                claim,
+                DateTimeOffset.UtcNow.AddMinutes(5),
+                cancellationToken);
+            active.Claim = renewed;
+            _claims[jobId] = renewed;
+            return true;
+        }
+        catch (ModuleStorageContractException)
+        {
+            active.ControlRequested = true;
+            active.ControlCancellation.Cancel();
+            _claims.TryRemove(jobId, out _);
+            return false;
+        }
+    }
+
+    private async Task RenewClaimLoopAsync(
+        Guid jobId,
+        ActiveJobExecution active,
+        CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var claim = active.Claim;
+            if (claim is null)
+                return;
+
+            var remaining = claim.LeaseExpiresAt - DateTimeOffset.UtcNow;
+            var delayTicks = Math.Clamp(
+                remaining.Ticks / 3,
+                TimeSpan.FromSeconds(1).Ticks,
+                TimeSpan.FromSeconds(30).Ticks);
+            await Task.Delay(TimeSpan.FromTicks(delayTicks), cancellationToken);
+            if (!await RenewActiveClaimAsync(jobId, cancellationToken))
+                return;
+        }
+    }
+
+    private async ValueTask<ModuleStorageClaimAuthority?> RenewClaimForWriteAsync(
+        Guid jobId,
+        CancellationToken cancellationToken)
+    {
+        if (_activeExecutions.TryGetValue(jobId, out var active))
+        {
+            if (active.ControlRequested)
+                throw new KernelActionExecutionException(
+                    $"Jobs execution '{jobId:D}' no longer owns its storage claim.");
+            if (active.Claim is not { } activeClaim)
+                return null;
+
+            var renewedActive = await _store.RenewJobClaimAsync(
+                activeClaim,
+                DateTimeOffset.UtcNow.AddMinutes(5),
+                cancellationToken);
+            active.Claim = renewedActive;
+            _claims[jobId] = renewedActive;
+            return renewedActive;
+        }
+
+        if (!_claims.TryGetValue(jobId, out var claim))
+            return null;
+
+        var renewed = await _store.RenewJobClaimAsync(
+            claim,
+            DateTimeOffset.UtcNow.AddMinutes(5),
+            cancellationToken);
+        _claims[jobId] = renewed;
+        return renewed;
+    }
+
+    private bool IsControlRequested(Guid jobId) =>
+        _activeExecutions.TryGetValue(jobId, out var active) && active.ControlRequested;
 
     private async ValueTask<ModuleDocumentRecord<JobDocument>> RequireOwnedJobAsync(
         Guid jobId,
@@ -1245,7 +1671,9 @@ public sealed class KernelJobsCoordinator
         JobDocument job,
         KernelActionExecutionContext executionContext,
         CancellationToken cancellationToken,
-        long? expectedRevision = null)
+        long? expectedRevision = null,
+        ModuleStorageClaimAuthority? authority = null,
+        bool allowUnclaimedControlWrite = false)
     {
         var prepared = await RunFamilyAsync<KernelJobsOperationFamilies.PersistencePrepare>(
             new SharpClawActionKey("jobs.persistence.prepare"),
@@ -1263,10 +1691,13 @@ public sealed class KernelJobsCoordinator
                 {
                     await RunStorageMutationAsync(
                         new StorageSaveJobRequest(current),
-                        (request, storageCt) => _store.SaveJobAsync(
+                        async (request, storageCt) => await _store.SaveJobAsync(
                             request.Job,
                             expectedRevision,
-                            storageCt),
+                            storageCt,
+                            authority ?? (allowUnclaimedControlWrite
+                                ? null
+                                : await RenewClaimForWriteAsync(request.Job.Id, storageCt))),
                         executionContext,
                         ct);
                     return current;
@@ -1306,24 +1737,15 @@ public sealed class KernelJobsCoordinator
         JobAttemptDocument attempt,
         KernelActionExecutionContext executionContext,
         CancellationToken cancellationToken,
-        long? expectedRevision = null) =>
+        long? expectedRevision = null,
+        ModuleStorageClaimAuthority? authority = null) =>
         RunStorageMutationAsync(
             new StorageSaveAttemptRequest(attempt),
-            (request, ct) => _store.SaveAttemptAsync(
+            async (request, ct) => await _store.SaveAttemptAsync(
                 request.Attempt,
                 expectedRevision,
-                ct),
-            executionContext,
-            cancellationToken);
-
-    private ValueTask SaveResultAsync(
-        Guid jobId,
-        JobPayloadEnvelope result,
-        KernelActionExecutionContext executionContext,
-        CancellationToken cancellationToken) =>
-        RunStorageMutationAsync(
-            new StorageSaveResultRequest(jobId, result),
-            (request, ct) => _store.SaveResultAsync(request.JobId, request.Result, ct),
+                ct,
+                authority ?? await RenewClaimForWriteAsync(request.Attempt.JobId, ct)),
             executionContext,
             cancellationToken);
 
@@ -1333,34 +1755,12 @@ public sealed class KernelJobsCoordinator
         CancellationToken cancellationToken) =>
         RunStorageMutationAsync(
             new StorageSaveProgressRequest(progress),
-            (request, ct) => _store.SaveProgressAsync(request.Progress, ct),
+            async (request, ct) => await _store.SaveProgressAsync(
+                request.Progress,
+                ct,
+                await RenewClaimForWriteAsync(request.Progress.JobId, ct)),
             executionContext,
             cancellationToken);
-
-    private ValueTask<bool> DeleteResultAsync(
-        Guid jobId,
-        KernelActionExecutionContext executionContext,
-        CancellationToken cancellationToken) =>
-        DeleteStorageResultAsync(
-            new StorageDeleteRequest(jobId),
-            executionContext,
-            cancellationToken);
-
-    private async ValueTask CleanupUncommittedResultAsync(
-        Guid jobId,
-        KernelActionExecutionContext executionContext)
-    {
-        try
-        {
-            var record = await GetJobAsync(jobId, executionContext, CancellationToken.None);
-            if (record?.Value is { Status: not JobStatus.Completed })
-                await DeleteResultAsync(jobId, executionContext, CancellationToken.None);
-        }
-        catch
-        {
-            // The original action outcome remains authoritative.
-        }
-    }
 
     private ValueTask<bool> DeleteJobAsync(
         Guid jobId,
@@ -1443,26 +1843,16 @@ public sealed class KernelJobsCoordinator
         return await RunStorageResultAsync<StorageDeleteRequest, bool>(
             new SharpClawActionKey("storage.delete.commit"),
             request,
-            (effective, ct) => _store.DeleteJobAsync(effective.JobId, cancellationToken: ct),
-            executionContext,
-            cancellationToken);
-    }
-
-    private async ValueTask<bool> DeleteStorageResultAsync(
-        StorageDeleteRequest request,
-        KernelActionExecutionContext executionContext,
-        CancellationToken cancellationToken)
-    {
-        await RunStorageAsync(
-            new SharpClawActionKey("storage.delete.prepare"),
-            request,
-            static (_, _) => Task.CompletedTask,
-            executionContext,
-            cancellationToken);
-        return await RunStorageResultAsync<StorageDeleteRequest, bool>(
-            new SharpClawActionKey("storage.delete.commit"),
-            request,
-            (effective, ct) => _store.DeleteResultAsync(effective.JobId, ct),
+            async (effective, ct) =>
+            {
+                await _store.DeleteJobAsync(
+                    effective.JobId,
+                    cancellationToken: ct,
+                    authority: _claims.TryGetValue(effective.JobId, out var authority)
+                        ? authority
+                        : null);
+                return true;
+            },
             executionContext,
             cancellationToken);
     }
@@ -1542,7 +1932,8 @@ public sealed class KernelJobsCoordinator
         exception is ModuleStorageContractException storageException
             ? string.Equals(storageException.Failure.Code, ModuleStorageErrors.RevisionConflict, StringComparison.Ordinal)
             : exception.ToString().Contains("stale revision", StringComparison.OrdinalIgnoreCase) ||
-              exception.ToString().Contains(ModuleStorageErrors.RevisionConflict, StringComparison.OrdinalIgnoreCase);
+              exception.ToString().Contains(ModuleStorageErrors.RevisionConflict, StringComparison.OrdinalIgnoreCase) ||
+              exception.ToString().Contains("aggregate revision", StringComparison.OrdinalIgnoreCase);
 
     private static bool SamePrincipal(RequestPrincipal left, RequestPrincipal right) =>
         string.Equals(left.SubjectId, right.SubjectId, StringComparison.Ordinal) &&
@@ -1573,7 +1964,6 @@ public sealed class KernelJobsCoordinator
     private sealed record StorageProgressListRequest(Guid JobId);
     private sealed record StorageSaveJobRequest(JobDocument Job);
     private sealed record StorageSaveAttemptRequest(JobAttemptDocument Attempt);
-    private sealed record StorageSaveResultRequest(Guid JobId, JobPayloadEnvelope Result);
     private sealed record StorageSaveProgressRequest(JobProgress Progress);
     private sealed record StorageDeleteRequest(Guid JobId);
 }

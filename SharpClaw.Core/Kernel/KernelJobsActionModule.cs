@@ -69,16 +69,10 @@ public static class KernelJobsStorage
 {
     public const string OwnerModuleId = KernelJobsActionModule.ModuleId;
     public const string Jobs = "jobs";
-    public const string Attempts = "job-attempts";
-    public const string Results = "job-results";
-    public const string Progress = "job-progress";
 
     public static IReadOnlyList<ModuleStorageContractDescriptor> Contracts { get; } =
     [
-        Contract(Jobs),
-        Contract(Attempts),
-        Contract(Results),
-        Contract(Progress)
+        Contract(Jobs)
     ];
 
     private static ModuleStorageContractDescriptor Contract(string name) =>
@@ -90,15 +84,15 @@ public static class KernelJobsStorage
                 new(ModuleStorageOperations.List),
                 new(ModuleStorageOperations.Query),
                 new(ModuleStorageOperations.Upsert),
-                new(ModuleStorageOperations.BatchUpsert),
                 new(ModuleStorageOperations.Delete),
                 new(ModuleStorageOperations.Claim),
                 new(ModuleStorageOperations.RenewClaim),
                 new(ModuleStorageOperations.RecoverClaim),
                 new(ModuleStorageOperations.MutateAndOutbox)
             ],
-            "Canonical Jobs records owned by the host kernel.",
+            "Canonical Jobs aggregate owned by the host kernel.",
             [
+                new("recordType", ModuleStorageIndexValueKind.String),
                 new("jobId", ModuleStorageIndexValueKind.String),
                 new("actionKey", ModuleStorageIndexValueKind.String),
                 new("status", ModuleStorageIndexValueKind.String),
