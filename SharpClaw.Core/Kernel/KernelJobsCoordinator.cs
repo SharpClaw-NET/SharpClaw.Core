@@ -83,20 +83,62 @@ public sealed class KernelJobsCoordinator
     {
         ArgumentNullException.ThrowIfNull(submission);
         ArgumentNullException.ThrowIfNull(executionContext);
+        var handler = RequireInputHandler<TInput>(submission.ActionKey);
+        var input = handler.EncodeInput(submission.Input!);
+        return await SubmitEnvelopeCoreAsync(
+            new JobSubmission<JobPayloadEnvelope>(
+                submission.ActionKey,
+                input,
+                submission.Caller,
+                submission.Features,
+                submission.ConversationId,
+                submission.Holds,
+                submission.IdempotencyKey),
+            handler,
+            executionContext,
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Submits a module-owned serialized payload through the same typed Jobs lifecycle.
+    /// The registered handler decodes the envelope through its typed codec during dispatch.
+    /// </summary>
+    public async ValueTask<JobDocument> SubmitAsync(
+        JobSubmission<JobPayloadEnvelope> submission,
+        KernelActionExecutionContext executionContext,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(submission);
+        ArgumentNullException.ThrowIfNull(executionContext);
+        var handler = RequireEnvelopeInputHandler(submission.ActionKey);
+        return await SubmitEnvelopeCoreAsync(
+            submission,
+            handler,
+            executionContext,
+            cancellationToken);
+    }
+
+    private async ValueTask<JobDocument> SubmitEnvelopeCoreAsync(
+        JobSubmission<JobPayloadEnvelope> submission,
+        IJobHandler handler,
+        KernelActionExecutionContext executionContext,
+        CancellationToken cancellationToken)
+    {
         if (!SamePrincipal(submission.Caller, executionContext.Caller) ||
             !SameFeatures(submission.Features, executionContext.Features))
         {
             throw new KernelCapabilityException(
                 "Jobs submission caller and features must match the host execution context.");
         }
-        var handler = RequireInputHandler<TInput>(submission.ActionKey);
-        var input = handler.EncodeInput(submission.Input!);
+
+        ArgumentNullException.ThrowIfNull(submission.Input);
+        ValidateHandler(handler, submission.Input);
         var idempotencyKey = submission.IdempotencyKey ?? executionContext.IdempotencyKey;
         var existing = await FindIdempotentSubmissionAsync(
             idempotencyKey,
             submission,
             handler,
-            input,
+            submission.Input,
             executionContext,
             cancellationToken);
         if (existing is not null)
@@ -117,7 +159,7 @@ public sealed class KernelJobsCoordinator
             null,
             null,
             ActionOutcomeCertainty.Certain,
-            input);
+            submission.Input);
 
         job = await RunFamilyAsync<KernelJobsOperationFamilies.Submit>(
             new SharpClawActionKey("jobs.submit"),
@@ -161,7 +203,7 @@ public sealed class KernelJobsCoordinator
                 idempotencyKey,
                 submission,
                 handler,
-                input,
+                submission.Input,
                 executionContext,
                 cancellationToken);
             if (raced is not null)
@@ -1830,9 +1872,9 @@ public sealed class KernelJobsCoordinator
         return attempts.Count == 0 ? 1 : attempts.Max(record => record.Value!.AttemptNumber) + 1;
     }
 
-    private async ValueTask<JobDocument?> FindIdempotentSubmissionAsync<TInput>(
+    private async ValueTask<JobDocument?> FindIdempotentSubmissionAsync(
         Guid idempotencyKey,
-        JobSubmission<TInput> submission,
+        JobSubmission<JobPayloadEnvelope> submission,
         IJobHandler handler,
         JobPayloadEnvelope input,
         KernelActionExecutionContext executionContext,
@@ -2156,6 +2198,9 @@ public sealed class KernelJobsCoordinator
                 $"Jobs action '{key.Value}' expects input '{handler.InputType.FullName}'.");
         return handler;
     }
+
+    private IJobHandler RequireEnvelopeInputHandler(SharpClawActionKey key) =>
+        RequireHandler<object, object>(key, allowResultMismatch: true);
 
     private static void ValidateHandler(IJobHandler handler, JobPayloadEnvelope input)
     {

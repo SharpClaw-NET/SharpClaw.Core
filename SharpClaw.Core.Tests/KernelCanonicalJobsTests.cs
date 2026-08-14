@@ -69,6 +69,33 @@ public sealed class KernelCanonicalJobsTests
     }
 
     [Fact]
+    public async Task Serialized_submission_uses_the_registered_typed_handler()
+    {
+        var graph = CreateGraph();
+        var context = CreateContext("serialized-owner");
+        var handler = new ReadHandler();
+        var coordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(new InMemoryJobsGateway()),
+            [handler]);
+        var input = handler.InputCodec.Encode(new ReadRequest("serialized"));
+
+        var job = await coordinator.SubmitAsync(
+            new JobSubmission<JobPayloadEnvelope>(
+                new SharpClawActionKey("tool.fetch"),
+                input,
+                context.Caller,
+                context.Features),
+            context);
+        var result = await coordinator.DispatchAsync<ReadResult>(job.Id, context);
+
+        Assert.Equal(input, job.Input);
+        Assert.Equal(ActionOutcomeKind.Completed, result.Outcome);
+        Assert.Equal("serialized:serialized-owner", result.Result!.Value);
+    }
+
+    [Fact]
     public async Task Concurrent_submission_uses_one_atomic_idempotency_record()
     {
         var graph = CreateGraph();
