@@ -12,6 +12,8 @@ public sealed class KernelJobsStore
     private const int MaxRetainedProgress = 128;
     private const int MaxProgressTextBytes = 2048;
     private const int MaxAggregateDocumentBytes = 60_000;
+    private const int MaxHistoryDocumentBytes = 40_000;
+    private const int MaxPayloadEnvelopeBytes = 12_000;
 
     private readonly IModuleStorageGateway _gateway;
     private readonly ModuleDocumentStore<KernelJobsAggregate> _records;
@@ -100,17 +102,43 @@ public sealed class KernelJobsStore
         var attempts = RetainAttempts(current.Value!.Attempts
             .Where(item => item.AttemptId != attempt.AttemptId)
             .Append(attempt));
-        var aggregate = current.Value with
+        var aggregate = NormalizeAggregate(current.Value with
         {
             Job = startedJob,
             Attempts = attempts,
-        };
+        });
         var claim = await _records
             .Claim()
             .WhereIndex("jobId").EqualTo(startedJob.Id.ToString("D"))
             .AtRevision(expectedRevision)
             .Take(1)
             .Patch(aggregate, JobIndexes(startedJob))
+            .ToRecordsAsync(cancellationToken);
+
+        if (claim.Records.Count != 1 || claim.Records[0].Value is null)
+            throw RevisionConflict(current.Key, expectedRevision, current.Revision);
+
+        return new KernelJobsClaim(
+            ToJobRecord(claim.Records[0]),
+            claim.Authority);
+    }
+
+    internal async Task<KernelJobsClaim> ClaimExistingJobAsync(
+        JobDocument job,
+        long expectedRevision,
+        CancellationToken cancellationToken = default)
+    {
+        var current = await FindAggregateRecordByJobIdAsync(job.Id, cancellationToken);
+        if (current is null || current.Value is null)
+            throw RevisionConflict(job.IdempotencyKey.ToString("N"), expectedRevision, null);
+
+        var aggregate = NormalizeAggregate(current.Value);
+        var claim = await _records
+            .Claim()
+            .WhereIndex("jobId").EqualTo(job.Id.ToString("D"))
+            .AtRevision(expectedRevision)
+            .Take(1)
+            .Patch(aggregate, JobIndexes(aggregate.Job))
             .ToRecordsAsync(cancellationToken);
 
         if (claim.Records.Count != 1 || claim.Records[0].Value is null)
@@ -344,6 +372,7 @@ public sealed class KernelJobsStore
         JsonElement? serializedAggregate = null;
         if (aggregate is not null)
         {
+            aggregate = NormalizeAggregate(aggregate);
             var serialized = JsonSerializer.SerializeToElement(aggregate, _jsonOptions);
             var bytes = Encoding.UTF8.GetByteCount(serialized.GetRawText());
             if (bytes > MaxAggregateDocumentBytes)
@@ -393,6 +422,63 @@ public sealed class KernelJobsStore
     private static IReadOnlyList<JobProgress> RetainProgress(
         IEnumerable<JobProgress> progress) =>
         progress.TakeLast(MaxRetainedProgress).ToArray();
+
+    private KernelJobsAggregate NormalizeAggregate(KernelJobsAggregate aggregate)
+    {
+        ValidatePayloadEnvelope(aggregate.Job.Input);
+        if (aggregate.Result is not null)
+            ValidatePayloadEnvelope(aggregate.Result);
+
+        var normalized = aggregate with
+        {
+            Attempts = RetainAttempts(aggregate.Attempts),
+            Progress = RetainProgress(aggregate.Progress),
+        };
+
+        while (SerializedAggregateBytes(normalized) > MaxHistoryDocumentBytes &&
+               normalized.Progress.Count > 0)
+        {
+            normalized = normalized with
+            {
+                Progress = normalized.Progress.Skip(1).ToArray(),
+            };
+        }
+
+        while (SerializedAggregateBytes(normalized) > MaxHistoryDocumentBytes &&
+               normalized.Attempts.Count > 0)
+        {
+            normalized = normalized with
+            {
+                Attempts = normalized.Attempts.Skip(1).ToArray(),
+            };
+        }
+
+        var bytes = SerializedAggregateBytes(normalized);
+        if (bytes > MaxHistoryDocumentBytes)
+        {
+            throw new KernelActionExecutionException(
+                $"Jobs aggregate lifecycle data for '{normalized.Job.Id:D}' is {bytes} bytes " +
+                $"and exceeds the reserved {MaxHistoryDocumentBytes}-byte history budget.");
+        }
+
+        return normalized;
+    }
+
+    private int SerializedAggregateBytes(KernelJobsAggregate aggregate) =>
+        Encoding.UTF8.GetByteCount(
+            JsonSerializer.SerializeToElement(aggregate, _jsonOptions).GetRawText());
+
+    private void ValidatePayloadEnvelope(JobPayloadEnvelope payload)
+    {
+        var bytes = Encoding.UTF8.GetByteCount(
+            JsonSerializer.SerializeToElement(payload, _jsonOptions).GetRawText());
+        if (bytes > MaxPayloadEnvelopeBytes)
+        {
+            throw new KernelActionExecutionException(
+                $"Jobs payload '{payload.ContractName}' is {bytes} bytes and exceeds the " +
+                $"bounded Core limit of {MaxPayloadEnvelopeBytes} bytes.");
+        }
+    }
 
     private static void ValidateProgress(JobProgress progress)
     {

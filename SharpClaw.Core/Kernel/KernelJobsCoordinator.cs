@@ -702,6 +702,11 @@ public sealed class KernelJobsCoordinator
             await CompleteControlTransitionAsync(jobId, controlledExecution);
             return cancelled;
         }
+        catch
+        {
+            await CompleteControlTransitionAfterFailureAsync(jobId, controlledExecution);
+            throw;
+        }
         finally
         {
             await ReleaseControlClaimAsync(jobId, controlAuthority);
@@ -729,9 +734,8 @@ public sealed class KernelJobsCoordinator
                     current,
                     async (scanned, scanCt) =>
                     {
-                        if (scanned.Status == JobStatus.OutcomeUncertain)
-                            return scanned;
-                        if (scanned.Status != JobStatus.Running)
+                        if (scanned.Status == JobStatus.OutcomeUncertain ||
+                            !HasRecoverableControlledAttempt(scanned))
                             return scanned;
 
                         if (await RenewActiveClaimAsync(scanned.Id, scanCt))
@@ -746,12 +750,15 @@ public sealed class KernelJobsCoordinator
                         ModuleDocumentRecord<JobDocument>? recoveryRecord;
                         try
                         {
-                            recoveryRecord = await AcquireControlClaimAsync(
-                                await GetJobAsync(scanned.Id, executionContext, CancellationToken.None)
-                                    ?? throw new KernelActionExecutionException(
-                                        $"Jobs record '{scanned.Id:D}' disappeared during recovery."),
+                            var fresh = await GetJobAsync(
+                                scanned.Id,
                                 executionContext,
-                                scanCt);
+                                CancellationToken.None)
+                                ?? throw new KernelActionExecutionException(
+                                    $"Jobs record '{scanned.Id:D}' disappeared during recovery.");
+                            recoveryRecord = fresh.Value!.Status == JobStatus.Running
+                                ? await AcquireControlClaimAsync(fresh, executionContext, scanCt)
+                                : await AcquireExpiredControlledClaimAsync(fresh, scanCt);
                         }
                         catch (KernelActionExecutionException exception)
                             when (exception.Message.StartsWith(
@@ -765,19 +772,26 @@ public sealed class KernelJobsCoordinator
                             : null;
                         try
                         {
+                            var recovered = recoveryRecord!.Value!;
+                            var recoveredJob = recovered.Status == JobStatus.Running
+                                ? recovered with
+                                {
+                                    Status = JobStatus.OutcomeUncertain,
+                                    OutcomeCertainty = ActionOutcomeCertainty.Uncertain,
+                                    Error = new ExecutionError(
+                                        "JOBS_RECOVERY_UNCERTAIN",
+                                        "The active Jobs claim was recovered without a live execution."),
+                                }
+                                : recovered with
+                                {
+                                    ActiveAttemptId = null,
+                                };
                             return await RunFamilyAsync<KernelJobsOperationFamilies.RecoveryClassify>(
                                 new SharpClawActionKey("jobs.recovery.classify"),
-                                recoveryRecord!.Value!,
+                                recovered,
                                 async (classified, classifyCt) => await TransitionJobAsync(
                                     classified,
-                                    classified with
-                                    {
-                                        Status = JobStatus.OutcomeUncertain,
-                                        OutcomeCertainty = ActionOutcomeCertainty.Uncertain,
-                                        Error = new ExecutionError(
-                                            "JOBS_RECOVERY_UNCERTAIN",
-                                            "The active Jobs claim was recovered without a live execution."),
-                                    },
+                                    recoveredJob,
                                     executionContext,
                                     recoveryRecord.Revision,
                                     classifyCt,
@@ -1360,6 +1374,11 @@ public sealed class KernelJobsCoordinator
             }
             return transitioned;
         }
+        catch
+        {
+            await CompleteControlTransitionAfterFailureAsync(jobId, controlledExecution);
+            throw;
+        }
         finally
         {
             await ReleaseControlClaimAsync(jobId, controlAuthority);
@@ -1539,6 +1558,24 @@ public sealed class KernelJobsCoordinator
                     $"Jobs execution '{jobId:D}' has no request context for cleanup."));
     }
 
+    private async ValueTask CompleteControlTransitionAfterFailureAsync(
+        Guid jobId,
+        ActiveJobExecution? active)
+    {
+        if (active is null)
+            return;
+
+        try
+        {
+            await CompleteControlTransitionAsync(jobId, active);
+        }
+        catch
+        {
+            active.ControlTransitionCompleted = true;
+            active.ControlTransitionSignal.TrySetResult(true);
+        }
+    }
+
     private async ValueTask CleanupActiveExecutionAsync(
         Guid jobId,
         ActiveJobExecution active,
@@ -1556,26 +1593,71 @@ public sealed class KernelJobsCoordinator
             return;
         }
 
-        await ClearControlledAttemptAsync(jobId, attempt, active, executionContext);
-        active.LeaseCancellation.Cancel();
-        if (active.RenewalTask is not null)
+        try
         {
+            await ClearControlledAttemptAsync(jobId, attempt, active, executionContext);
+        }
+        finally
+        {
+            active.LeaseCancellation.Cancel();
+            if (active.RenewalTask is not null)
+            {
+                try
+                {
+                    await active.RenewalTask;
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }
+
             try
             {
-                await active.RenewalTask;
+                await ReleaseActiveClaimAsync(jobId, active);
             }
-            catch (OperationCanceledException)
+            finally
             {
+                RemoveActiveExecution(jobId, active);
             }
         }
-        await ReleaseActiveClaimAsync(jobId, active);
-        RemoveActiveExecution(jobId, active);
     }
 
     private void RemoveActiveExecution(Guid jobId, ActiveJobExecution active)
     {
         if (_activeExecutions.TryGetValue(jobId, out var current) && ReferenceEquals(current, active))
             _activeExecutions.TryRemove(jobId, out _);
+    }
+
+    private static bool HasRecoverableControlledAttempt(JobDocument job) =>
+        job.ActiveAttemptId is not null &&
+        job.Status is JobStatus.Running or JobStatus.Paused or JobStatus.Held or
+            JobStatus.Cancelled or JobStatus.Queued or JobStatus.Completed;
+
+    private async ValueTask<ModuleDocumentRecord<JobDocument>> AcquireExpiredControlledClaimAsync(
+        ModuleDocumentRecord<JobDocument> record,
+        CancellationToken cancellationToken)
+    {
+        if (record.Value is not { } job || !HasRecoverableControlledAttempt(job) ||
+            job.Status == JobStatus.Running)
+        {
+            return record;
+        }
+
+        try
+        {
+            var claimed = await _store.ClaimExistingJobAsync(
+                job,
+                record.Revision,
+                cancellationToken);
+            _claims[job.Id] = claimed.Authority;
+            return claimed.Job;
+        }
+        catch (ModuleStorageContractException exception)
+            when (exception.Failure.Code is ModuleStorageErrors.StaleClaim or ModuleStorageErrors.RevisionConflict)
+        {
+            throw new KernelActionExecutionException(
+                $"{ClaimUnavailablePrefix} Jobs record '{job.Id:D}' is still controlled by another active execution.");
+        }
     }
 
     private async ValueTask<ModuleDocumentRecord<JobDocument>> AcquireControlClaimAsync(

@@ -348,6 +348,167 @@ public sealed class KernelCanonicalJobsTests
     }
 
     [Fact]
+    public async Task Expired_paused_claim_is_recovered_by_a_second_coordinator()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway(TimeSpan.FromMilliseconds(150));
+        var handler = new NonCooperativeHandler();
+        var firstCoordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [handler]);
+        var secondCoordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [new ReadHandler()]);
+        var context = CreateContext("paused-process-owner");
+        var job = await firstCoordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.fetch"),
+                new ReadRequest("paused-process"),
+                context.Caller,
+                context.Features),
+            context);
+
+        var dispatch = firstCoordinator.DispatchAsync<ReadResult>(job.Id, context).AsTask();
+        await handler.FirstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var paused = await firstCoordinator.PauseAsync(job.Id, context);
+        Assert.Equal(JobStatus.Paused, paused.Status);
+        Assert.NotNull(paused.ActiveAttemptId);
+
+        var liveRecovery = await secondCoordinator.RecoverAsync(job.Id, context);
+        Assert.Equal(JobStatus.Paused, liveRecovery.Status);
+        Assert.NotNull(liveRecovery.ActiveAttemptId);
+
+        gateway.RejectRenewals = true;
+        handler.ReleaseFirst.TrySetResult(true);
+        await handler.FirstFinished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+
+        JobDocument? recovered = null;
+        for (var attempt = 0; attempt < 150; attempt++)
+        {
+            recovered = await secondCoordinator.RecoverAsync(job.Id, context);
+            if (recovered.ActiveAttemptId is null)
+                break;
+            await Task.Delay(20);
+        }
+
+        Assert.NotNull(recovered);
+        Assert.Equal(JobStatus.Paused, recovered!.Status);
+        Assert.Null(recovered.ActiveAttemptId);
+        Assert.Equal(JobStatus.Queued, (await secondCoordinator.ResumeAsync(job.Id, context)).Status);
+    }
+
+    [Fact]
+    public async Task Failed_pause_interceptor_releases_the_control_signal_for_recovery()
+    {
+        var graph = CreateGraph(failPause: true);
+        var gateway = new InMemoryJobsGateway(TimeSpan.FromMilliseconds(150));
+        var handler = new NonCooperativeHandler();
+        var firstCoordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [handler]);
+        var secondCoordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [new ReadHandler()]);
+        var context = CreateContext("failed-pause-hook-owner");
+        var job = await firstCoordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.fetch"),
+                new ReadRequest("failed-pause-hook"),
+                context.Caller,
+                context.Features),
+            context);
+
+        var dispatch = firstCoordinator.DispatchAsync<ReadResult>(job.Id, context).AsTask();
+        await handler.FirstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var exception = await Record.ExceptionAsync(
+            () => firstCoordinator.PauseAsync(job.Id, context).AsTask());
+        Assert.NotNull(exception);
+
+        gateway.RejectRenewals = true;
+        handler.ReleaseFirst.TrySetResult(true);
+        await handler.FirstFinished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        catch
+        {
+        }
+
+        JobDocument? recovered = null;
+        for (var attempt = 0; attempt < 150; attempt++)
+        {
+            recovered = await secondCoordinator.RecoverAsync(job.Id, context);
+            if (recovered.Status == JobStatus.OutcomeUncertain)
+                break;
+            await Task.Delay(20);
+        }
+
+        Assert.NotNull(recovered);
+        Assert.Equal(JobStatus.OutcomeUncertain, recovered!.Status);
+        Assert.True(gateway.RecoverCount > 0);
+    }
+
+    [Fact]
+    public async Task Failed_pause_persistence_releases_the_control_signal_for_recovery()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway(TimeSpan.FromSeconds(2));
+        var handler = new NonCooperativeHandler();
+        var firstCoordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [handler]);
+        var secondCoordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [new ReadHandler()]);
+        var context = CreateContext("failed-pause-storage-owner");
+        var job = await firstCoordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.fetch"),
+                new ReadRequest("failed-pause-storage"),
+                context.Caller,
+                context.Features),
+            context);
+
+        var dispatch = firstCoordinator.DispatchAsync<ReadResult>(job.Id, context).AsTask();
+        await handler.FirstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        gateway.FailNextCommit = true;
+
+        var exception = await Record.ExceptionAsync(
+            () => firstCoordinator.PauseAsync(job.Id, context).AsTask());
+        Assert.NotNull(exception);
+
+        handler.ReleaseFirst.TrySetResult(true);
+        await handler.FirstFinished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        catch
+        {
+        }
+
+        var recovered = await secondCoordinator.RecoverAsync(job.Id, context);
+        Assert.Equal(JobStatus.OutcomeUncertain, recovered.Status);
+        Assert.True(gateway.RecoverCount > 0);
+    }
+
+    [Fact]
     public async Task Running_claim_is_renewed_and_recovered_before_control_transition()
     {
         var graph = CreateGraph();
@@ -624,8 +785,46 @@ public sealed class KernelCanonicalJobsTests
 
         Assert.Equal(32, gateway.CountAttempts());
         Assert.Equal(128, gateway.CountProgress());
-        Assert.InRange(gateway.MaxStoredDocumentBytes, 1, 60_000);
+        Assert.InRange(gateway.MaxStoredDocumentBytes, 1, 40_000);
         Assert.Equal(JobStatus.Cancelled, (await coordinator.StopAsync(job.Id, context)).Status);
+    }
+
+    [Fact]
+    public async Task Maximum_progress_values_are_trimmed_before_terminal_completion()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway();
+        var coordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [new ReadHandler()]);
+        var context = CreateContext("maximum-progress-owner");
+        var job = await coordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.fetch"),
+                new ReadRequest("maximum-progress"),
+                context.Caller,
+                context.Features),
+            context);
+        var code = new string('c', 2048);
+        var message = new string('m', 2048);
+
+        for (var index = 0; index < 128; index++)
+        {
+            await coordinator.ReportProgressAsync(
+                new JobProgress(job.Id, null, code, message, index),
+                context);
+        }
+
+        var progress = await coordinator.ReadProgressAsync(job.Id, context);
+        Assert.InRange(progress.Count, 1, 127);
+
+        var completed = await coordinator.DispatchAsync<ReadResult>(job.Id, context);
+
+        Assert.Equal(ActionOutcomeKind.Completed, completed.Outcome);
+        Assert.Equal(JobStatus.Completed, completed.Job.Status);
+        Assert.InRange(gateway.MaxStoredDocumentBytes, 1, 40_000);
     }
 
     [Fact]
@@ -789,13 +988,27 @@ public sealed class KernelCanonicalJobsTests
             Guid.NewGuid(),
             Guid.NewGuid());
 
-    private static KernelGraph CreateGraph()
+    private static KernelGraph CreateGraph(bool failPause = false)
     {
         var registry = new KernelModuleRegistry();
         var jobs = new KernelJobsActionModule();
-        var workload = new WorkloadModule();
+        var workload = new WorkloadModule(failPause);
         registry.Add(jobs);
         registry.Add(workload);
+        var sensitiveApprovals = jobs.Approvals.ToList();
+        if (failPause)
+        {
+            var pause = KernelJobsActionCatalog.For<KernelJobsOperationFamilies.Pause>(
+                new SharpClawActionKey("jobs.pause")).Action;
+            sensitiveApprovals.Add(new KernelSensitiveActionApproval(
+                workload.Identity.Id,
+                pause.Key,
+                pause.Version,
+                typeof(KernelJobOperationInput<KernelJobsOperationFamilies.Pause>).AssemblyQualifiedName!,
+                typeof(KernelJobOperationResult<KernelJobsOperationFamilies.Pause>).AssemblyQualifiedName!,
+                KernelSchemaIdentity.Action(pause)));
+        }
+
         return registry.Compile(
             null,
             new KernelGraphCompileOptions
@@ -807,7 +1020,7 @@ public sealed class KernelCanonicalJobsTests
                     [jobs.Identity.Id] = jobs.Grants,
                     [workload.Identity.Id] = workload.Grants,
                 },
-                SensitiveActionApprovals = jobs.Approvals,
+                SensitiveActionApprovals = sensitiveApprovals,
             });
     }
 
@@ -993,22 +1206,39 @@ public sealed class KernelCanonicalJobsTests
             ActionInterceptionCapabilities.ReplaceResult |
             ActionInterceptionCapabilities.Wrap;
 
-        public ModuleIdentity Identity { get; } =
-            new("test.workloads", "Test workloads", "tests");
+        private readonly bool _failPause;
 
-        public IReadOnlyDictionary<string, ActionInterceptionCapabilities> Grants { get; } =
-            new Dictionary<string, ActionInterceptionCapabilities>(StringComparer.Ordinal)
+        public WorkloadModule(bool failPause = false)
+        {
+            _failPause = failPause;
+            var grants = new Dictionary<string, ActionInterceptionCapabilities>(StringComparer.Ordinal)
             {
                 ["tool.fetch"] = WorkloadCapabilities,
                 ["tool.validate"] = WorkloadCapabilities,
                 ["tool.fail"] = WorkloadCapabilities,
                 ["tool.receipted"] = WorkloadCapabilities,
             };
+            if (failPause)
+            {
+                grants["jobs.pause"] = ActionInterceptionCapabilities.Inspect |
+                    ActionInterceptionCapabilities.Wrap;
+            }
+
+            Grants = grants;
+        }
+
+        public ModuleIdentity Identity { get; } =
+            new("test.workloads", "Test workloads", "tests");
+
+        public IReadOnlyDictionary<string, ActionInterceptionCapabilities> Grants { get; }
 
         public void Configure(ISharpClawModuleBuilder builder)
         {
             foreach (var key in Grants.Keys)
             {
+                if (key == "jobs.pause")
+                    continue;
+
                 builder.Actions.Add(
                     new ActionDescriptor<KernelActionEnvelope, object>(
                         new SharpClawActionKey(key),
@@ -1021,7 +1251,24 @@ public sealed class KernelCanonicalJobsTests
                         null,
                         TimeSpan.FromSeconds(10)));
             }
+
+            if (_failPause)
+                builder.Hooks.For(new SharpClawActionKey("jobs.pause"))
+                    .Use<ThrowingPauseInterceptor>(new HookOrdering("test-pause-failure"));
         }
+    }
+
+    private sealed class ThrowingPauseInterceptor : IActionInterceptor<
+        KernelJobOperationInput<KernelJobsOperationFamilies.Pause>,
+        KernelJobOperationResult<KernelJobsOperationFamilies.Pause>>
+    {
+        public ValueTask<IActionOutcome<KernelJobOperationResult<KernelJobsOperationFamilies.Pause>>> InvokeAsync(
+            ActionContext<KernelJobOperationInput<KernelJobsOperationFamilies.Pause>> context,
+            IActionControl<
+                KernelJobOperationInput<KernelJobsOperationFamilies.Pause>,
+                KernelJobOperationResult<KernelJobsOperationFamilies.Pause>> control,
+            CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("The test pause interceptor failed.");
     }
 
     private sealed class InMemoryJobsGateway : IModuleStorageGateway
@@ -1042,6 +1289,10 @@ public sealed class KernelCanonicalJobsTests
         private readonly List<string> _commitLog = [];
 
         public TaskCompletionSource<bool>? ClaimBarrier { get; set; }
+
+        public bool RejectRenewals { get; set; }
+
+        public bool FailNextCommit { get; set; }
 
         private int _claimWaiters;
 
@@ -1146,6 +1397,12 @@ public sealed class KernelCanonicalJobsTests
             CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
+            if (FailNextCommit)
+            {
+                FailNextCommit = false;
+                throw new InvalidOperationException("The test storage commit failed.");
+            }
+
             Interlocked.Increment(ref _atomicCommitCount);
             lock (_sync)
             {
@@ -1318,6 +1575,14 @@ public sealed class KernelCanonicalJobsTests
         {
             ct.ThrowIfCancellationRequested();
             Interlocked.Increment(ref _renewCount);
+            if (RejectRenewals)
+            {
+                return Task.FromResult(new ModuleStorageClaimRenewalResult(
+                    false,
+                    null,
+                    ModuleStorageErrors.StaleClaim));
+            }
+
             lock (_sync)
             {
                 var match = _claims.FirstOrDefault(pair =>
