@@ -15,7 +15,7 @@ public sealed class KernelActionTests
         Assert.NotNull(loadedType);
 
         var map = loadedType!.GetInterfaceMap(typeof(IActionDispatcher));
-        Assert.Equal(2, map.TargetMethods.Length);
+        Assert.Equal(4, map.TargetMethods.Length);
         Assert.Contains(map.TargetMethods, method => method.Name == nameof(IActionDispatcher.RunAsync));
         Assert.Contains(
             typeof(IActionDispatcher).GetMethods(),

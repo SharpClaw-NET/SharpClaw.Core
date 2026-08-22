@@ -64,6 +64,79 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             snapshot,
             cancellationToken);
 
+    public ValueTask<IActionOutcome<TResult>> RunExternalAsync<TAction, TResult>(
+        ActionDescriptor<TAction, TResult> descriptor,
+        TAction action,
+        Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
+        ActionPipelineSnapshot snapshot,
+        SidecarExternalActionDispatchAuthority authority,
+        CancellationToken cancellationToken)
+    {
+        if (authority is null)
+        {
+            return ValueTask.FromResult<IActionOutcome<TResult>>(
+                KernelActionOutcome<TResult>.Failed(
+                    "ACTION_EXTERNAL_AUTHORITY_MISSING",
+                    "The external action authority is required."));
+        }
+        var validation = SidecarExternalActionDispatchAuthorityValidator.Validate(
+            authority,
+            descriptor,
+            action,
+            snapshot,
+            DateTimeOffset.UtcNow);
+        if (!validation.Accepted)
+        {
+            return ValueTask.FromResult<IActionOutcome<TResult>>(
+                KernelActionOutcome<TResult>.Failed(validation.Code, validation.Message));
+        }
+
+        if (!string.Equals(
+                snapshot.ContractHash,
+                _graph.ActionSnapshot.ContractHash,
+                StringComparison.Ordinal))
+        {
+            return ValueTask.FromResult<IActionOutcome<TResult>>(
+                KernelActionOutcome<TResult>.Failed(
+                    "ACTION_SNAPSHOT_MISMATCH",
+                    "The external action snapshot is not compatible with the host graph."));
+        }
+
+        var definition = new CompiledActionDefinition<TAction, TResult>(
+            descriptor,
+            authority.ModuleId,
+            [],
+            descriptor.Capabilities,
+            true,
+            descriptor.InputSchema!,
+            descriptor.ResultSchema!);
+        var effectiveContext = authority.EffectiveHostEntry.EffectiveContext;
+        var executionContext = new KernelActionExecutionContext(
+            effectiveContext.Caller,
+            effectiveContext.Features,
+            effectiveContext.TraceId,
+            effectiveContext.IdempotencyKey,
+            authority.InitiatingHostContext);
+        var invocation = new KernelActionInvocation<TAction, TResult>(
+            definition,
+            terminal,
+            snapshot,
+            executionContext,
+            _continuationHost,
+            _eventWriter,
+            _resultSnapshotter,
+            _repeatEvidenceAuthority,
+            cancellationToken,
+            effectiveContext.Deadline);
+        return invocation.InvokeExternalAsync(
+            action,
+            effectiveContext.InvocationId,
+            effectiveContext.ParentInvocationId,
+            effectiveContext.Depth,
+            effectiveContext.Attempt,
+            cancellationToken);
+    }
+
     private ValueTask<IActionOutcome<TResult>> RunCoreAsync<TAction, TResult>(
         KernelActionExecutionContext executionContext,
         ActionDescriptor<TAction, TResult> descriptor,
@@ -137,6 +210,24 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         return RequireResult(descriptor, outcome);
     }
 
+    public async ValueTask<TResult> RunExternalRequiredAsync<TAction, TResult>(
+        ActionDescriptor<TAction, TResult> descriptor,
+        TAction action,
+        Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
+        ActionPipelineSnapshot snapshot,
+        SidecarExternalActionDispatchAuthority authority,
+        CancellationToken cancellationToken)
+    {
+        var outcome = await RunExternalAsync(
+            descriptor,
+            action,
+            terminal,
+            snapshot,
+            authority,
+            cancellationToken);
+        return RequireResult(descriptor, outcome);
+    }
+
     private static TResult RequireResult<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor,
         IActionOutcome<TResult> outcome)
@@ -187,7 +278,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             ICommittedEventWriter eventWriter,
             IKernelActionResultSnapshotter resultSnapshotter,
             IKernelActionRepeatEvidenceAuthority repeatEvidenceAuthority,
-            CancellationToken rootCancellationToken)
+            CancellationToken rootCancellationToken,
+            DateTimeOffset? deadline = null)
         {
             _definition = definition;
             _terminal = terminal;
@@ -198,7 +290,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             _resultSnapshotter = resultSnapshotter;
             _repeatEvidenceAuthority = repeatEvidenceAuthority;
             _rootCancellationToken = rootCancellationToken;
-            _deadline = DateTimeOffset.UtcNow + definition.Descriptor.DefaultTimeout;
+            _deadline = deadline ?? DateTimeOffset.UtcNow + definition.Descriptor.DefaultTimeout;
         }
 
         public async ValueTask<IActionOutcome<TResult>> InvokeRootAsync(
@@ -209,6 +301,18 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             await InvokeAttemptAsync(
                 action,
                 new ActionAttempt(Guid.NewGuid(), parentInvocationId, depth, 1),
+                cancellationToken);
+
+        public ValueTask<IActionOutcome<TResult>> InvokeExternalAsync(
+            TAction action,
+            Guid invocationId,
+            Guid? parentInvocationId,
+            int depth,
+            int attempt,
+            CancellationToken cancellationToken) =>
+            InvokeAttemptAsync(
+                action,
+                new ActionAttempt(invocationId, parentInvocationId, depth, attempt),
                 cancellationToken);
 
         private async ValueTask<IActionOutcome<TResult>> InvokeAttemptAsync(
