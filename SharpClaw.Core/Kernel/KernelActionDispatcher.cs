@@ -124,14 +124,26 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                     authorityResult.Message));
         }
 
-        var definition = new CompiledActionDefinition<TAction, TResult>(
-            descriptor,
-            authority.ModuleId,
-            [],
-            descriptor.Capabilities,
-            true,
-            descriptor.InputSchema!,
-            descriptor.ResultSchema!);
+        KernelExternalActionPolicy<TAction, TResult> policy;
+        try
+        {
+            policy = _graph.CompileExternalAction(descriptor, authority);
+        }
+        catch (KernelGraphCompilationException exception)
+        {
+            return ValueTask.FromResult<IActionOutcome<TResult>>(
+                KernelActionOutcome<TResult>.Failed(
+                    "ACTION_EXTERNAL_POLICY_REJECTED",
+                    exception.Message));
+        }
+        if (!policy.Matches(snapshot, authority))
+        {
+            return ValueTask.FromResult<IActionOutcome<TResult>>(
+                KernelActionOutcome<TResult>.Failed(
+                    "ACTION_EXTERNAL_POLICY_MISMATCH",
+                    "The external action policy is not bound to the host snapshot and authority."));
+        }
+        var definition = policy.Definition;
         var effectiveContext = authority.EffectiveHostEntry.EffectiveContext;
         var executionContext = new KernelActionExecutionContext(
             effectiveContext.Caller,

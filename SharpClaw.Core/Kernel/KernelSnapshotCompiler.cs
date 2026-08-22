@@ -157,7 +157,10 @@ public sealed class KernelSnapshotCompiler
             modules,
             snapshot,
             chatSnapshot,
-            options.MaximumActionDepth);
+            options.MaximumActionDepth,
+            builder.ActionHooks,
+            serviceProvider,
+            options);
     }
 
     private static Dictionary<string, ICompiledActionDefinition> CompileActions(
@@ -570,6 +573,9 @@ public sealed class KernelGraph
 {
     private readonly IReadOnlyDictionary<string, ICompiledActionDefinition> _actions;
     private readonly IReadOnlyDictionary<string, ICompiledEventDefinition> _events;
+    private readonly IReadOnlyList<KernelActionHookRegistration> _actionHooks;
+    private readonly IServiceProvider? _serviceProvider;
+    private readonly KernelGraphCompileOptions _compileOptions;
 
     internal KernelGraph(
         IReadOnlyDictionary<string, ICompiledActionDefinition> actions,
@@ -578,7 +584,10 @@ public sealed class KernelGraph
         KernelModuleGraph modules,
         ActionPipelineSnapshot actionSnapshot,
         ChatPipelineSnapshot chatSnapshot,
-        int maximumActionDepth)
+        int maximumActionDepth,
+        IReadOnlyList<KernelActionHookRegistration> actionHooks,
+        IServiceProvider? serviceProvider,
+        KernelGraphCompileOptions compileOptions)
     {
         _actions = new ReadOnlyDictionary<string, ICompiledActionDefinition>(
             new Dictionary<string, ICompiledActionDefinition>(actions, StringComparer.Ordinal));
@@ -589,6 +598,9 @@ public sealed class KernelGraph
         ActionSnapshot = actionSnapshot;
         ChatSnapshot = chatSnapshot;
         MaximumActionDepth = maximumActionDepth;
+        _actionHooks = actionHooks.ToArray();
+        _serviceProvider = serviceProvider;
+        _compileOptions = compileOptions;
     }
 
     public ActionPipelineSnapshot ActionSnapshot { get; }
@@ -676,11 +688,88 @@ public sealed class KernelGraph
         return typed;
     }
 
+    internal KernelExternalActionPolicy<TAction, TResult> CompileExternalAction<TAction, TResult>(
+        ActionDescriptor<TAction, TResult> descriptor,
+        SidecarExternalActionDispatchAuthority authority)
+    {
+        ArgumentNullException.ThrowIfNull(descriptor);
+        ArgumentNullException.ThrowIfNull(authority);
+        var ownerModuleId = authority.ModuleId;
+        if (string.IsNullOrWhiteSpace(ownerModuleId))
+            throw new KernelGraphCompilationException("An external action owner is required.");
+
+        var registration = new ActionDefinitionRegistration<TAction, TResult>(descriptor, ownerModuleId);
+        var definition = registration.Compile(_actionHooks, _serviceProvider, _compileOptions) as
+            CompiledActionDefinition<TAction, TResult> ??
+            throw new KernelGraphCompilationException(
+                $"External action '{descriptor.Key.Value}' did not compile as its typed descriptor.");
+        return KernelExternalActionPolicy<TAction, TResult>.Create(
+            definition,
+            ActionSnapshot,
+            authority);
+    }
+
     internal ICompiledEventDefinition GetEvent(SharpClawEventKey key)
     {
         if (!_events.TryGetValue(key.Value, out var definition))
             throw new KernelActionExecutionException($"Event '{key.Value}' is not registered in the compiled graph.");
         return definition;
+    }
+}
+
+internal sealed record KernelExternalActionPolicy<TAction, TResult>(
+    CompiledActionDefinition<TAction, TResult> Definition,
+    string SnapshotContractHash,
+    string AuthorityBindingHash,
+    string Identity)
+{
+    public static KernelExternalActionPolicy<TAction, TResult> Create(
+        CompiledActionDefinition<TAction, TResult> definition,
+        ActionPipelineSnapshot snapshot,
+        SidecarExternalActionDispatchAuthority authority)
+    {
+        var authorityBindingHash = authority.EffectiveHostEntry.Authority.CanonicalBindingHash;
+        return new(
+            definition,
+            snapshot.ContractHash,
+            authorityBindingHash,
+            ComputeIdentity(definition, snapshot.ContractHash, authority, authorityBindingHash));
+    }
+
+    public bool Matches(
+        ActionPipelineSnapshot snapshot,
+        SidecarExternalActionDispatchAuthority authority) =>
+        string.Equals(SnapshotContractHash, snapshot.ContractHash, StringComparison.Ordinal) &&
+        string.Equals(
+            AuthorityBindingHash,
+            authority.EffectiveHostEntry.Authority.CanonicalBindingHash,
+            StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(
+            Identity,
+            ComputeIdentity(Definition, snapshot.ContractHash, authority, AuthorityBindingHash),
+            StringComparison.Ordinal);
+
+    private static string ComputeIdentity(
+        CompiledActionDefinition<TAction, TResult> definition,
+        string snapshotContractHash,
+        SidecarExternalActionDispatchAuthority authority,
+        string authorityBindingHash)
+    {
+        var material = string.Join(
+            "\n",
+            [
+                "external-policy-v1",
+                snapshotContractHash,
+                authority.ModuleId,
+                authority.GraphId,
+                authority.Descriptor.DescriptorHash,
+                authority.Action.ContentHash,
+                authorityBindingHash,
+                definition.Signature,
+                KernelGraphHasher.StableScalar((int)definition.EffectiveCapabilities),
+                KernelGraphHasher.StableScalar(definition.SnapshotSensitiveApproved)
+            ]);
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(material)));
     }
 }
 

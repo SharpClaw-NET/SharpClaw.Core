@@ -13,7 +13,7 @@ public sealed class KernelExternalActionDispatchTests
         var builder = new KernelGraphBuilder(false);
         var localKey = new SharpClawActionKey("local.host.action");
         builder.Add(LocalDescriptor(localKey));
-        var graph = builder.Compile();
+        var graph = builder.Compile(options: ExternalPolicyOptions());
         var fixture = CreateFixture(graph);
         var verifier = new ExactExternalAuthorityVerifier(fixture.Authority);
         var dispatcher = KernelTestExecution.CreateDispatcher(
@@ -61,7 +61,7 @@ public sealed class KernelExternalActionDispatchTests
     [Fact]
     public async Task External_action_rejects_missing_or_changed_authority_before_terminal()
     {
-        var graph = new KernelGraphBuilder(false).Compile();
+        var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
         var fixture = CreateFixture(graph);
         var verifier = new ExactExternalAuthorityVerifier(fixture.Authority);
         var dispatcher = KernelTestExecution.CreateDispatcher(
@@ -148,7 +148,7 @@ public sealed class KernelExternalActionDispatchTests
     [Fact]
     public async Task External_authority_is_consumed_once_and_requires_trusted_verification()
     {
-        var graph = new KernelGraphBuilder(false).Compile();
+        var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
         var fixture = CreateFixture(graph);
         var verifier = new ExactExternalAuthorityVerifier(fixture.Authority);
         var dispatcher = KernelTestExecution.CreateDispatcher(
@@ -189,7 +189,7 @@ public sealed class KernelExternalActionDispatchTests
     [Fact]
     public async Task External_authority_allows_one_dispatch_under_concurrent_replay()
     {
-        var graph = new KernelGraphBuilder(false).Compile();
+        var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
         var fixture = CreateFixture(graph);
         var verifier = new ExactExternalAuthorityVerifier(fixture.Authority);
         var dispatcher = KernelTestExecution.CreateDispatcher(
@@ -221,7 +221,7 @@ public sealed class KernelExternalActionDispatchTests
     [Fact]
     public async Task External_action_requires_a_trusted_verifier()
     {
-        var graph = new KernelGraphBuilder(false).Compile();
+        var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
         var fixture = CreateFixture(graph);
         var dispatcher = KernelTestExecution.CreateDispatcher(graph);
         var terminalCalls = 0;
@@ -243,6 +243,129 @@ public sealed class KernelExternalActionDispatchTests
         Assert.Equal(0, terminalCalls);
     }
 
+    [Fact]
+    public async Task External_action_uses_the_host_wildcard_policy_once()
+    {
+        Volatile.Write(ref ExternalWildcardInterceptor.Calls, 0);
+        var builder = new KernelGraphBuilder(false);
+        builder.Hooks.AnyAction().UseAny<ExternalWildcardInterceptor>(Order("external-wildcard"));
+        var policyCapabilities = ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap;
+        var graph = builder.Compile(options: new KernelGraphCompileOptions
+        {
+            ActionModuleCapabilityGrants = ModuleGrant(policyCapabilities)
+        });
+        var fixture = CreateFixture(graph, ExternalDescriptor(policyCapabilities));
+        var dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityVerifier: new ExactExternalAuthorityVerifier(fixture.Authority));
+        var terminalCalls = 0;
+
+        var outcome = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (context, _) =>
+            {
+                terminalCalls++;
+                Assert.Equal(fixture.Action, context.Action);
+                return ValueTask.FromResult(new ExternalResult("accepted"));
+            },
+            graph.ActionSnapshot,
+            fixture.Authority,
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);
+        Assert.Equal(1, ExternalWildcardInterceptor.Calls);
+        Assert.Equal(1, terminalCalls);
+    }
+
+    [Fact]
+    public async Task External_action_rejects_unsupported_effects_before_terminal()
+    {
+        var graph = new KernelGraphBuilder(false).Compile(options: new KernelGraphCompileOptions
+        {
+            SupportedActionCapabilities = ActionInterceptionCapabilities.Inspect,
+            ActionModuleCapabilityGrants = ModuleGrant(ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Cancel)
+        });
+        var descriptor = ExternalDescriptor(ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Cancel);
+        var fixture = CreateFixture(graph, descriptor);
+        var dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityVerifier: new ExactExternalAuthorityVerifier(fixture.Authority));
+        var terminalCalls = 0;
+
+        var outcome = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (_, _) =>
+            {
+                terminalCalls++;
+                return ValueTask.FromResult(new ExternalResult("unexpected"));
+            },
+            graph.ActionSnapshot,
+            fixture.Authority,
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
+        Assert.Equal("ACTION_EXTERNAL_POLICY_REJECTED", outcome.Error?.Code);
+        Assert.Equal(0, terminalCalls);
+    }
+
+    [Fact]
+    public async Task External_action_rejects_denied_effects_before_terminal()
+    {
+        var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
+        var descriptor = ExternalDescriptor(ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Cancel);
+        var fixture = CreateFixture(graph, descriptor);
+        var dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityVerifier: new ExactExternalAuthorityVerifier(fixture.Authority));
+        var terminalCalls = 0;
+
+        var outcome = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (_, _) =>
+            {
+                terminalCalls++;
+                return ValueTask.FromResult(new ExternalResult("unexpected"));
+            },
+            graph.ActionSnapshot,
+            fixture.Authority,
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
+        Assert.Equal("ACTION_EXTERNAL_POLICY_REJECTED", outcome.Error?.Code);
+        Assert.Equal(0, terminalCalls);
+    }
+
+    [Fact]
+    public async Task External_sensitive_action_requires_exact_host_approval()
+    {
+        var descriptor = ExternalDescriptor(sensitive: true);
+        var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
+        var fixture = CreateFixture(graph, descriptor);
+        var dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityVerifier: new ExactExternalAuthorityVerifier(fixture.Authority));
+        var terminalCalls = 0;
+
+        var outcome = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (_, _) =>
+            {
+                terminalCalls++;
+                return ValueTask.FromResult(new ExternalResult("unexpected"));
+            },
+            graph.ActionSnapshot,
+            fixture.Authority,
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
+        Assert.Equal("ACTION_EXTERNAL_POLICY_REJECTED", outcome.Error?.Code);
+        Assert.Equal(0, terminalCalls);
+    }
+
     private static ActionDescriptor<KernelActionEnvelope, object> LocalDescriptor(SharpClawActionKey key) =>
         new(
             key,
@@ -259,23 +382,12 @@ public sealed class KernelExternalActionDispatchTests
             ResultSchema = new JsonSchemaReference("local.result", 1, "local-result"),
         };
 
-    private static ExternalFixture CreateFixture(KernelGraph graph)
+    private static ExternalFixture CreateFixture(
+        KernelGraph graph,
+        ActionDescriptor<ExternalInput, ExternalResult>? descriptorOverride = null)
     {
         var now = DateTimeOffset.UtcNow;
-        var descriptor = new ActionDescriptor<ExternalInput, ExternalResult>(
-            new SharpClawActionKey("sidecar.external.action"),
-            1,
-            "sidecar",
-            ActionInterceptionCapabilities.Inspect,
-            false,
-            false,
-            new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "sidecar.external.action"),
-            null,
-            TimeSpan.FromSeconds(30))
-        {
-            InputSchema = new JsonSchemaReference("sidecar.external.input", 1, "external-input"),
-            ResultSchema = new JsonSchemaReference("sidecar.external.result", 1, "external-result"),
-        };
+        var descriptor = descriptorOverride ?? ExternalDescriptor();
         var action = new ExternalInput("payload-a");
         var actionBytes = SidecarCapabilityTransportCodec.Serialize(action);
         var actionPayload = new SidecarSerializedPayload(
@@ -445,6 +557,56 @@ public sealed class KernelExternalActionDispatchTests
         ActionDescriptor<ExternalInput, ExternalResult> Descriptor,
         ExternalInput Action,
         SidecarExternalActionDispatchAuthority Authority);
+
+    private static ActionDescriptor<ExternalInput, ExternalResult> ExternalDescriptor(
+        ActionInterceptionCapabilities capabilities = ActionInterceptionCapabilities.Inspect,
+        bool sensitive = false) =>
+        new(
+            new SharpClawActionKey("sidecar.external.action"),
+            1,
+            "sidecar",
+            capabilities,
+            sensitive,
+            false,
+            new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "sidecar.external.action"),
+            null,
+            TimeSpan.FromSeconds(30))
+        {
+            InputSchema = new JsonSchemaReference("sidecar.external.input", 1, "external-input"),
+            ResultSchema = new JsonSchemaReference("sidecar.external.result", 1, "external-result"),
+        };
+
+    private static HookOrdering Order(string id) =>
+        new(id, HookPriority.Normal, [], [], null, HookFailurePolicy.FailAction);
+
+    private static KernelGraphCompileOptions ExternalPolicyOptions() => new()
+    {
+        ActionModuleCapabilityGrants = ModuleGrant(ActionInterceptionCapabilities.Inspect)
+    };
+
+    private static IReadOnlyDictionary<string, IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
+        ModuleGrant(ActionInterceptionCapabilities capabilities) =>
+        new Dictionary<string, IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
+        {
+            ["sidecar.module"] = new Dictionary<string, ActionInterceptionCapabilities>
+            {
+                ["sidecar.external.action"] = capabilities
+            }
+        };
+
+    private sealed class ExternalWildcardInterceptor : IAnyActionInterceptor
+    {
+        public static int Calls;
+
+        public ValueTask<IUntypedActionOutcome> InvokeAsync(
+            UntypedActionContext context,
+            IUntypedActionControl control,
+            CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref Calls);
+            return control.ProceedAsync(cancellationToken);
+        }
+    }
 
     private static SidecarExternalActionDispatchAuthority WithProof(
         SidecarExternalActionDispatchAuthority authority,
