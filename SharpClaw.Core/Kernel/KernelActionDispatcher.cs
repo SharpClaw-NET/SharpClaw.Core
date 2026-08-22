@@ -16,6 +16,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
     private readonly ICommittedEventWriter _eventWriter;
     private readonly IKernelActionResultSnapshotter _resultSnapshotter;
     private readonly IKernelActionRepeatEvidenceAuthority _repeatEvidenceAuthority;
+    private readonly ISidecarExternalActionDispatchAuthorityVerifier? _externalAuthorityVerifier;
 
     internal KernelActionExecutionContext ExecutionContext => _executionContext;
 
@@ -25,7 +26,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         IActionContinuationHost? continuationHost = null,
         ICommittedEventWriter? eventWriter = null,
         IKernelActionResultSnapshotter? resultSnapshotter = null,
-        IKernelActionRepeatEvidenceAuthority? repeatEvidenceAuthority = null)
+        IKernelActionRepeatEvidenceAuthority? repeatEvidenceAuthority = null,
+        ISidecarExternalActionDispatchAuthorityVerifier? externalAuthorityVerifier = null)
     {
         _graph = graph ?? throw new ArgumentNullException(nameof(graph));
         _executionContext = executionContext ?? throw new ArgumentNullException(nameof(executionContext));
@@ -33,6 +35,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         _eventWriter = eventWriter ?? new KernelEventDispatcher(graph);
         _resultSnapshotter = resultSnapshotter ?? new JsonKernelActionResultSnapshotter();
         _repeatEvidenceAuthority = repeatEvidenceAuthority ?? new DenyKernelActionRepeatEvidenceAuthority();
+        _externalAuthorityVerifier = externalAuthorityVerifier;
     }
 
     public ValueTask<IActionOutcome<TResult>> RunAsync<TAction, TResult>(
@@ -100,6 +103,25 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                 KernelActionOutcome<TResult>.Failed(
                     "ACTION_SNAPSHOT_MISMATCH",
                     "The external action snapshot is not compatible with the host graph."));
+        }
+
+        if (_externalAuthorityVerifier is null)
+        {
+            return ValueTask.FromResult<IActionOutcome<TResult>>(
+                KernelActionOutcome<TResult>.Failed(
+                    "ACTION_EXTERNAL_AUTHORITY_UNAVAILABLE",
+                    "A trusted external action authority verifier is required."));
+        }
+
+        var authorityResult = _externalAuthorityVerifier.ValidateAndConsume(
+            authority,
+            DateTimeOffset.UtcNow);
+        if (!authorityResult.Accepted)
+        {
+            return ValueTask.FromResult<IActionOutcome<TResult>>(
+                KernelActionOutcome<TResult>.Failed(
+                    authorityResult.Code,
+                    authorityResult.Message));
         }
 
         var definition = new CompiledActionDefinition<TAction, TResult>(

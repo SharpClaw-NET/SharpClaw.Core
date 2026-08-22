@@ -14,8 +14,11 @@ public sealed class KernelExternalActionDispatchTests
         var localKey = new SharpClawActionKey("local.host.action");
         builder.Add(LocalDescriptor(localKey));
         var graph = builder.Compile();
-        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
         var fixture = CreateFixture(graph);
+        var verifier = new ExactExternalAuthorityVerifier(fixture.Authority);
+        var dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityVerifier: verifier);
         var terminalCalls = 0;
 
         Assert.False(graph.ContainsAction(fixture.Descriptor.Key));
@@ -60,7 +63,10 @@ public sealed class KernelExternalActionDispatchTests
     {
         var graph = new KernelGraphBuilder(false).Compile();
         var fixture = CreateFixture(graph);
-        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        var verifier = new ExactExternalAuthorityVerifier(fixture.Authority);
+        var dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityVerifier: verifier);
         var terminalCalls = 0;
 
         var cases = new[]
@@ -93,7 +99,12 @@ public sealed class KernelExternalActionDispatchTests
                         ExpiresAt = DateTimeOffset.UtcNow.AddSeconds(-1)
                     }
                 }
-            })
+            }),
+            ("forged-proof", WithProof(fixture.Authority, "forged-proof")),
+            ("recomputed-fabricated-proof", WithProof(
+                fixture.Authority,
+                "fabricated-proof",
+                recomputeHash: true))
         };
 
         foreach (var (name, authority) in cases)
@@ -131,6 +142,104 @@ public sealed class KernelExternalActionDispatchTests
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Failed, changedPayload.Kind);
+        Assert.Equal(0, terminalCalls);
+    }
+
+    [Fact]
+    public async Task External_authority_is_consumed_once_and_requires_trusted_verification()
+    {
+        var graph = new KernelGraphBuilder(false).Compile();
+        var fixture = CreateFixture(graph);
+        var verifier = new ExactExternalAuthorityVerifier(fixture.Authority);
+        var dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityVerifier: verifier);
+        var terminalCalls = 0;
+
+        var first = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (_, _) =>
+            {
+                Interlocked.Increment(ref terminalCalls);
+                return ValueTask.FromResult(new ExternalResult("accepted"));
+            },
+            graph.ActionSnapshot,
+            fixture.Authority,
+            CancellationToken.None);
+        var second = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (_, _) =>
+            {
+                Interlocked.Increment(ref terminalCalls);
+                return ValueTask.FromResult(new ExternalResult("replayed"));
+            },
+            graph.ActionSnapshot,
+            fixture.Authority,
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Completed, first.Kind);
+        Assert.Equal(ActionOutcomeKind.Failed, second.Kind);
+        Assert.Equal(SidecarCapabilityErrors.Replay, second.Error?.Code);
+        Assert.Equal(1, terminalCalls);
+        Assert.Equal(1, verifier.SuccessfulConsumptions);
+    }
+
+    [Fact]
+    public async Task External_authority_allows_one_dispatch_under_concurrent_replay()
+    {
+        var graph = new KernelGraphBuilder(false).Compile();
+        var fixture = CreateFixture(graph);
+        var verifier = new ExactExternalAuthorityVerifier(fixture.Authority);
+        var dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityVerifier: verifier);
+        var terminalCalls = 0;
+
+        async Task<IActionOutcome<ExternalResult>> DispatchAsync() =>
+            await dispatcher.RunExternalAsync(
+                fixture.Descriptor,
+                fixture.Action,
+                (_, _) =>
+                {
+                    Interlocked.Increment(ref terminalCalls);
+                    return ValueTask.FromResult(new ExternalResult("accepted"));
+                },
+                graph.ActionSnapshot,
+                fixture.Authority,
+                CancellationToken.None);
+
+        var outcomes = await Task.WhenAll(DispatchAsync(), DispatchAsync());
+
+        Assert.Equal(1, outcomes.Count(outcome => outcome.Kind == ActionOutcomeKind.Completed));
+        Assert.Equal(1, outcomes.Count(outcome => outcome.Kind == ActionOutcomeKind.Failed));
+        Assert.Equal(1, terminalCalls);
+        Assert.Equal(1, verifier.SuccessfulConsumptions);
+    }
+
+    [Fact]
+    public async Task External_action_requires_a_trusted_verifier()
+    {
+        var graph = new KernelGraphBuilder(false).Compile();
+        var fixture = CreateFixture(graph);
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        var terminalCalls = 0;
+
+        var outcome = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (_, _) =>
+            {
+                terminalCalls++;
+                return ValueTask.FromResult(new ExternalResult("unexpected"));
+            },
+            graph.ActionSnapshot,
+            fixture.Authority,
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
+        Assert.Equal("ACTION_EXTERNAL_AUTHORITY_UNAVAILABLE", outcome.Error?.Code);
         Assert.Equal(0, terminalCalls);
     }
 
@@ -336,4 +445,53 @@ public sealed class KernelExternalActionDispatchTests
         ActionDescriptor<ExternalInput, ExternalResult> Descriptor,
         ExternalInput Action,
         SidecarExternalActionDispatchAuthority Authority);
+
+    private static SidecarExternalActionDispatchAuthority WithProof(
+        SidecarExternalActionDispatchAuthority authority,
+        string proof,
+        bool recomputeHash = false)
+    {
+        var hostAuthority = authority.EffectiveHostEntry.Authority with { Proof = proof };
+        if (recomputeHash)
+            hostAuthority = hostAuthority with
+            {
+                CanonicalBindingHash = SidecarCapabilityTransportValidation.ComputeTerminalAuthorityBindingHash(hostAuthority)
+            };
+
+        return authority with
+        {
+            EffectiveHostEntry = authority.EffectiveHostEntry with { Authority = hostAuthority }
+        };
+    }
+
+    private sealed class ExactExternalAuthorityVerifier(
+        SidecarExternalActionDispatchAuthority expected)
+        : ISidecarExternalActionDispatchAuthorityVerifier
+    {
+        private int _successfulConsumptions;
+
+        public int SuccessfulConsumptions => Volatile.Read(ref _successfulConsumptions);
+
+        public SidecarCapabilityValidationResult ValidateAndConsume(
+            SidecarExternalActionDispatchAuthority authority,
+            DateTimeOffset now)
+        {
+            if (Volatile.Read(ref _successfulConsumptions) != 0)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The external action authority was already consumed.");
+
+            if (authority != expected)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Unauthenticated,
+                    "The external action authority proof is not trusted.");
+
+            if (Interlocked.CompareExchange(ref _successfulConsumptions, 1, 0) != 0)
+                return SidecarCapabilityValidationResult.Reject(
+                    SidecarCapabilityErrors.Replay,
+                    "The external action authority was already consumed.");
+
+            return SidecarCapabilityValidationResult.Accept();
+        }
+    }
 }
