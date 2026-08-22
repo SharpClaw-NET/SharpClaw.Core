@@ -101,12 +101,16 @@ public sealed class DirectTurnRunner
         CancellationToken cancellationToken)
     {
         var request = await PrepareTurnAsync(input, snapshot, cancellationToken);
-        var providerStage = await RunStageWithInputAsync(
+        var providerStage = await RunStageWithActionContextAsync(
             SharpClawActions.Chat.ProviderRound,
             request,
-            async (effectiveRequest, ct) =>
+            async (effectiveRequest, hostActionContext, ct) =>
             {
-                var value = await _providerLoop.RunAsync(effectiveRequest, _toolPipeline, ct);
+                var value = await _providerLoop.RunAsync(
+                    effectiveRequest,
+                    _toolPipeline,
+                    hostActionContext,
+                    ct);
                 return await RunStageAsync(
                     new SharpClawActionKey("chat.provider_round.complete"),
                     value,
@@ -278,13 +282,14 @@ public sealed class DirectTurnRunner
         CancellationToken cancellationToken)
     {
         var request = await PrepareTurnAsync(input, snapshot, cancellationToken);
-        var providerStage = await RunStageWithInputAsync(
+        var providerStage = await RunStageWithActionContextAsync(
             SharpClawActions.Chat.ProviderRound,
             request,
-            (effectiveRequest, ct) => RunStreamingProviderAsync(
+            (effectiveRequest, hostActionContext, ct) => RunStreamingProviderAsync(
                 effectiveRequest,
                 snapshot,
                 writer,
+                hostActionContext,
                 ct),
             snapshot.Actions,
             cancellationToken);
@@ -299,12 +304,14 @@ public sealed class DirectTurnRunner
         ProviderTurnRequest request,
         ChatPipelineSnapshot snapshot,
         ChannelWriter<ChatStreamChunk> writer,
+        HostActionEntryRequestContext? hostActionContext,
         CancellationToken cancellationToken)
     {
         ChatCompletionResult? completion = null;
         await foreach (var chunk in _providerLoop.StreamAsync(
             request,
             _toolPipeline,
+            hostActionContext,
             cancellationToken))
         {
             if (chunk.IsFinished)
@@ -504,9 +511,9 @@ public sealed class DirectTurnRunner
         var result = await _dispatcher.RunRequiredAsync(
             descriptor,
             new KernelActionEnvelope(key, input),
-            async (envelope, ct) =>
+            async (context, ct) =>
             {
-                effectiveInput = envelope.Payload switch
+                effectiveInput = context.Action.Payload switch
                 {
                     TInput typed => typed,
                     KernelActionEnvelope nested when nested.Payload is TInput typed => typed,
@@ -514,6 +521,41 @@ public sealed class DirectTurnRunner
                         $"Action '{key.Value}' returned an invalid replacement input.")
                 };
                 return (object)(await operation(effectiveInput, ct))!;
+            },
+            snapshot,
+            cancellationToken);
+        return result is TResult value
+            ? new StageResult<TInput, TResult>(effectiveInput, value)
+            : throw new KernelActionExecutionException(
+                $"Action '{key.Value}' returned '{result?.GetType().FullName ?? "null"}' " +
+                $"instead of '{typeof(TResult).FullName}'.");
+    }
+
+    private async ValueTask<StageResult<TInput, TResult>> RunStageWithActionContextAsync<TInput, TResult>(
+        SharpClawActionKey key,
+        TInput input,
+        Func<TInput, HostActionEntryRequestContext?, CancellationToken, ValueTask<TResult>> operation,
+        ActionPipelineSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
+        var descriptor = _graph.GetStandardAction(key);
+        var effectiveInput = input;
+        var result = await _dispatcher.RunRequiredAsync(
+            descriptor,
+            new KernelActionEnvelope(key, input),
+            async (context, ct) =>
+            {
+                effectiveInput = context.Action.Payload switch
+                {
+                    TInput typed => typed,
+                    KernelActionEnvelope nested when nested.Payload is TInput typed => typed,
+                    _ => throw new KernelActionExecutionException(
+                        $"Action '{key.Value}' returned an invalid replacement input.")
+                };
+                return (object)(await operation(
+                    effectiveInput,
+                    _dispatcher.ExecutionContext.HostActionEntry,
+                    ct))!;
             },
             snapshot,
             cancellationToken);
@@ -578,8 +620,8 @@ public sealed class KernelChatContextAssembler : IChatContextAssembler
         var result = await _dispatcher.RunRequiredAsync(
             descriptor,
             new KernelActionEnvelope(AssembleStart, request),
-            async (envelope, ct) => (object)await BuildCoreAsync(
-                ExtractContextRequest(envelope),
+            async (context, ct) => (object)await BuildCoreAsync(
+                ExtractContextRequest(context.Action),
                 ct),
             _graph.ActionSnapshot,
             cancellationToken);
@@ -608,9 +650,9 @@ public sealed class KernelChatContextAssembler : IChatContextAssembler
             var result = await _dispatcher.RunRequiredAsync(
                 descriptor,
                 new KernelActionEnvelope(ContributorInvoke, invocation),
-                async (envelope, ct) =>
+                async (context, ct) =>
                 {
-                    var effective = ExtractContributorInvocation(envelope);
+                    var effective = ExtractContributorInvocation(context.Action);
                     if (effective.ContributorIndex != index ||
                         !string.Equals(effective.ContributorType, invocation.ContributorType, StringComparison.Ordinal))
                         throw new KernelActionExecutionException(
@@ -632,8 +674,8 @@ public sealed class KernelChatContextAssembler : IChatContextAssembler
         var completed = await _dispatcher.RunRequiredAsync(
             completeDescriptor,
             new KernelActionEnvelope(AssembleComplete, assembled),
-            static (envelope, _) => ValueTask.FromResult<object>(
-                envelope.Payload is ChatContextContribution value
+            static (context, _) => ValueTask.FromResult<object>(
+                context.Action.Payload is ChatContextContribution value
                     ? value
                     : throw new KernelActionExecutionException(
                         "The context completion action received an invalid contribution.")),

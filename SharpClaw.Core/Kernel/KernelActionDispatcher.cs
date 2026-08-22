@@ -17,6 +17,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
     private readonly IKernelActionResultSnapshotter _resultSnapshotter;
     private readonly IKernelActionRepeatEvidenceAuthority _repeatEvidenceAuthority;
 
+    internal KernelActionExecutionContext ExecutionContext => _executionContext;
+
     public KernelActionDispatcher(
         KernelGraph graph,
         KernelActionExecutionContext executionContext,
@@ -36,7 +38,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
     public ValueTask<IActionOutcome<TResult>> RunAsync<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor,
         TAction action,
-        Func<TAction, CancellationToken, ValueTask<TResult>> terminal,
+        Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         CancellationToken cancellationToken)
         => RunCoreAsync(
@@ -51,7 +53,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         KernelActionExecutionContext executionContext,
         ActionDescriptor<TAction, TResult> descriptor,
         TAction action,
-        Func<TAction, CancellationToken, ValueTask<TResult>> terminal,
+        Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         CancellationToken cancellationToken)
         => RunCoreAsync(
@@ -66,7 +68,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         KernelActionExecutionContext executionContext,
         ActionDescriptor<TAction, TResult> descriptor,
         TAction action,
-        Func<TAction, CancellationToken, ValueTask<TResult>> terminal,
+        Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         CancellationToken cancellationToken)
     {
@@ -109,7 +111,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
     public async ValueTask<TResult> RunRequiredAsync<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor,
         TAction action,
-        Func<TAction, CancellationToken, ValueTask<TResult>> terminal,
+        Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         CancellationToken cancellationToken)
     {
@@ -121,7 +123,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         KernelActionExecutionContext executionContext,
         ActionDescriptor<TAction, TResult> descriptor,
         TAction action,
-        Func<TAction, CancellationToken, ValueTask<TResult>> terminal,
+        Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         CancellationToken cancellationToken)
     {
@@ -164,7 +166,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             int Depth,
             int Number);
         private readonly CompiledActionDefinition<TAction, TResult> _definition;
-        private readonly Func<TAction, CancellationToken, ValueTask<TResult>> _terminal;
+        private readonly Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> _terminal;
         private readonly ActionPipelineSnapshot _snapshot;
         private readonly KernelActionExecutionContext _executionContext;
         private readonly IActionContinuationHost _continuationHost;
@@ -178,7 +180,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
 
         public KernelActionInvocation(
             CompiledActionDefinition<TAction, TResult> definition,
-            Func<TAction, CancellationToken, ValueTask<TResult>> terminal,
+            Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
             ActionPipelineSnapshot snapshot,
             KernelActionExecutionContext executionContext,
             IActionContinuationHost continuationHost,
@@ -283,10 +285,9 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                     "ACTION_DEADLINE_EXCEEDED",
                     "The action deadline expired before this action path completed.");
 
-            if (index >= _definition.Frames.Count)
-                return await InvokeTerminalAsync(action, attempt.InvocationId, cancellationToken);
-
-            var activeFrame = _definition.Frames[index];
+            var ownerModuleId = index >= _definition.Frames.Count
+                ? _definition.OwnerModuleId
+                : _definition.Frames[index].OwnerModuleId;
             var context = new ActionContext<TAction>(
                 attempt.InvocationId,
                 attempt.ParentInvocationId,
@@ -296,11 +297,16 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                 attempt.Number,
                 _deadline,
                 _definition.Descriptor.Key,
-                activeFrame.OwnerModuleId,
+                ownerModuleId,
                 _executionContext.Caller,
                 action,
                 _executionContext.Features,
                 _snapshot);
+
+            if (index >= _definition.Frames.Count)
+                return await InvokeTerminalAsync(context, cancellationToken);
+
+            var activeFrame = _definition.Frames[index];
 
             var frame = activeFrame;
             if (frame is TypedActionFrame<TAction, TResult> typed)
@@ -547,14 +553,13 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         }
 
         private async ValueTask<IActionOutcome<TResult>> InvokeTerminalAsync(
-            TAction action,
-            Guid invocationId,
+            ActionContext<TAction> context,
             CancellationToken cancellationToken)
         {
             try
             {
                 var result = await InvokeBoundedAsync(
-                    token => _terminal(action, token),
+                    token => _terminal(context, token),
                     null,
                     cancellationToken);
                 return KernelActionOutcome<TResult>.Completed(result);
@@ -571,10 +576,10 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                         "ACTION_CONTINUATION_DENIED",
                         "An uncertain durable action requires a durable continuation host.");
                 var uncertainty = await RecordUncertaintyAsync(
-                    invocationId,
+                    context.InvocationId,
                     exception.Uncertainty,
                     cancellationToken,
-                    KernelJson.Serialize(action).GetRawText());
+                    KernelJson.Serialize(context.Action).GetRawText());
                 return KernelActionOutcome<TResult>.Uncertain(uncertainty);
             }
             catch (KernelActionCancelledException exception)
@@ -609,10 +614,10 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                         _executionContext.IdempotencyKey),
                     DateTimeOffset.UtcNow);
                 var uncertainty = await RecordUncertaintyAsync(
-                    invocationId,
+                    context.InvocationId,
                     supplied,
                     cancellationToken,
-                    KernelJson.Serialize(action).GetRawText());
+                    KernelJson.Serialize(context.Action).GetRawText());
                 return KernelActionOutcome<TResult>.Uncertain(uncertainty);
             }
             catch (TimeoutException exception)
@@ -637,10 +642,10 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                         _executionContext.IdempotencyKey),
                     DateTimeOffset.UtcNow);
                 var uncertainty = await RecordUncertaintyAsync(
-                    invocationId,
+                    context.InvocationId,
                     supplied,
                     CancellationToken.None,
-                    KernelJson.Serialize(action).GetRawText());
+                    KernelJson.Serialize(context.Action).GetRawText());
                 return KernelActionOutcome<TResult>.Uncertain(uncertainty);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

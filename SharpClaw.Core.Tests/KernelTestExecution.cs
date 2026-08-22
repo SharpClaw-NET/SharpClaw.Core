@@ -5,12 +5,33 @@ namespace SharpClaw.Core.Tests;
 
 internal static class KernelTestExecution
 {
+    public static HostActionEntryRequestContext CreateToolContext(
+        RequestPrincipal? caller = null,
+        ExtensionFeatureSet? features = null)
+    {
+        var now = DateTimeOffset.UtcNow;
+        return new HostActionEntryRequestContext(
+            Guid.NewGuid(),
+            "tests.in-process",
+            HostActionEntryIngress.Tool,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            caller ?? RequestPrincipal.Anonymous,
+            features ?? ExtensionFeatureSet.Empty,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            now.AddMinutes(1),
+            now.AddMinutes(1));
+    }
+
     public static KernelActionExecutionContext CreateContext() =>
         new(
             RequestPrincipal.Anonymous,
             ExtensionFeatureSet.Empty,
             Guid.NewGuid(),
-            Guid.NewGuid());
+            Guid.NewGuid(),
+            CreateToolContext());
 
     public static KernelActionDispatcher CreateDispatcher(
         KernelGraph graph,

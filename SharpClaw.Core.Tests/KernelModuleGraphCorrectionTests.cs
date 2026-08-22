@@ -117,8 +117,7 @@ public sealed class KernelModuleGraphCorrectionTests
                 "call",
                 "service_tool",
                 JsonSerializer.SerializeToElement(new { }),
-                RequestPrincipal.Anonymous,
-                ExtensionFeatureSet.Empty),
+                KernelTestExecution.CreateToolContext()),
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);

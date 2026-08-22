@@ -294,8 +294,7 @@ public sealed class KernelFlowCorrectionTests
             "call",
             "sample",
             JsonSerializer.SerializeToElement(new { }),
-            RequestPrincipal.Anonymous,
-            ExtensionFeatureSet.Empty);
+            KernelTestExecution.CreateToolContext());
 
     private static HookOrdering Order(string id) =>
         new(id, HookPriority.Normal, [], [], TimeSpan.FromSeconds(5), HookFailurePolicy.FailAction);

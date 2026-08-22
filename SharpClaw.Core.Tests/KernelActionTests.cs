@@ -7,6 +7,25 @@ namespace SharpClaw.Core.Tests;
 public sealed class KernelActionTests
 {
     [Fact]
+    public void Dispatcher_loads_against_the_beta16_terminal_delegate_contract()
+    {
+        var dispatcherType = typeof(KernelActionDispatcher);
+        var dispatcherAssembly = System.Reflection.Assembly.Load(dispatcherType.Assembly.FullName!);
+        var loadedType = dispatcherAssembly.GetType(dispatcherType.FullName!);
+        Assert.NotNull(loadedType);
+
+        var map = loadedType!.GetInterfaceMap(typeof(IActionDispatcher));
+        Assert.Equal(2, map.TargetMethods.Length);
+        Assert.Contains(map.TargetMethods, method => method.Name == nameof(IActionDispatcher.RunAsync));
+        Assert.Contains(
+            typeof(IActionDispatcher).GetMethods(),
+            method => method.Name == nameof(IActionDispatcher.RunAsync) &&
+                      method.GetParameters()[2].ParameterType.ToString().Contains(
+                          "ActionContext",
+                          StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task Typed_and_wildcard_interceptors_run_in_one_compiled_chain()
     {
         var key = new SharpClawActionKey("sample.action");
@@ -20,12 +39,56 @@ public sealed class KernelActionTests
         var outcome = await dispatcher.RunAsync(
             graph.GetStandardAction(key),
             new KernelActionEnvelope(key, "input"),
-            (action, _) => ValueTask.FromResult<object>(action.Payload + "-terminal"),
+            (context, _) => ValueTask.FromResult<object>(context.Action.Payload + "-terminal"),
             graph.ActionSnapshot,
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);
         Assert.Equal("input-replaced-terminal", outcome.Result as string);
+    }
+
+    [Fact]
+    public async Task Terminal_receives_the_effective_action_and_complete_dispatch_context()
+    {
+        var key = new SharpClawActionKey("context.action");
+        var builder = new KernelGraphBuilder(false);
+        builder.Add(Descriptor(key));
+        builder.Hooks.For(key).Use<ReplaceContextInputInterceptor>(Order("replace-context"));
+        var graph = builder.Compile();
+        var caller = new RequestPrincipal(
+            "caller",
+            "Caller",
+            new HashSet<string>(["operator"], StringComparer.Ordinal),
+            true);
+        var features = new ExtensionFeatureSet(
+            [new ExtensionFeature("feature", 1, "sample.module", 100, JsonSerializer.SerializeToElement(true))]);
+        var traceId = Guid.NewGuid();
+        var idempotencyKey = Guid.NewGuid();
+        var dispatcher = new KernelActionDispatcher(
+            graph,
+            new KernelActionExecutionContext(caller, features, traceId, idempotencyKey));
+        ActionContext<KernelActionEnvelope>? terminalContext = null;
+
+        var outcome = await dispatcher.RunAsync(
+            graph.GetStandardAction(key),
+            new KernelActionEnvelope(key, "A"),
+            (context, _) =>
+            {
+                terminalContext = context;
+                return ValueTask.FromResult<object>(context.Action.Payload!);
+            },
+            graph.ActionSnapshot,
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);
+        Assert.Equal("B", outcome.Result);
+        Assert.NotNull(terminalContext);
+        Assert.Equal("B", terminalContext!.Action.Payload);
+        Assert.Equal(traceId, terminalContext.TraceId);
+        Assert.Equal(idempotencyKey, terminalContext.IdempotencyKey);
+        Assert.Equal(0, terminalContext.Depth);
+        Assert.Equal(1, terminalContext.Attempt);
+        Assert.Same(graph.ActionSnapshot, terminalContext.Snapshot);
     }
 
     [Fact]
@@ -207,6 +270,19 @@ public sealed class KernelActionTests
                 new ActionReplacement<KernelActionEnvelope>(
                     context.Action with { Payload = "input-replaced" },
                     "test replacement"),
+                cancellationToken);
+    }
+
+    private sealed class ReplaceContextInputInterceptor : IActionInterceptor<KernelActionEnvelope, object>
+    {
+        public ValueTask<IActionOutcome<object>> InvokeAsync(
+            ActionContext<KernelActionEnvelope> context,
+            IActionControl<KernelActionEnvelope, object> control,
+            CancellationToken cancellationToken) =>
+            control.ProceedWithInputAsync(
+                new ActionReplacement<KernelActionEnvelope>(
+                    context.Action with { Payload = "B" },
+                    "replace action for terminal context test"),
                 cancellationToken);
     }
 

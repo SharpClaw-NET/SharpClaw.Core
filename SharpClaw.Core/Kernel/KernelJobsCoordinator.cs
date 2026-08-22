@@ -2125,9 +2125,9 @@ public sealed class KernelJobsCoordinator
             executionContext,
             descriptor,
             new KernelActionEnvelope(key, request),
-            async (envelope, ct) =>
+            async (context, ct) =>
             {
-                if (envelope.Payload is not TRequest effective)
+                if (context.Action.Payload is not TRequest effective)
                     throw new KernelActionExecutionException(
                         $"Storage action '{key.Value}' returned an invalid request payload.");
                 await effect(effective, ct);
@@ -2197,9 +2197,9 @@ public sealed class KernelJobsCoordinator
             executionContext,
             descriptor,
             new KernelActionEnvelope(key, request),
-            async (envelope, ct) =>
+            async (context, ct) =>
             {
-                if (envelope.Payload is not TRequest effective)
+                if (context.Action.Payload is not TRequest effective)
                     throw new KernelActionExecutionException(
                         $"Storage action '{key.Value}' returned an invalid request payload.");
                 return (object)(await effect(effective, ct))!;

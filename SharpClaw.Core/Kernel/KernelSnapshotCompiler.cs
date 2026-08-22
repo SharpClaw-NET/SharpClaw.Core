@@ -1961,9 +1961,9 @@ public sealed class KernelModuleRegistry
             await dispatcher.RunRequiredAsync<KernelActionEnvelope, object>(
                 descriptor,
                 new KernelActionEnvelope(descriptor.Key, context),
-                async (envelope, ct) =>
+                async (context, ct) =>
                 {
-                    var effectiveContext = envelope.Payload switch
+                    var effectiveContext = context.Action.Payload switch
                     {
                         ModuleStartContext value => value,
                         KernelActionEnvelope nested when nested.Payload is ModuleStartContext value => value,

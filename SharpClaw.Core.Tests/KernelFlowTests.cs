@@ -156,8 +156,7 @@ public sealed class KernelFlowTests
             "call-1",
             toolName,
             JsonSerializer.SerializeToElement(new { value = "sample" }),
-            RequestPrincipal.Anonymous,
-            ExtensionFeatureSet.Empty);
+            KernelTestExecution.CreateToolContext());
 
     private static ProviderTurnRequest NewProviderRequest(KernelGraph graph)
     {

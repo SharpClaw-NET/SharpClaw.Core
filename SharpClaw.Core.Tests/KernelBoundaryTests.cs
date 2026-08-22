@@ -1210,8 +1210,7 @@ public sealed class KernelBoundaryTests
                 "call",
                 "initial",
                 arguments.RootElement.Clone(),
-                RequestPrincipal.Anonymous,
-                ExtensionFeatureSet.Empty),
+                KernelTestExecution.CreateToolContext()),
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);

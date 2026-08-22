@@ -10,7 +10,8 @@ public sealed class KernelActionExecutionContext
         RequestPrincipal caller,
         ExtensionFeatureSet features,
         Guid traceId,
-        Guid idempotencyKey)
+        Guid idempotencyKey,
+        HostActionEntryRequestContext? hostActionEntry = null)
     {
         ArgumentNullException.ThrowIfNull(caller);
         ArgumentNullException.ThrowIfNull(features);
@@ -36,6 +37,7 @@ public sealed class KernelActionExecutionContext
                 .ToArray()));
         TraceId = traceId;
         IdempotencyKey = idempotencyKey;
+        HostActionEntry = hostActionEntry;
     }
 
     public RequestPrincipal Caller { get; }
@@ -45,6 +47,8 @@ public sealed class KernelActionExecutionContext
     public Guid TraceId { get; }
 
     public Guid IdempotencyKey { get; }
+
+    public HostActionEntryRequestContext? HostActionEntry { get; }
 }
 
 public enum KernelActionRepeatEvidenceKind

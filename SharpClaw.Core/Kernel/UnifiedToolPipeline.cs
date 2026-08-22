@@ -42,8 +42,8 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
         var outcome = await _dispatcher.RunAsync(
             descriptor,
             new KernelActionEnvelope(SharpClawActions.Tools.Invoke, invocation),
-            async (envelope, ct) => await ExecutePipelineAsync(
-                ExtractInput<ToolInvocation>(envelope),
+            async (context, ct) => await ExecutePipelineAsync(
+                ExtractInput<ToolInvocation>(context.Action),
                 ct),
             _graph.ActionSnapshot,
             cancellationToken);
@@ -237,7 +237,7 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
         return await _dispatcher.RunRequiredAsync(
             descriptor,
             new KernelActionEnvelope(key, input),
-            async (envelope, ct) => await terminal(ExtractInput<TInput>(envelope), ct),
+            async (context, ct) => await terminal(ExtractInput<TInput>(context.Action), ct),
             _graph.ActionSnapshot,
             cancellationToken);
     }

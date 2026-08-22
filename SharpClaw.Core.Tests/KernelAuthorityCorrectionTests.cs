@@ -402,9 +402,9 @@ public sealed class KernelAuthorityCorrectionTests
         var inputOutcome = await dispatcher.RunAsync(
             graph.GetStandardAction(SharpClawActions.Provider.Resolve),
             new KernelActionEnvelope(SharpClawActions.Provider.Resolve, request),
-            (envelope, _) =>
+            (context, _) =>
             {
-                var effective = Assert.IsType<KernelProviderRequestEnvelope>(envelope.Payload);
+                var effective = Assert.IsType<KernelProviderRequestEnvelope>(context.Action.Payload);
                 terminalMessage = Assert.Single(effective.Messages).Content;
                 return ValueTask.FromResult<object>(effective);
             },

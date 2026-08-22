@@ -37,10 +37,10 @@ public sealed class KernelJobsActionRunner(
                 JobSafePoint.BeforeTerminal,
                 input,
                 expectedRevision),
-            (effective, _) =>
+            (context, _) =>
             {
                 Interlocked.Exchange(ref beforeCompleted, 1);
-                return ValueTask.FromResult(effective);
+                return ValueTask.FromResult(context.Action);
             },
             graph.ActionSnapshot,
             cancellationToken);
@@ -54,11 +54,11 @@ public sealed class KernelJobsActionRunner(
             executionContext,
             contract.Action,
             before.Value,
-            async (effective, ct) =>
+            async (context, ct) =>
             {
                 Interlocked.Exchange(ref rootCompleted, 1);
-                var updated = await terminal(effective.Job, ct);
-                return new KernelJobOperationResult<TFamily>(updated, null, effective.Progress);
+                var updated = await terminal(context.Action.Job, ct);
+                return new KernelJobOperationResult<TFamily>(updated, null, context.Action.Progress);
             },
             graph.ActionSnapshot,
             cancellationToken);
@@ -81,10 +81,10 @@ public sealed class KernelJobsActionRunner(
                 JobSafePoint.AfterTerminal,
                 result,
                 expectedRevision),
-            (effective, _) =>
+            (context, _) =>
             {
                 Interlocked.Exchange(ref afterCompleted, 1);
-                return ValueTask.FromResult(effective);
+                return ValueTask.FromResult(context.Action);
             },
             graph.ActionSnapshot,
             cancellationToken);

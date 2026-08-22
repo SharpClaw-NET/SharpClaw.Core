@@ -163,13 +163,13 @@ public sealed class KernelJobsCatalogTests
         var readOutcome = await dispatcher.RunAsync(
             read,
             new JobsInput<ReadFamily>("read"),
-            (input, _) => ValueTask.FromResult(new JobsResult<ReadFamily>(input.Value + "-complete")),
+            (context, _) => ValueTask.FromResult(new JobsResult<ReadFamily>(context.Action.Value + "-complete")),
             graph.ActionSnapshot,
             CancellationToken.None);
         var progressOutcome = await dispatcher.RunAsync(
             progress,
             new JobsInput<ProgressFamily>("progress"),
-            (input, _) => ValueTask.FromResult(new JobsResult<ProgressFamily>(input.Value + "-complete")),
+            (context, _) => ValueTask.FromResult(new JobsResult<ProgressFamily>(context.Action.Value + "-complete")),
             graph.ActionSnapshot,
             CancellationToken.None);
 
@@ -204,7 +204,7 @@ public sealed class KernelJobsCatalogTests
             var outcome = await dispatcher.RunAsync(
                 descriptor,
                 new JobsInput<TFamily>(keyValue),
-                (input, _) => ValueTask.FromResult(new JobsResult<TFamily>(input.Value)),
+                (context, _) => ValueTask.FromResult(new JobsResult<TFamily>(context.Action.Value)),
                 graph.ActionSnapshot,
                 CancellationToken.None);
 
@@ -306,10 +306,10 @@ public sealed class KernelJobsCatalogTests
         var outcome = await dispatcher.RunAsync(
             descriptor,
             new JobsInput<ReadFamily>("original"),
-            (input, _) =>
+            (context, _) =>
             {
-                Assert.Equal("replaced", input.Value);
-                return ValueTask.FromResult(new JobsResult<ReadFamily>(input.Value));
+                Assert.Equal("replaced", context.Action.Value);
+                return ValueTask.FromResult(new JobsResult<ReadFamily>(context.Action.Value));
             },
             graph.ActionSnapshot,
             CancellationToken.None);
