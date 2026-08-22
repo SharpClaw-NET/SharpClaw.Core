@@ -30,7 +30,11 @@ public sealed class KernelFlowCorrectionTests
             new TracedProfileResolver(),
             store,
             new KernelChatContextAssembler(graph, dispatcher, [new TracedContributor()]),
-            new ProviderRoundLoop(transport, graph, dispatcher),
+            new ProviderRoundLoop(
+                transport,
+                graph,
+                dispatcher,
+                KernelTestExecution.CreateToolContextIssuer()),
             new UnifiedToolPipeline(graph, dispatcher));
 
         var result = await runner.RunAsync(new ChatTurnInput("hello"), CancellationToken.None);
@@ -107,7 +111,11 @@ public sealed class KernelFlowCorrectionTests
             new PlainProfileResolver(),
             new PlainConversationStore(),
             new KernelChatContextAssembler(graph, dispatcher, []),
-            new ProviderRoundLoop(transport, graph, dispatcher),
+            new ProviderRoundLoop(
+                transport,
+                graph,
+                dispatcher,
+                KernelTestExecution.CreateToolContextIssuer()),
             new UnifiedToolPipeline(graph, dispatcher));
 
         var exception = await Record.ExceptionAsync(async () =>
@@ -139,7 +147,11 @@ public sealed class KernelFlowCorrectionTests
         var transport = new CountingTransport();
 
         var exception = await Record.ExceptionAsync(async () =>
-            await new ProviderRoundLoop(transport, graph, dispatcher).RunAsync(
+            await new ProviderRoundLoop(
+                    transport,
+                    graph,
+                    dispatcher,
+                    KernelTestExecution.CreateToolContextIssuer()).RunAsync(
                 NewProviderRequest(graph),
                 new UnifiedToolPipeline(graph, dispatcher),
                 CancellationToken.None));
@@ -200,6 +212,62 @@ public sealed class KernelFlowCorrectionTests
     }
 
     [Fact]
+    public async Task Tool_pipeline_rejects_mismatched_host_authority_before_handler()
+    {
+        TracedToolHandler.Calls = 0;
+        var builder = new KernelGraphBuilder();
+        builder.AddTool<TracedToolHandler>(new ToolDescriptor(
+            "sample",
+            "Sample tool.",
+            JsonSerializer.SerializeToElement(new { type = "object" })));
+        var graph = builder.Compile();
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        var pipeline = new UnifiedToolPipeline(graph, dispatcher);
+        var valid = NewToolInvocation();
+        var invalid = new[]
+        {
+            valid with { InvocationId = Guid.NewGuid() },
+            valid with { ToolName = "other" },
+            valid with
+            {
+                HostActionContext = valid.HostActionContext with
+                {
+                    Ingress = HostActionEntryIngress.Cli
+                }
+            },
+            valid with
+            {
+                HostActionContext = valid.HostActionContext with
+                {
+                    ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-1)
+                }
+            },
+            valid with
+            {
+                HostActionContext = valid.HostActionContext with
+                {
+                    Contribution = valid.HostActionContext.Contribution! with
+                    {
+                        IngressBinding = new HostActionEntryIngressBinding(
+                            HostActionEntryIngress.Tool,
+                            "other",
+                            null!)
+                    }
+                }
+            },
+            valid with { HostActionContext = null! }
+        };
+
+        foreach (var invocation in invalid)
+        {
+            var outcome = await pipeline.InvokeAsync(invocation, CancellationToken.None);
+            Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
+        }
+
+        Assert.Equal(0, TracedToolHandler.Calls);
+    }
+
+    [Fact]
     public async Task Streaming_stops_before_reading_data_after_first_final_chunk()
     {
         var graph = new KernelGraphBuilder().Compile();
@@ -207,7 +275,11 @@ public sealed class KernelFlowCorrectionTests
         var transport = new FinalThenExtraTransport();
         var chunks = new List<ChatStreamChunk>();
 
-        await foreach (var chunk in new ProviderRoundLoop(transport, graph, dispatcher).StreamAsync(
+        await foreach (var chunk in new ProviderRoundLoop(
+                           transport,
+                           graph,
+                           dispatcher,
+                           KernelTestExecution.CreateToolContextIssuer()).StreamAsync(
                            NewProviderRequest(graph),
                            new UnifiedToolPipeline(graph, dispatcher),
                            CancellationToken.None))
@@ -231,7 +303,8 @@ public sealed class KernelFlowCorrectionTests
         await foreach (var chunk in new ProviderRoundLoop(
                            new FinalThenExtraTransport(),
                            graph,
-                           dispatcher).StreamAsync(
+                           dispatcher,
+                           KernelTestExecution.CreateToolContextIssuer()).StreamAsync(
                            NewProviderRequest(graph),
                            new UnifiedToolPipeline(graph, dispatcher),
                            CancellationToken.None))
@@ -288,13 +361,7 @@ public sealed class KernelFlowCorrectionTests
     }
 
     private static ToolInvocation NewToolInvocation() =>
-        new(
-            Guid.NewGuid(),
-            Guid.NewGuid(),
-            "call",
-            "sample",
-            JsonSerializer.SerializeToElement(new { }),
-            KernelTestExecution.CreateToolContext());
+        KernelTestExecution.CreateToolInvocation("sample");
 
     private static HookOrdering Order(string id) =>
         new(id, HookPriority.Normal, [], [], TimeSpan.FromSeconds(5), HookFailurePolicy.FailAction);

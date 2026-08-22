@@ -1120,7 +1120,11 @@ public sealed class KernelBoundaryTests
 
         var transport = new RecordingTransport();
         var requestForProvider = NewProviderRequest(graph, context);
-        await new ProviderRoundLoop(transport, graph, dispatcher).RunAsync(
+        await new ProviderRoundLoop(
+            transport,
+            graph,
+            dispatcher,
+            KernelTestExecution.CreateToolContextIssuer()).RunAsync(
             requestForProvider,
             new NoToolPipeline(),
             CancellationToken.None);
@@ -1160,7 +1164,11 @@ public sealed class KernelBoundaryTests
             profile,
             store,
             new KernelChatContextAssembler(graph, dispatcher, [contextContributor]),
-            new ProviderRoundLoop(transport, graph, dispatcher),
+            new ProviderRoundLoop(
+                transport,
+                graph,
+                dispatcher,
+                KernelTestExecution.CreateToolContextIssuer()),
             new UnifiedToolPipeline(graph, dispatcher));
 
         var result = await runner.RunAsync(new ChatTurnInput("original"), CancellationToken.None);
@@ -1204,13 +1212,7 @@ public sealed class KernelBoundaryTests
         using var arguments = JsonDocument.Parse("{\"stage\":\"original\"}");
 
         var outcome = await pipeline.InvokeAsync(
-            new ToolInvocation(
-                Guid.NewGuid(),
-                Guid.NewGuid(),
-                "call",
-                "initial",
-                arguments.RootElement.Clone(),
-                KernelTestExecution.CreateToolContext()),
+            KernelTestExecution.CreateToolInvocation("initial", arguments.RootElement.Clone()),
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);
@@ -1248,7 +1250,11 @@ public sealed class KernelBoundaryTests
         var request = NewProviderRequest(graph, ChatContextContribution.Empty);
         var transport = new RecordingTransport();
         var dispatcher = KernelTestExecution.CreateDispatcher(graph);
-        var loop = new ProviderRoundLoop(transport, graph, dispatcher);
+        var loop = new ProviderRoundLoop(
+            transport,
+            graph,
+            dispatcher,
+            KernelTestExecution.CreateToolContextIssuer());
 
         var completion = await loop.RunAsync(request, new NoToolPipeline(), CancellationToken.None);
 
@@ -1272,7 +1278,8 @@ public sealed class KernelBoundaryTests
         await foreach (var chunk in new ProviderRoundLoop(
                            new OneRoundStreamTransport(),
                            graph,
-                           dispatcher).StreamAsync(
+                           dispatcher,
+                           KernelTestExecution.CreateToolContextIssuer()).StreamAsync(
                            request,
                            new NoToolPipeline(),
                            CancellationToken.None))
@@ -1302,7 +1309,11 @@ public sealed class KernelBoundaryTests
 
         ProviderRecordingInterceptor.Keys.Clear();
         await Assert.ThrowsAsync<KernelActionFailedException>(async () =>
-            await new ProviderRoundLoop(new FailingTransport(), graph, dispatcher)
+            await new ProviderRoundLoop(
+                    new FailingTransport(),
+                    graph,
+                    dispatcher,
+                    KernelTestExecution.CreateToolContextIssuer())
                 .RunAsync(request, new NoToolPipeline(), CancellationToken.None));
         Assert.Contains("provider.request.fail", ProviderRecordingInterceptor.Keys);
     }
@@ -1324,7 +1335,8 @@ public sealed class KernelBoundaryTests
         await foreach (var chunk in new ProviderRoundLoop(
                            new OneRoundStreamTransport(),
                            graph,
-                           KernelTestExecution.CreateDispatcher(graph)).StreamAsync(
+                           KernelTestExecution.CreateDispatcher(graph),
+                           KernelTestExecution.CreateToolContextIssuer()).StreamAsync(
                            NewProviderRequest(graph, ChatContextContribution.Empty),
                            new NoToolPipeline(),
                            CancellationToken.None))
@@ -1361,7 +1373,8 @@ public sealed class KernelBoundaryTests
             await new ProviderRoundLoop(
                     new RecordingTransport(),
                     graph,
-                    KernelTestExecution.CreateDispatcher(graph))
+                    KernelTestExecution.CreateDispatcher(graph),
+                    KernelTestExecution.CreateToolContextIssuer())
                 .RunAsync(NewProviderRequest(graph, ChatContextContribution.Empty), new NoToolPipeline(), CancellationToken.None));
 
         Assert.IsAssignableFrom<OperationCanceledException>(exception);
@@ -1391,7 +1404,8 @@ public sealed class KernelBoundaryTests
             await foreach (var chunk in new ProviderRoundLoop(
                                new OneRoundStreamTransport(),
                                graph,
-                               KernelTestExecution.CreateDispatcher(graph)).StreamAsync(
+                               KernelTestExecution.CreateDispatcher(graph),
+                               KernelTestExecution.CreateToolContextIssuer()).StreamAsync(
                                NewProviderRequest(graph, ChatContextContribution.Empty),
                                new NoToolPipeline(),
                                CancellationToken.None))

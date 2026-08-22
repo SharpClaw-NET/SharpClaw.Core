@@ -111,7 +111,11 @@ public sealed class KernelFlowTests
         var dispatcher = KernelTestExecution.CreateDispatcher(graph);
         var pipeline = new UnifiedToolPipeline(graph, dispatcher);
         var transport = new TwoRoundTransport();
-        var loop = new ProviderRoundLoop(transport, graph, dispatcher);
+        var loop = new ProviderRoundLoop(
+            transport,
+            graph,
+            dispatcher,
+            KernelTestExecution.CreateToolContextIssuer());
         var request = NewProviderRequest(graph);
 
         var completion = await loop.RunAsync(request, pipeline, CancellationToken.None);
@@ -119,6 +123,93 @@ public sealed class KernelFlowTests
         Assert.Equal("final", completion.Content);
         Assert.Equal(2, transport.Calls);
         Assert.Equal(1, SampleToolHandler.Calls);
+    }
+
+    [Fact]
+    public async Task Provider_issues_one_valid_context_for_each_distinct_tool_call()
+    {
+        SampleToolHandler.Calls = 0;
+        var builder = new KernelGraphBuilder();
+        builder.AddTool<SampleToolHandler>(new ToolDescriptor(
+            "sample",
+            "sample tool",
+            JsonSerializer.SerializeToElement(new { type = "object" }),
+            1,
+            false));
+        builder.AddTool<SampleToolHandler>(new ToolDescriptor(
+            "other",
+            "other tool",
+            JsonSerializer.SerializeToElement(new { type = "object" }),
+            1,
+            false));
+        var graph = builder.Compile();
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        var issuer = new TestToolContextIssuer();
+        var loop = new ProviderRoundLoop(
+            new TwoToolCallTransport(),
+            graph,
+            dispatcher,
+            issuer);
+        var parent = new ActionContext<KernelActionEnvelope>(
+            Guid.NewGuid(),
+            null,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            0,
+            1,
+            DateTimeOffset.UtcNow.AddMinutes(1),
+            SharpClawActions.Chat.ProviderRound,
+            "test",
+            RequestPrincipal.Anonymous,
+            new KernelActionEnvelope(SharpClawActions.Chat.ProviderRound, NewProviderRequest(graph)),
+            ExtensionFeatureSet.Empty,
+            graph.ActionSnapshot);
+
+        var completion = await loop.RunAsync(
+            NewProviderRequest(graph),
+            new UnifiedToolPipeline(graph, dispatcher),
+            parent,
+            CancellationToken.None);
+
+        Assert.Equal("final", completion.Content);
+        Assert.Equal(2, issuer.Requests.Count);
+        Assert.Equal(["sample", "other"], issuer.Requests.Select(request => request.ToolName));
+        Assert.Equal(2, issuer.Requests.Select(request => request.InvocationId).Distinct().Count());
+        Assert.All(issuer.Requests, request =>
+        {
+            Assert.Same(parent, request.ParentActionContext);
+            Assert.True(KernelTestExecution.CreateToolContext(
+                request.InvocationId,
+                request.ToolName,
+                request.Arguments,
+                parent).IsWellFormed(DateTimeOffset.UtcNow));
+        });
+        Assert.Equal(2, SampleToolHandler.Calls);
+    }
+
+    [Fact]
+    public async Task Provider_without_a_host_issuer_fails_before_tool_handler()
+    {
+        SampleToolHandler.Calls = 0;
+        var builder = new KernelGraphBuilder();
+        builder.AddTool<SampleToolHandler>(new ToolDescriptor(
+            "sample",
+            "sample tool",
+            JsonSerializer.SerializeToElement(new { type = "object" }),
+            1,
+            false));
+        var graph = builder.Compile();
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        var loop = new ProviderRoundLoop(new TwoRoundTransport(), graph, dispatcher);
+
+        var exception = await Assert.ThrowsAsync<KernelActionExecutionException>(async () =>
+            await loop.RunAsync(
+                NewProviderRequest(graph),
+                new UnifiedToolPipeline(graph, dispatcher),
+                CancellationToken.None));
+
+        Assert.Contains("host-issued action context issuer", exception.Message);
+        Assert.Equal(0, SampleToolHandler.Calls);
     }
 
     [Fact]
@@ -136,7 +227,11 @@ public sealed class KernelFlowTests
         var dispatcher = KernelTestExecution.CreateDispatcher(graph);
         var pipeline = new UnifiedToolPipeline(graph, dispatcher);
         var transport = new StreamingTwoRoundTransport();
-        var loop = new ProviderRoundLoop(transport, graph, dispatcher);
+        var loop = new ProviderRoundLoop(
+            transport,
+            graph,
+            dispatcher,
+            KernelTestExecution.CreateToolContextIssuer());
         var chunks = new List<ChatStreamChunk>();
 
         await foreach (var chunk in loop.StreamAsync(NewProviderRequest(graph), pipeline, CancellationToken.None))
@@ -150,13 +245,9 @@ public sealed class KernelFlowTests
     }
 
     private static ToolInvocation NewInvocation(string toolName) =>
-        new(
-            Guid.NewGuid(),
-            Guid.NewGuid(),
-            "call-1",
+        KernelTestExecution.CreateToolInvocation(
             toolName,
-            JsonSerializer.SerializeToElement(new { value = "sample" }),
-            KernelTestExecution.CreateToolContext());
+            JsonSerializer.SerializeToElement(new { value = "sample" }));
 
     private static ProviderTurnRequest NewProviderRequest(KernelGraph graph)
     {
@@ -230,6 +321,47 @@ public sealed class KernelFlowTests
             ToolInvocation invocation,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult<ToolGateDecision>(new ToolGateDecision.Reject("blocked", "blocked by test"));
+    }
+
+    private sealed class TwoToolCallTransport : IKernelProviderTransport
+    {
+        private int _calls;
+
+        public ValueTask<ChatCompletionResult> CompleteAsync(
+            ProviderTurnRequest request,
+            IReadOnlyList<ToolAwareMessage> messages,
+            CancellationToken cancellationToken)
+        {
+            _calls++;
+            return ValueTask.FromResult(_calls == 1
+                ? new ChatCompletionResult
+                {
+                    Content = "call",
+                    ToolCalls =
+                    [
+                        new ChatToolCall("call-1", "sample", "{}"),
+                        new ChatToolCall("call-2", "other", "{}")
+                    ]
+                }
+                : new ChatCompletionResult
+                {
+                    Content = "final",
+                    ToolCalls = Array.Empty<ChatToolCall>()
+                });
+        }
+
+        public async IAsyncEnumerable<ChatStreamChunk> StreamAsync(
+            ProviderTurnRequest request,
+            IReadOnlyList<ToolAwareMessage> messages,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await Task.Yield();
+            yield return ChatStreamChunk.Final(new ChatCompletionResult
+            {
+                Content = "final",
+                ToolCalls = Array.Empty<ChatToolCall>()
+            });
+        }
     }
 
     private sealed class TwoRoundTransport : IKernelProviderTransport

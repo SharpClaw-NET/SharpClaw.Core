@@ -104,12 +104,12 @@ public sealed class DirectTurnRunner
         var providerStage = await RunStageWithActionContextAsync(
             SharpClawActions.Chat.ProviderRound,
             request,
-            async (effectiveRequest, hostActionContext, ct) =>
+            async (effectiveRequest, parentActionContext, ct) =>
             {
                 var value = await _providerLoop.RunAsync(
                     effectiveRequest,
                     _toolPipeline,
-                    hostActionContext,
+                    parentActionContext,
                     ct);
                 return await RunStageAsync(
                     new SharpClawActionKey("chat.provider_round.complete"),
@@ -285,11 +285,11 @@ public sealed class DirectTurnRunner
         var providerStage = await RunStageWithActionContextAsync(
             SharpClawActions.Chat.ProviderRound,
             request,
-            (effectiveRequest, hostActionContext, ct) => RunStreamingProviderAsync(
+            (effectiveRequest, parentActionContext, ct) => RunStreamingProviderAsync(
                 effectiveRequest,
                 snapshot,
                 writer,
-                hostActionContext,
+                parentActionContext,
                 ct),
             snapshot.Actions,
             cancellationToken);
@@ -304,14 +304,14 @@ public sealed class DirectTurnRunner
         ProviderTurnRequest request,
         ChatPipelineSnapshot snapshot,
         ChannelWriter<ChatStreamChunk> writer,
-        HostActionEntryRequestContext? hostActionContext,
+        ActionContext<KernelActionEnvelope> parentActionContext,
         CancellationToken cancellationToken)
     {
         ChatCompletionResult? completion = null;
         await foreach (var chunk in _providerLoop.StreamAsync(
             request,
             _toolPipeline,
-            hostActionContext,
+            parentActionContext,
             cancellationToken))
         {
             if (chunk.IsFinished)
@@ -534,7 +534,7 @@ public sealed class DirectTurnRunner
     private async ValueTask<StageResult<TInput, TResult>> RunStageWithActionContextAsync<TInput, TResult>(
         SharpClawActionKey key,
         TInput input,
-        Func<TInput, HostActionEntryRequestContext?, CancellationToken, ValueTask<TResult>> operation,
+        Func<TInput, ActionContext<KernelActionEnvelope>, CancellationToken, ValueTask<TResult>> operation,
         ActionPipelineSnapshot snapshot,
         CancellationToken cancellationToken)
     {
@@ -554,7 +554,7 @@ public sealed class DirectTurnRunner
                 };
                 return (object)(await operation(
                     effectiveInput,
-                    _dispatcher.ExecutionContext.HostActionEntry,
+                    context,
                     ct))!;
             },
             snapshot,

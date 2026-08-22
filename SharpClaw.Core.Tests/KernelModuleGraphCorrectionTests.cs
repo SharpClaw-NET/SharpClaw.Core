@@ -111,13 +111,7 @@ public sealed class KernelModuleGraphCorrectionTests
         var pipeline = new UnifiedToolPipeline(graph, dispatcher);
 
         var outcome = await pipeline.InvokeAsync(
-            new ToolInvocation(
-                Guid.NewGuid(),
-                Guid.NewGuid(),
-                "call",
-                "service_tool",
-                JsonSerializer.SerializeToElement(new { }),
-                KernelTestExecution.CreateToolContext()),
+            KernelTestExecution.CreateToolInvocation("service_tool"),
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);

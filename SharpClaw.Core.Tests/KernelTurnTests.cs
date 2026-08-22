@@ -25,7 +25,11 @@ public sealed class KernelTurnTests
             profileResolver,
             store,
             new KernelChatContextAssembler(graph, dispatcher, []),
-            new ProviderRoundLoop(new CompletionTransport(), graph, dispatcher),
+            new ProviderRoundLoop(
+                new CompletionTransport(),
+                graph,
+                dispatcher,
+                KernelTestExecution.CreateToolContextIssuer()),
             new UnifiedToolPipeline(graph, dispatcher));
         var input = new ChatTurnInput(
             "hello",

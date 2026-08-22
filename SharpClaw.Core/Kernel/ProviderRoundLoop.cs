@@ -34,17 +34,20 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
     private readonly IKernelProviderTransport _transport;
     private readonly KernelGraph _graph;
     private readonly KernelActionDispatcher _dispatcher;
+    private readonly IKernelToolContextIssuer? _toolContextIssuer;
     private readonly int _maximumRounds;
 
     public ProviderRoundLoop(
         IKernelProviderTransport transport,
         KernelGraph graph,
         KernelActionDispatcher dispatcher,
+        IKernelToolContextIssuer? toolContextIssuer = null,
         int maximumRounds = 8)
     {
         _transport = transport ?? throw new ArgumentNullException(nameof(transport));
         _graph = graph ?? throw new ArgumentNullException(nameof(graph));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
+        _toolContextIssuer = toolContextIssuer;
         if (maximumRounds < 1)
             throw new ArgumentOutOfRangeException(nameof(maximumRounds));
         _maximumRounds = maximumRounds;
@@ -59,7 +62,7 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
     public async ValueTask<ChatCompletionResult> RunAsync(
         ProviderTurnRequest request,
         IUnifiedToolPipeline toolPipeline,
-        HostActionEntryRequestContext? hostActionContext,
+        ActionContext<KernelActionEnvelope>? parentActionContext,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -83,7 +86,11 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
                     completion.ProviderMetadataJson));
                 foreach (var call in completion.ToolCalls)
                 {
-                    var invocation = CreateInvocation(request, call, hostActionContext);
+                    var invocation = await CreateInvocationAsync(
+                        request,
+                        call,
+                        parentActionContext,
+                        cancellationToken);
                     var outcome = await toolPipeline.InvokeAsync(invocation, cancellationToken);
                     if (outcome.Kind != ActionOutcomeKind.Completed)
                         ThrowToolOutcome(outcome);
@@ -151,7 +158,7 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
     public async IAsyncEnumerable<ChatStreamChunk> StreamAsync(
         ProviderTurnRequest request,
         IUnifiedToolPipeline toolPipeline,
-        HostActionEntryRequestContext? hostActionContext,
+        ActionContext<KernelActionEnvelope>? parentActionContext,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -386,7 +393,11 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
                 foreach (var call in completion.ToolCalls)
                 {
                     var outcome = await toolPipeline.InvokeAsync(
-                        CreateInvocation(request, call, hostActionContext),
+                        await CreateInvocationAsync(
+                            request,
+                            call,
+                            parentActionContext,
+                            cancellationToken),
                         cancellationToken);
                     if (outcome.Kind != ActionOutcomeKind.Completed)
                         await ThrowStreamToolOutcomeAsync(outcome, () => failureDispatched = true);
@@ -639,19 +650,59 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
         return messages;
     }
 
-    private ToolInvocation CreateInvocation(
+    private async ValueTask<ToolInvocation> CreateInvocationAsync(
         ProviderTurnRequest request,
         ChatToolCall call,
-        HostActionEntryRequestContext? hostActionContext) =>
-        new(
-            Guid.NewGuid(),
+        ActionContext<KernelActionEnvelope>? parentActionContext,
+        CancellationToken cancellationToken)
+    {
+        var arguments = ParseArguments(call.ArgumentsJson);
+        var invocationId = Guid.NewGuid();
+        var requestForIssuer = new KernelToolContextIssueRequest(
+            invocationId,
             request.Turn.Conversation.ConversationId,
             call.Id,
             call.Name,
-            ParseArguments(call.ArgumentsJson),
-            hostActionContext ?? _dispatcher.ExecutionContext.HostActionEntry
-                ?? throw new KernelActionExecutionException(
-                    "A provider tool call requires a host-issued action entry context."));
+            arguments,
+            parentActionContext);
+        if (!requestForIssuer.IsWellFormed)
+            throw new KernelActionExecutionException(
+                "The provider returned an invalid tool invocation request.");
+        if (_toolContextIssuer is null)
+            throw new KernelActionExecutionException(
+                "A provider tool call requires a host-issued action context issuer.");
+
+        var hostActionContext = await _toolContextIssuer.IssueAsync(
+            requestForIssuer,
+            cancellationToken);
+        if (hostActionContext is null)
+            throw new KernelActionExecutionException(
+                "The host did not issue a Tool action context.");
+
+        var invocation = new ToolInvocation(
+            invocationId,
+            requestForIssuer.ConversationId,
+            requestForIssuer.ToolCallId,
+            requestForIssuer.ToolName,
+            requestForIssuer.Arguments,
+            hostActionContext);
+        if (!IsWellFormed(invocation))
+            throw new KernelActionExecutionException(
+                "The host-issued Tool action context does not match the provider invocation.");
+        return invocation;
+    }
+
+    private static bool IsWellFormed(ToolInvocation invocation)
+    {
+        try
+        {
+            return invocation.IsWellFormed(DateTimeOffset.UtcNow);
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     private static JsonElement ParseArguments(string argumentsJson)
     {

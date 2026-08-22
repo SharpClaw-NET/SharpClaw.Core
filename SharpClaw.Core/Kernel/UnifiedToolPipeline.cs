@@ -38,6 +38,11 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
         ToolInvocation invocation,
         CancellationToken cancellationToken)
     {
+        if (!IsWellFormed(invocation))
+            return ToolInvocationOutcome.Rejected(
+                "TOOL_INVOCATION_INVALID",
+                "The Tool invocation does not contain valid host-issued authority.");
+
         var descriptor = _graph.GetStandardAction(SharpClawActions.Tools.Invoke);
         var outcome = await _dispatcher.RunAsync(
             descriptor,
@@ -74,6 +79,18 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
         else if (result.Kind == ActionOutcomeKind.Failed)
             await TryDispatchTerminalAsync(Failure, result);
         return result;
+    }
+
+    private static bool IsWellFormed(ToolInvocation invocation)
+    {
+        try
+        {
+            return invocation.IsWellFormed(DateTimeOffset.UtcNow);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private async ValueTask<object> ExecutePipelineAsync(

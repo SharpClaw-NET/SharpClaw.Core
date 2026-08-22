@@ -277,7 +277,11 @@ public sealed class KernelDirectTurnStreamingTests
             new ProfileResolver(),
             store,
             new KernelChatContextAssembler(graph, dispatcher, []),
-            new ProviderRoundLoop(transport, graph, dispatcher),
+            new ProviderRoundLoop(
+                transport,
+                graph,
+                dispatcher,
+                KernelTestExecution.CreateToolContextIssuer()),
             new UnifiedToolPipeline(graph, dispatcher));
 
     private static async Task<List<ChatStreamChunk>> CollectAsync(
