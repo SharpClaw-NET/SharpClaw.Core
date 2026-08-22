@@ -109,12 +109,15 @@ public sealed class KernelSnapshotCompiler
     {
         ArgumentNullException.ThrowIfNull(builder);
         options ??= new KernelGraphCompileOptions();
+        options = KernelGraphCompileOptions.Freeze(options);
+        var actionHooks = FreezeActionHooks(builder.ActionHooks);
+        var eventHooks = FreezeEventHooks(builder.EventHooks);
         if (options.MaximumActionDepth < 1)
             throw new KernelGraphCompilationException("Maximum action depth must be positive.");
 
         var modules = KernelModuleGraphCompiler.Compile(builder.Modules, serviceProvider);
-        var actions = CompileActions(builder, modules.Services, options);
-        var events = CompileEvents(builder, modules.Services, options);
+        var actions = CompileActions(builder, modules.Services, options, actionHooks);
+        var events = CompileEvents(builder, modules.Services, options, eventHooks);
         var tools = CompileTools(builder, modules.Services);
         var actionGrants = actions.Values
             .Select(action => new ActionCapabilityGrant(
@@ -136,8 +139,8 @@ public sealed class KernelSnapshotCompiler
             actions.Values,
             events.Values,
             tools,
-            builder.ActionHooks,
-            builder.EventHooks,
+            actionHooks,
+            eventHooks,
             modules,
             options);
         var snapshot = new ActionPipelineSnapshot(
@@ -158,7 +161,7 @@ public sealed class KernelSnapshotCompiler
             snapshot,
             chatSnapshot,
             options.MaximumActionDepth,
-            builder.ActionHooks,
+            actionHooks,
             serviceProvider,
             options);
     }
@@ -166,14 +169,15 @@ public sealed class KernelSnapshotCompiler
     private static Dictionary<string, ICompiledActionDefinition> CompileActions(
         KernelGraphBuilder builder,
         IServiceProvider? serviceProvider,
-        KernelGraphCompileOptions options)
+        KernelGraphCompileOptions options,
+        IReadOnlyList<KernelActionHookRegistration> actionHooks)
     {
         ValidateJobsCatalog(builder);
         var result = new Dictionary<string, ICompiledActionDefinition>(StringComparer.Ordinal);
         foreach (var definition in builder.ActionDefinitions)
         {
             if (!result.TryAdd(definition.Key.Value, definition.Compile(
-                    builder.ActionHooks,
+                    actionHooks,
                     serviceProvider,
                     options)))
             {
@@ -257,13 +261,14 @@ public sealed class KernelSnapshotCompiler
     private static Dictionary<string, ICompiledEventDefinition> CompileEvents(
         KernelGraphBuilder builder,
         IServiceProvider? serviceProvider,
-        KernelGraphCompileOptions options)
+        KernelGraphCompileOptions options,
+        IReadOnlyList<KernelEventHookRegistration> eventHooks)
     {
         var result = new Dictionary<string, ICompiledEventDefinition>(StringComparer.Ordinal);
         foreach (var definition in builder.EventDefinitions)
         {
             if (!result.TryAdd(definition.Key.Value, definition.Compile(
-                    builder.EventHooks,
+                    eventHooks,
                     serviceProvider,
                     options)))
             {
@@ -465,6 +470,27 @@ public sealed class KernelSnapshotCompiler
                     $"{prefix}|{module.Key}|{grant.Key}|{KernelGraphHasher.StableScalar(grant.Value)}");
         }
     }
+
+    private static IReadOnlyList<KernelActionHookRegistration> FreezeActionHooks(
+        IReadOnlyList<KernelActionHookRegistration> hooks) =>
+        new ReadOnlyCollection<KernelActionHookRegistration>(hooks
+            .Select(hook => hook with { Ordering = FreezeOrdering(hook.Ordering) })
+            .ToArray());
+
+    private static IReadOnlyList<KernelEventHookRegistration> FreezeEventHooks(
+        IReadOnlyList<KernelEventHookRegistration> hooks) =>
+        new ReadOnlyCollection<KernelEventHookRegistration>(hooks
+            .Select(hook => hook with { Ordering = FreezeOrdering(hook.Ordering) })
+            .ToArray());
+
+    private static HookOrdering FreezeOrdering(HookOrdering ordering) =>
+        new(
+            ordering.Id,
+            ordering.Priority,
+            new ReadOnlyCollection<string>((ordering.Before ?? []).ToArray()),
+            new ReadOnlyCollection<string>((ordering.After ?? []).ToArray()),
+            ordering.Timeout,
+            ordering.FailurePolicy);
 }
 
 internal static class KernelGraphHasher

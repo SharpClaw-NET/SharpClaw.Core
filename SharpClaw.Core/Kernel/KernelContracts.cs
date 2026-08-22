@@ -183,6 +183,54 @@ public sealed class KernelGraphCompileOptions
     public IReadOnlyList<KernelSensitiveEventApproval> SensitiveEventApprovals { get; init; } = [];
 
     public int MaximumActionDepth { get; init; } = 32;
+
+    internal static KernelGraphCompileOptions Freeze(KernelGraphCompileOptions source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        return new KernelGraphCompileOptions
+        {
+            SupportedActionCapabilities = source.SupportedActionCapabilities,
+            SupportedEventCapabilities = source.SupportedEventCapabilities,
+            ActionCapabilityGrants = FreezeDictionary(source.ActionCapabilityGrants),
+            ActionModuleCapabilityGrants = FreezeNestedDictionary(source.ActionModuleCapabilityGrants),
+            EventCapabilityGrants = FreezeDictionary(source.EventCapabilityGrants),
+            EventModuleCapabilityGrants = FreezeNestedDictionary(source.EventModuleCapabilityGrants),
+            SensitiveActionApprovals = FreezeList(source.SensitiveActionApprovals),
+            SensitiveEventApprovals = FreezeList(source.SensitiveEventApprovals),
+            MaximumActionDepth = source.MaximumActionDepth
+        };
+    }
+
+    private static IReadOnlyDictionary<string, T>? FreezeDictionary<T>(
+        IReadOnlyDictionary<string, T>? source)
+    {
+        if (source is null)
+            return null;
+
+        var copy = new Dictionary<string, T>(StringComparer.Ordinal);
+        foreach (var entry in source)
+            copy.Add(entry.Key, entry.Value);
+        return new ReadOnlyDictionary<string, T>(copy);
+    }
+
+    private static IReadOnlyDictionary<string, IReadOnlyDictionary<string, T>>? FreezeNestedDictionary<T>(
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, T>>? source)
+    {
+        if (source is null)
+            return null;
+
+        var copy = new Dictionary<string, IReadOnlyDictionary<string, T>>(StringComparer.Ordinal);
+        foreach (var entry in source)
+        {
+            ArgumentNullException.ThrowIfNull(entry.Value);
+            copy.Add(entry.Key, FreezeDictionary(entry.Value)!);
+        }
+
+        return new ReadOnlyDictionary<string, IReadOnlyDictionary<string, T>>(copy);
+    }
+
+    private static IReadOnlyList<T> FreezeList<T>(IReadOnlyList<T> source) =>
+        new ReadOnlyCollection<T>(source.ToArray());
 }
 
 public sealed record KernelSensitiveActionApproval(

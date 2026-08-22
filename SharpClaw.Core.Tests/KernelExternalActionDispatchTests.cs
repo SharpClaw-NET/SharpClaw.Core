@@ -366,6 +366,65 @@ public sealed class KernelExternalActionDispatchTests
         Assert.Equal(0, terminalCalls);
     }
 
+    [Fact]
+    public async Task External_policy_freezes_mutable_grants_and_sensitive_approvals()
+    {
+        var moduleGrants = new Dictionary<string, IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
+        {
+            ["sidecar.module"] = new Dictionary<string, ActionInterceptionCapabilities>
+            {
+                ["sidecar.external.action"] = ActionInterceptionCapabilities.Inspect
+            }
+        };
+        var approvals = new List<KernelSensitiveActionApproval>();
+        var options = new KernelGraphCompileOptions
+        {
+            ActionModuleCapabilityGrants = moduleGrants,
+            SensitiveActionApprovals = approvals
+        };
+        var graph = new KernelGraphBuilder(false).Compile(options: options);
+        var snapshotHash = graph.ActionSnapshot.ContractHash;
+        var descriptor = ExternalDescriptor(
+            ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Cancel,
+            sensitive: true);
+        var fixture = CreateFixture(graph, descriptor);
+        var verifier = new ExactExternalAuthorityVerifier(fixture.Authority);
+        var dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityVerifier: verifier);
+        var terminalCalls = 0;
+
+        moduleGrants["sidecar.module"] = new Dictionary<string, ActionInterceptionCapabilities>
+        {
+            ["sidecar.external.action"] =
+                ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Cancel
+        };
+        approvals.Add(new KernelSensitiveActionApproval(
+            "sidecar.module",
+            descriptor.Key,
+            descriptor.Version,
+            typeof(ExternalInput).AssemblyQualifiedName!,
+            typeof(ExternalResult).AssemblyQualifiedName!,
+            KernelSchemaIdentity.Action(descriptor)));
+
+        var outcome = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (_, _) =>
+            {
+                terminalCalls++;
+                return ValueTask.FromResult(new ExternalResult("unexpected"));
+            },
+            graph.ActionSnapshot,
+            fixture.Authority,
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
+        Assert.Equal("ACTION_EXTERNAL_POLICY_REJECTED", outcome.Error?.Code);
+        Assert.Equal(0, terminalCalls);
+        Assert.Equal(snapshotHash, graph.ActionSnapshot.ContractHash);
+    }
+
     private static ActionDescriptor<KernelActionEnvelope, object> LocalDescriptor(SharpClawActionKey key) =>
         new(
             key,
