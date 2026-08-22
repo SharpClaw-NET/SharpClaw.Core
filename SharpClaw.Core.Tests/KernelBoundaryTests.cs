@@ -1184,7 +1184,7 @@ public sealed class KernelBoundaryTests
     }
 
     [Fact]
-    public async Task Unified_tool_pipeline_consumes_replaced_gate_coordinator_and_handler_inputs()
+    public async Task Unified_tool_pipeline_preserves_argument_replacements_without_authority_changes()
     {
         ToolReplacementInterceptor.Reset();
         var builder = new KernelGraphBuilder();
@@ -1212,7 +1212,7 @@ public sealed class KernelBoundaryTests
         using var arguments = JsonDocument.Parse("{\"stage\":\"original\"}");
 
         var outcome = await pipeline.InvokeAsync(
-            KernelTestExecution.CreateToolInvocation("initial", arguments.RootElement.Clone()),
+            KernelTestExecution.CreateToolInvocation("registered", arguments.RootElement.Clone()),
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);
@@ -2002,8 +2002,6 @@ public sealed class KernelBoundaryTests
 
             var replacement = context.Action.Key.Value switch
             {
-                "tool.call.propose" => invocation with { ToolName = "resolved" },
-                "tool.definition.select" => invocation with { ToolName = "registered" },
                 "tool.call.check" => invocation with { Arguments = Arguments("checked") },
                 "tool.call.coordinate" => invocation with { Arguments = Arguments("coordinate") },
                 "tool.handler.invoke" => invocation with { Arguments = Arguments("handler") },

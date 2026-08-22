@@ -267,6 +267,68 @@ public sealed class KernelFlowCorrectionTests
         Assert.Equal(0, TracedToolHandler.Calls);
     }
 
+    [Theory]
+    [InlineData("tools.invoke")]
+    [InlineData("tool.call.parse")]
+    [InlineData("tool.call.input.transform")]
+    [InlineData("tool.call.propose")]
+    [InlineData("tool.call.check")]
+    [InlineData("tool.call.coordinate")]
+    [InlineData("tool.handler.invoke")]
+    public async Task Tool_pipeline_rechecks_authority_after_each_effective_boundary(string phase)
+    {
+        InnerToolAuthorityReplacementInterceptor.Phase = phase;
+        InnerToolAuthorityReplacementInterceptor.Mutation = "ToolName";
+        TracedToolHandler.Calls = 0;
+        var builder = new KernelGraphBuilder();
+        builder.AddTool<TracedToolHandler>(new ToolDescriptor(
+            "sample",
+            "Sample tool.",
+            JsonSerializer.SerializeToElement(new { type = "object" })));
+        builder.Hooks.For(new SharpClawActionKey(phase))
+            .Use<InnerToolAuthorityReplacementInterceptor>(Order(phase));
+        var graph = builder.Compile();
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+
+        var outcome = await new UnifiedToolPipeline(graph, dispatcher).InvokeAsync(
+            NewToolInvocation(),
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
+        Assert.Equal(0, TracedToolHandler.Calls);
+    }
+
+    [Theory]
+    [InlineData("InvocationId")]
+    [InlineData("ConversationId")]
+    [InlineData("ToolCallId")]
+    [InlineData("ToolName")]
+    [InlineData("Ingress")]
+    [InlineData("Contribution")]
+    [InlineData("ExpiresAt")]
+    public async Task Tool_pipeline_rejects_each_inner_authority_mutation(string mutation)
+    {
+        InnerToolAuthorityReplacementInterceptor.Phase = "tool.call.parse";
+        InnerToolAuthorityReplacementInterceptor.Mutation = mutation;
+        TracedToolHandler.Calls = 0;
+        var builder = new KernelGraphBuilder();
+        builder.AddTool<TracedToolHandler>(new ToolDescriptor(
+            "sample",
+            "Sample tool.",
+            JsonSerializer.SerializeToElement(new { type = "object" })));
+        builder.Hooks.For(new SharpClawActionKey("tool.call.parse"))
+            .Use<InnerToolAuthorityReplacementInterceptor>(Order("inner-authority"));
+        var graph = builder.Compile();
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+
+        var outcome = await new UnifiedToolPipeline(graph, dispatcher).InvokeAsync(
+            NewToolInvocation(),
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
+        Assert.Equal(0, TracedToolHandler.Calls);
+    }
+
     [Fact]
     public async Task Streaming_stops_before_reading_data_after_first_final_chunk()
     {
@@ -431,6 +493,65 @@ public sealed class KernelFlowCorrectionTests
                         DateTimeOffset.UtcNow))),
                 _ => throw new InvalidOperationException($"Unknown test mode '{Mode}'.")
             };
+    }
+
+    private sealed class InnerToolAuthorityReplacementInterceptor :
+        IActionInterceptor<KernelActionEnvelope, object>
+    {
+        public static string Phase { get; set; } = "tool.call.parse";
+        public static string Mutation { get; set; } = "ToolName";
+
+        public ValueTask<IActionOutcome<object>> InvokeAsync(
+            ActionContext<KernelActionEnvelope> context,
+            IActionControl<KernelActionEnvelope, object> control,
+            CancellationToken cancellationToken)
+        {
+            if (context.Action.Payload is not ToolInvocation invocation ||
+                !string.Equals(context.Action.Key.Value, Phase, StringComparison.Ordinal))
+                return control.ProceedAsync(cancellationToken);
+
+            var replacement = Mutation switch
+            {
+                "InvocationId" => invocation with { InvocationId = Guid.NewGuid() },
+                "ConversationId" => invocation with { ConversationId = Guid.NewGuid() },
+                "ToolCallId" => invocation with { ToolCallId = "changed-call" },
+                "ToolName" => invocation with { ToolName = "other" },
+                "Ingress" => invocation with
+                {
+                    HostActionContext = invocation.HostActionContext! with
+                    {
+                        Ingress = HostActionEntryIngress.Cli
+                    }
+                },
+                "Contribution" => invocation with
+                {
+                    HostActionContext = invocation.HostActionContext! with
+                    {
+                        Contribution = invocation.HostActionContext.Contribution! with
+                        {
+                            IngressBinding = new HostActionEntryIngressBinding(
+                                HostActionEntryIngress.Tool,
+                                "other",
+                                null!)
+                        }
+                    }
+                },
+                "ExpiresAt" => invocation with
+                {
+                    HostActionContext = invocation.HostActionContext! with
+                    {
+                        ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-1)
+                    }
+                },
+                _ => throw new InvalidOperationException($"Unknown mutation '{Mutation}'.")
+            };
+
+            return control.ProceedWithInputAsync(
+                new ActionReplacement<KernelActionEnvelope>(
+                    context.Action with { Payload = replacement },
+                    "mutate tool authority for rejection test"),
+                cancellationToken);
+        }
     }
 
     private sealed class ResponseCompletionReplacementInterceptor :
