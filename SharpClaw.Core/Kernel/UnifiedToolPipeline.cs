@@ -125,6 +125,10 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
             return invalid;
 
         var resolution = await ResolveToolAsync(invocation, authority, cancellationToken);
+        if (resolution is null)
+            return ToolInvocationOutcome.Rejected(
+                "TOOL_INVOCATION_AUTHORITY_CHANGED",
+                "The resolved tool handler is outside host-bound authority.");
         if (resolution.SelectedToolName is null)
             return ToolInvocationOutcome.Rejected(
                 "TOOL_NOT_REGISTERED",
@@ -164,6 +168,10 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
         if (checkedInput.Rejection is { } rejection)
             return ToolInvocationOutcome.Rejected(rejection.Code, rejection.Message);
         var registration = await ResolveToolAsync(checkedInput.Invocation, authority, cancellationToken);
+        if (registration is null)
+            return ToolInvocationOutcome.Rejected(
+                "TOOL_INVOCATION_AUTHORITY_CHANGED",
+                "The resolved tool handler is outside host-bound authority.");
         if (registration.SelectedToolName is null)
             return ToolInvocationOutcome.Rejected(
                 "TOOL_NOT_REGISTERED",
@@ -202,6 +210,9 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
                                 effectiveHandlerInvocation,
                                 authority,
                                 handlerCancellationToken);
+                            if (handlerResolution is null)
+                                throw new KernelActionExecutionException(
+                                    "The resolved tool handler is outside host-bound authority.");
                             if (handlerResolution.SelectedToolName is null)
                                 return (object)ToolResult.Error(
                                     $"No handler is registered for tool '{handlerResolution.Invocation.ToolName}'.");
@@ -264,7 +275,7 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
             : ToolInvocationOutcome.Rejected("TOOL_COORDINATION_FAILED", "The tool coordinator returned no result.");
     }
 
-    private async ValueTask<KernelToolResolution> ResolveToolAsync(
+    private async ValueTask<KernelToolResolution?> ResolveToolAsync(
         ToolInvocation invocation,
         ToolAuthorityTuple authority,
         CancellationToken cancellationToken)
@@ -290,6 +301,12 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
         if (!authority.IsWellFormedWithOriginalPayload(resolution.Invocation))
             throw new KernelActionExecutionException(
                 "The effective Tool invocation does not contain valid host-issued authority.");
+        if (resolution.SelectedToolName is not null &&
+            !string.Equals(
+                resolution.SelectedToolName,
+                authority.ToolName,
+                StringComparison.Ordinal))
+            return null;
         return resolution;
     }
 

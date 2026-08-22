@@ -268,10 +268,10 @@ public sealed class KernelFlowCorrectionTests
     }
 
     [Theory]
-    [InlineData("tools.invoke")]
     [InlineData("tool.call.parse")]
     [InlineData("tool.call.input.transform")]
     [InlineData("tool.call.propose")]
+    [InlineData("tool.definition.select")]
     [InlineData("tool.call.check")]
     [InlineData("tool.call.coordinate")]
     [InlineData("tool.handler.invoke")]
@@ -296,6 +296,38 @@ public sealed class KernelFlowCorrectionTests
 
         Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
         Assert.Equal(0, TracedToolHandler.Calls);
+    }
+
+    [Fact]
+    public async Task Tool_pipeline_rejects_replaced_resolution_handler_before_effects()
+    {
+        TracedToolHandler.Calls = 0;
+        AlternateToolHandler.Calls = 0;
+        var builder = new KernelGraphBuilder();
+        builder.AddTool<TracedToolHandler>(new ToolDescriptor(
+            "sample",
+            "Sample tool.",
+            JsonSerializer.SerializeToElement(new { type = "object" })));
+        builder.AddTool<AlternateToolHandler>(new ToolDescriptor(
+            "other",
+            "Other tool.",
+            JsonSerializer.SerializeToElement(new { type = "object" })));
+        builder.Hooks.For(new SharpClawActionKey("tool.definition.select"))
+            .Use<ResolutionResultReplacementInterceptor>(Order("resolution-result"));
+        var graph = builder.Compile();
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        var gate = new CountingToolGate();
+        var coordinator = new CountingToolCoordinator();
+        var pipeline = new UnifiedToolPipeline(graph, dispatcher, [gate], coordinator);
+
+        var outcome = await pipeline.InvokeAsync(NewToolInvocation(), CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
+        Assert.Equal("TOOL_INVOCATION_AUTHORITY_CHANGED", outcome.Error?.Code);
+        Assert.Equal(0, gate.Calls);
+        Assert.Equal(0, coordinator.Calls);
+        Assert.Equal(0, TracedToolHandler.Calls);
+        Assert.Equal(0, AlternateToolHandler.Calls);
     }
 
     [Theory]
@@ -669,6 +701,64 @@ public sealed class KernelFlowCorrectionTests
             ActionTrace.RequireCurrent("tool.handler.invoke");
             Calls++;
             return ValueTask.FromResult(ToolResult.Text("tool-result"));
+        }
+    }
+
+    private sealed class AlternateToolHandler : IToolHandler
+    {
+        public static int Calls { get; set; }
+
+        public ValueTask<ToolResult> InvokeAsync(
+            ToolInvocation invocation,
+            CancellationToken cancellationToken)
+        {
+            Calls++;
+            return ValueTask.FromResult(ToolResult.Text("alternate-result"));
+        }
+    }
+
+    private sealed class ResolutionResultReplacementInterceptor :
+        IActionInterceptor<KernelActionEnvelope, object>
+    {
+        public ValueTask<IActionOutcome<object>> InvokeAsync(
+            ActionContext<KernelActionEnvelope> context,
+            IActionControl<KernelActionEnvelope, object> control,
+            CancellationToken cancellationToken)
+        {
+            if (context.Action.Payload is not ToolInvocation invocation)
+                return control.ProceedAsync(cancellationToken);
+
+            return ValueTask.FromResult(control.ReplaceResult(
+                new KernelToolResolution(invocation, "other"),
+                "replace selected handler"));
+        }
+    }
+
+    private sealed class CountingToolGate : IToolInvocationGate
+    {
+        public int Calls { get; private set; }
+
+        public ValueTask<ToolGateDecision> EvaluateAsync(
+            ToolInvocation invocation,
+            CancellationToken cancellationToken)
+        {
+            Calls++;
+            return ValueTask.FromResult<ToolGateDecision>(new ToolGateDecision.Continue());
+        }
+    }
+
+    private sealed class CountingToolCoordinator : IToolExecutionCoordinator
+    {
+        public int Calls { get; private set; }
+
+        public ValueTask<ToolInvocationOutcome> CoordinateAsync(
+            ToolExecutionPlan plan,
+            ToolExecutionDelegate terminal,
+            CancellationToken cancellationToken)
+        {
+            Calls++;
+            return ValueTask.FromResult(
+                ToolInvocationOutcome.Rejected("TEST_UNEXPECTED_COORDINATION", "Unexpected coordination."));
         }
     }
 
