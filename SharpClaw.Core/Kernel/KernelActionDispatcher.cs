@@ -73,7 +73,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         SidecarExternalActionDispatchAuthority authority,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ISidecarExternalActionDispatchAuthorityVerifier? authorityVerifier = null)
     {
         if (authority is null)
         {
@@ -105,7 +106,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                     "The external action snapshot is not compatible with the host graph."));
         }
 
-        if (_externalAuthorityVerifier is null)
+        var trustedAuthorityVerifier = authorityVerifier ?? _externalAuthorityVerifier;
+        if (trustedAuthorityVerifier is null)
         {
             return ValueTask.FromResult<IActionOutcome<TResult>>(
                 KernelActionOutcome<TResult>.Failed(
@@ -113,7 +115,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                     "A trusted external action authority verifier is required."));
         }
 
-        var authorityResult = _externalAuthorityVerifier.ValidateAndConsume(
+        var authorityResult = trustedAuthorityVerifier.ValidateAndConsume(
             authority,
             DateTimeOffset.UtcNow);
         if (!authorityResult.Accepted)
@@ -250,7 +252,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         SidecarExternalActionDispatchAuthority authority,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ISidecarExternalActionDispatchAuthorityVerifier? authorityVerifier = null)
     {
         var outcome = await RunExternalAsync(
             descriptor,
@@ -258,7 +261,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             terminal,
             snapshot,
             authority,
-            cancellationToken);
+            cancellationToken,
+            authorityVerifier);
         return RequireResult(descriptor, outcome);
     }
 

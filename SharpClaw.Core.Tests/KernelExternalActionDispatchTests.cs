@@ -59,6 +59,66 @@ public sealed class KernelExternalActionDispatchTests
     }
 
     [Fact]
+    public async Task External_action_accepts_a_per_call_session_verifier_and_rejects_replay()
+    {
+        var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
+        var fixture = CreateFixture(graph);
+        var session = CreateSessionVerifier(fixture);
+        IActionDispatcher dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        var terminalCalls = 0;
+
+        var forged = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (_, _) =>
+            {
+                Interlocked.Increment(ref terminalCalls);
+                return ValueTask.FromResult(new ExternalResult("forged"));
+            },
+            graph.ActionSnapshot,
+            WithProof(fixture.Authority, "forged-proof", recomputeHash: true),
+            CancellationToken.None,
+            session);
+
+        Assert.Equal(ActionOutcomeKind.Failed, forged.Kind);
+        Assert.Equal(SidecarCapabilityErrors.Unauthenticated, forged.Error?.Code);
+        Assert.Equal(0, terminalCalls);
+
+        var accepted = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (_, _) =>
+            {
+                Interlocked.Increment(ref terminalCalls);
+                return ValueTask.FromResult(new ExternalResult("accepted"));
+            },
+            graph.ActionSnapshot,
+            SessionProof(fixture.Authority),
+            CancellationToken.None,
+            session);
+
+        var replay = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (_, _) =>
+            {
+                Interlocked.Increment(ref terminalCalls);
+                return ValueTask.FromResult(new ExternalResult("replayed"));
+            },
+            graph.ActionSnapshot,
+            SessionProof(fixture.Authority),
+            CancellationToken.None,
+            session);
+
+        Assert.True(
+            accepted.Kind == ActionOutcomeKind.Completed,
+            $"Accepted dispatch failed: {accepted.Error?.Code} {accepted.Error?.Message}");
+        Assert.Equal(ActionOutcomeKind.Failed, replay.Kind);
+        Assert.Equal(SidecarCapabilityErrors.Replay, replay.Error?.Code);
+        Assert.Equal(1, terminalCalls);
+    }
+
+    [Fact]
     public async Task External_action_rejects_missing_or_changed_authority_before_terminal()
     {
         var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
@@ -683,6 +743,83 @@ public sealed class KernelExternalActionDispatchTests
         {
             EffectiveHostEntry = authority.EffectiveHostEntry with { Authority = hostAuthority }
         };
+    }
+
+    private static SidecarExternalActionDispatchAuthority SessionProof(
+        SidecarExternalActionDispatchAuthority authority)
+    {
+        var hostAuthority = authority.EffectiveHostEntry.Authority with
+        {
+            Proof = authority.EffectiveHostEntry.Authority.CanonicalBindingHash,
+        };
+        return authority with
+        {
+            EffectiveHostEntry = authority.EffectiveHostEntry with
+            {
+                Authority = hostAuthority,
+            },
+        };
+    }
+
+    private static SidecarCapabilitySession CreateSessionVerifier(ExternalFixture fixture)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var expiresAt = now.AddMinutes(5);
+        var proof = new SidecarAuthenticationProof(
+            "hmac-sha256",
+            "core-test-host",
+            "session-nonce",
+            "signature",
+            string.Empty,
+            now,
+            expiresAt);
+        var binding = new SidecarCapabilitySessionBinding(
+            fixture.Authority.ModuleId,
+            fixture.Authority.GraphId,
+            1,
+            new SidecarCapabilityGrant(
+                "core-test-grant",
+                fixture.Authority.ModuleId,
+                fixture.Authority.GraphId,
+                [SidecarCapabilityKind.Action],
+                "authorization-hash",
+                now.AddMinutes(-1),
+                expiresAt),
+            fixture.Authority.Call.SessionId,
+            fixture.Authority.Call.RequestId,
+            fixture.Authority.Call.CancellationId,
+            expiresAt,
+            new SidecarPayloadLimits(4096, 4096, 4096, 8192, 1024),
+            new SidecarConcurrencyLimits(2, 4),
+            new SidecarSafeFailureIdentity(
+                Guid.NewGuid(),
+                "core.test.failure",
+                "The test failure is safe."),
+            "core-test-host",
+            proof);
+        binding = binding with
+        {
+            Authentication = proof with
+            {
+                BindingHash = SidecarCapabilitySessionValidator.ComputeBindingHash(binding),
+            },
+        };
+        var bindingHash = binding.Authentication.BindingHash;
+        var nonces = new HashSet<string>(StringComparer.Ordinal);
+        var session = new SidecarCapabilitySession(
+            binding,
+            authority => string.Equals(authority.BindingHash, bindingHash, StringComparison.Ordinal),
+            nonces.Add,
+            now,
+            static (authority, hash) => string.Equals(authority.Proof, hash, StringComparison.Ordinal));
+        var begin = session.BeginCall(
+            fixture.Authority.Call,
+            SidecarCapabilityKind.Action,
+            fixture.Authority.Action,
+            fixture.Authority.Action.ByteLength,
+            now);
+        Assert.True(begin.Accepted, begin.Message);
+        return session;
     }
 
     private sealed class ExactExternalAuthorityVerifier(
