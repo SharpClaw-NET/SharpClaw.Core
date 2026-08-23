@@ -437,6 +437,71 @@ public sealed class KernelExternalActionDispatchTests
     }
 
     [Fact]
+    public void External_registry_removes_expired_session_registration()
+    {
+        var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
+        var fixture = CreateFixture(graph);
+        var session = CreateSessionVerifier(fixture);
+        using var registry = new KernelExternalAuthoritySessionRegistry();
+        registry.Register(session);
+        var expired = registry.ValidateAndConsume(
+            SessionProof(fixture.Authority),
+            session.Binding.ExpiresAt.AddSeconds(1));
+        var removed = registry.ValidateAndConsume(
+            SessionProof(fixture.Authority),
+            DateTimeOffset.UtcNow);
+
+        Assert.Equal(SidecarCapabilityErrors.Expired, expired.Code);
+        Assert.Equal("ACTION_EXTERNAL_AUTHORITY_UNAVAILABLE", removed.Code);
+    }
+
+    [Fact]
+    public void External_registry_removes_registration_after_binding_rotation()
+    {
+        var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
+        var fixture = CreateFixture(graph);
+        var session = CreateSessionVerifier(fixture, permissive: true);
+        using var registry = new KernelExternalAuthoritySessionRegistry();
+        registry.Register(session);
+        Assert.True(session.CompleteCall(fixture.Authority.Call.CallId, 0).Accepted);
+
+        var now = DateTimeOffset.UtcNow;
+        var replacementExpiry = now.AddMinutes(5);
+        var replacement = session.Binding with
+        {
+            SessionId = Guid.NewGuid(),
+            RequestId = Guid.NewGuid(),
+            CancellationId = Guid.NewGuid(),
+            ExpiresAt = replacementExpiry,
+            Grant = session.Binding.Grant with { ExpiresAt = replacementExpiry },
+            Authentication = session.Binding.Authentication with
+            {
+                Nonce = Guid.NewGuid().ToString("N"),
+                IssuedAt = now,
+                ExpiresAt = replacementExpiry,
+                BindingHash = string.Empty,
+            },
+        };
+        replacement = replacement with
+        {
+            Authentication = replacement.Authentication with
+            {
+                BindingHash = SidecarCapabilitySessionValidator.ComputeBindingHash(replacement),
+            },
+        };
+
+        Assert.True(session.RotateBinding(replacement, now).Accepted);
+        var result = registry.ValidateAndConsume(
+            SessionProof(fixture.Authority),
+            now);
+
+        Assert.Equal(SidecarCapabilityErrors.InvalidBinding, result.Code);
+        Assert.Equal(
+            "ACTION_EXTERNAL_AUTHORITY_UNAVAILABLE",
+            registry.ValidateAndConsume(SessionProof(fixture.Authority), now).Code);
+    }
+
+    [Fact]
     public async Task External_action_uses_the_host_wildcard_policy_once()
     {
         Volatile.Write(ref ExternalWildcardInterceptor.Calls, 0);
