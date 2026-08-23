@@ -15,10 +15,10 @@ public sealed class KernelExternalActionDispatchTests
         builder.Add(LocalDescriptor(localKey));
         var graph = builder.Compile(options: ExternalPolicyOptions());
         var fixture = CreateFixture(graph);
-        var verifier = new ExactExternalAuthorityVerifier(fixture.Authority);
+        using var registry = CreateRegistry(fixture);
         var dispatcher = KernelTestExecution.CreateDispatcher(
             graph,
-            externalAuthorityVerifier: verifier);
+            externalAuthorityRegistry: registry);
         var terminalCalls = 0;
 
         Assert.False(graph.ContainsAction(fixture.Descriptor.Key));
@@ -34,7 +34,7 @@ public sealed class KernelExternalActionDispatchTests
                 return ValueTask.FromResult(new ExternalResult("sidecar-result"));
             },
             graph.ActionSnapshot,
-            fixture.Authority,
+            SessionProof(fixture.Authority),
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Completed, external.Kind);
@@ -63,9 +63,10 @@ public sealed class KernelExternalActionDispatchTests
     {
         var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
         var fixture = CreateFixture(graph);
-        var session = CreateSessionVerifier(fixture);
-        IActionDispatcher dispatcher = KernelTestExecution.CreateDispatcher(graph);
-        using var registration = dispatcher.RegisterExternalAuthoritySession(session);
+        using var registry = CreateRegistry(fixture);
+        IActionDispatcher dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityRegistry: registry);
         var terminalCalls = 0;
 
         var forged = await dispatcher.RunExternalAsync(
@@ -122,8 +123,11 @@ public sealed class KernelExternalActionDispatchTests
         var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
         var fixture = CreateFixture(graph);
         var session = CreateSessionVerifier(fixture);
-        IActionDispatcher dispatcher = KernelTestExecution.CreateDispatcher(graph);
-        var registration = dispatcher.RegisterExternalAuthoritySession(session);
+        using var registry = new KernelExternalAuthoritySessionRegistry();
+        var registration = registry.Register(session);
+        IActionDispatcher dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityRegistry: registry);
         registration.Dispose();
         var terminalCalls = 0;
 
@@ -149,9 +153,10 @@ public sealed class KernelExternalActionDispatchTests
     {
         var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
         var fixture = CreateFixture(graph);
-        var session = CreateSessionVerifier(fixture);
-        IActionDispatcher dispatcher = KernelTestExecution.CreateDispatcher(graph);
-        using var registration = dispatcher.RegisterExternalAuthoritySession(session);
+        using var registry = CreateRegistry(fixture);
+        IActionDispatcher dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityRegistry: registry);
         var terminalCalls = 0;
 
         var fabricated = WithProof(fixture.Authority, "always-accept-proof", recomputeHash: true);
@@ -177,34 +182,34 @@ public sealed class KernelExternalActionDispatchTests
     {
         var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
         var fixture = CreateFixture(graph);
-        var verifier = new ExactExternalAuthorityVerifier(fixture.Authority);
+        using var registry = CreateRegistry(fixture);
         var dispatcher = KernelTestExecution.CreateDispatcher(
             graph,
-            externalAuthorityVerifier: verifier);
+            externalAuthorityRegistry: registry);
         var terminalCalls = 0;
 
         var cases = new[]
         {
             ("missing", (SidecarExternalActionDispatchAuthority)null!),
-            ("module", fixture.Authority with { ModuleId = "other.module" }),
-            ("graph", fixture.Authority with { GraphId = "other.graph" }),
-            ("descriptor", fixture.Authority with
+            ("module", SessionProof(fixture.Authority) with { ModuleId = "other.module" }),
+            ("graph", SessionProof(fixture.Authority) with { GraphId = "other.graph" }),
+            ("descriptor", SessionProof(fixture.Authority) with
             {
                 Descriptor = fixture.Authority.Descriptor with { DescriptorHash = "changed" }
             }),
-            ("terminal", fixture.Authority with
+            ("terminal", SessionProof(fixture.Authority) with
             {
                 Terminal = fixture.Authority.Terminal with { TerminalId = Guid.NewGuid() }
             }),
-            ("host-context", fixture.Authority with
+            ("host-context", SessionProof(fixture.Authority) with
             {
                 InitiatingHostContext = fixture.Authority.InitiatingHostContext with
                 {
                     Caller = new RequestPrincipal("other.caller")
                 }
             }),
-            ("snapshot", fixture.Authority),
-            ("stale", fixture.Authority with
+            ("snapshot", SessionProof(fixture.Authority)),
+            ("stale", SessionProof(fixture.Authority) with
             {
                 EffectiveHostEntry = fixture.Authority.EffectiveHostEntry with
                 {
@@ -216,7 +221,7 @@ public sealed class KernelExternalActionDispatchTests
             }),
             ("forged-proof", WithProof(fixture.Authority, "forged-proof")),
             ("recomputed-fabricated-proof", WithProof(
-                fixture.Authority,
+                SessionProof(fixture.Authority),
                 "fabricated-proof",
                 recomputeHash: true))
         };
@@ -252,7 +257,7 @@ public sealed class KernelExternalActionDispatchTests
                 return ValueTask.FromResult(new ExternalResult("unexpected"));
             },
             graph.ActionSnapshot,
-            fixture.Authority,
+            SessionProof(fixture.Authority),
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Failed, changedPayload.Kind);
@@ -264,10 +269,10 @@ public sealed class KernelExternalActionDispatchTests
     {
         var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
         var fixture = CreateFixture(graph);
-        var verifier = new ExactExternalAuthorityVerifier(fixture.Authority);
+        using var registry = CreateRegistry(fixture);
         var dispatcher = KernelTestExecution.CreateDispatcher(
             graph,
-            externalAuthorityVerifier: verifier);
+            externalAuthorityRegistry: registry);
         var terminalCalls = 0;
 
         var first = await dispatcher.RunExternalAsync(
@@ -279,7 +284,7 @@ public sealed class KernelExternalActionDispatchTests
                 return ValueTask.FromResult(new ExternalResult("accepted"));
             },
             graph.ActionSnapshot,
-            fixture.Authority,
+            SessionProof(fixture.Authority),
             CancellationToken.None);
         var second = await dispatcher.RunExternalAsync(
             fixture.Descriptor,
@@ -290,14 +295,13 @@ public sealed class KernelExternalActionDispatchTests
                 return ValueTask.FromResult(new ExternalResult("replayed"));
             },
             graph.ActionSnapshot,
-            fixture.Authority,
+            SessionProof(fixture.Authority),
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Completed, first.Kind);
         Assert.Equal(ActionOutcomeKind.Failed, second.Kind);
         Assert.Equal(SidecarCapabilityErrors.Replay, second.Error?.Code);
         Assert.Equal(1, terminalCalls);
-        Assert.Equal(1, verifier.SuccessfulConsumptions);
     }
 
     [Fact]
@@ -305,10 +309,10 @@ public sealed class KernelExternalActionDispatchTests
     {
         var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
         var fixture = CreateFixture(graph);
-        var verifier = new ExactExternalAuthorityVerifier(fixture.Authority);
+        using var registry = CreateRegistry(fixture);
         var dispatcher = KernelTestExecution.CreateDispatcher(
             graph,
-            externalAuthorityVerifier: verifier);
+            externalAuthorityRegistry: registry);
         var terminalCalls = 0;
 
         async Task<IActionOutcome<ExternalResult>> DispatchAsync() =>
@@ -321,7 +325,7 @@ public sealed class KernelExternalActionDispatchTests
                     return ValueTask.FromResult(new ExternalResult("accepted"));
                 },
                 graph.ActionSnapshot,
-                fixture.Authority,
+                SessionProof(fixture.Authority),
                 CancellationToken.None);
 
         var outcomes = await Task.WhenAll(DispatchAsync(), DispatchAsync());
@@ -329,7 +333,6 @@ public sealed class KernelExternalActionDispatchTests
         Assert.Equal(1, outcomes.Count(outcome => outcome.Kind == ActionOutcomeKind.Completed));
         Assert.Equal(1, outcomes.Count(outcome => outcome.Kind == ActionOutcomeKind.Failed));
         Assert.Equal(1, terminalCalls);
-        Assert.Equal(1, verifier.SuccessfulConsumptions);
     }
 
     [Fact]
@@ -349,11 +352,87 @@ public sealed class KernelExternalActionDispatchTests
                 return ValueTask.FromResult(new ExternalResult("unexpected"));
             },
             graph.ActionSnapshot,
-            fixture.Authority,
+            SessionProof(fixture.Authority),
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
         Assert.Equal("ACTION_EXTERNAL_AUTHORITY_UNAVAILABLE", outcome.Error?.Code);
+        Assert.Equal(0, terminalCalls);
+    }
+
+    [Fact]
+    public async Task Caller_created_permissive_session_cannot_register_through_dispatcher_contract()
+    {
+        var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
+        var fixture = CreateFixture(graph);
+        var permissiveSession = CreateSessionVerifier(fixture, permissive: true);
+        IActionDispatcher dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        var dispatcherMethods = typeof(IActionDispatcher).GetMethods();
+        var terminalCalls = 0;
+
+        Assert.DoesNotContain(
+            dispatcherMethods,
+            method => method.Name == "RegisterExternalAuthoritySession");
+
+        var outcome = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (_, _) =>
+            {
+                terminalCalls++;
+                return ValueTask.FromResult(new ExternalResult("unexpected"));
+            },
+            graph.ActionSnapshot,
+            SessionProof(fixture.Authority),
+            CancellationToken.None);
+
+        Assert.NotNull(permissiveSession);
+        Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
+        Assert.Equal("ACTION_EXTERNAL_AUTHORITY_UNAVAILABLE", outcome.Error?.Code);
+        Assert.Equal(0, terminalCalls);
+    }
+
+    [Fact]
+    public async Task External_action_removes_disconnected_session_registration()
+    {
+        var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
+        var fixture = CreateFixture(graph);
+        var session = CreateSessionVerifier(fixture);
+        using var registry = new KernelExternalAuthoritySessionRegistry();
+        registry.Register(session);
+        session.Disconnect();
+        IActionDispatcher dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityRegistry: registry);
+        var terminalCalls = 0;
+
+        var first = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (_, _) =>
+            {
+                terminalCalls++;
+                return ValueTask.FromResult(new ExternalResult("unexpected"));
+            },
+            graph.ActionSnapshot,
+            SessionProof(fixture.Authority),
+            CancellationToken.None);
+        var second = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (_, _) =>
+            {
+                terminalCalls++;
+                return ValueTask.FromResult(new ExternalResult("unexpected"));
+            },
+            graph.ActionSnapshot,
+            SessionProof(fixture.Authority),
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Failed, first.Kind);
+        Assert.Equal(SidecarCapabilityErrors.Disconnected, first.Error?.Code);
+        Assert.Equal(ActionOutcomeKind.Failed, second.Kind);
+        Assert.Equal("ACTION_EXTERNAL_AUTHORITY_UNAVAILABLE", second.Error?.Code);
         Assert.Equal(0, terminalCalls);
     }
 
@@ -371,7 +450,7 @@ public sealed class KernelExternalActionDispatchTests
         var fixture = CreateFixture(graph, ExternalDescriptor(policyCapabilities));
         var dispatcher = KernelTestExecution.CreateDispatcher(
             graph,
-            externalAuthorityVerifier: new ExactExternalAuthorityVerifier(fixture.Authority));
+            externalAuthorityRegistry: CreateRegistry(fixture));
         var terminalCalls = 0;
 
         var outcome = await dispatcher.RunExternalAsync(
@@ -384,7 +463,7 @@ public sealed class KernelExternalActionDispatchTests
                 return ValueTask.FromResult(new ExternalResult("accepted"));
             },
             graph.ActionSnapshot,
-            fixture.Authority,
+            SessionProof(fixture.Authority),
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Completed, outcome.Kind);
@@ -404,7 +483,7 @@ public sealed class KernelExternalActionDispatchTests
         var fixture = CreateFixture(graph, descriptor);
         var dispatcher = KernelTestExecution.CreateDispatcher(
             graph,
-            externalAuthorityVerifier: new ExactExternalAuthorityVerifier(fixture.Authority));
+            externalAuthorityRegistry: CreateRegistry(fixture));
         var terminalCalls = 0;
 
         var outcome = await dispatcher.RunExternalAsync(
@@ -416,7 +495,7 @@ public sealed class KernelExternalActionDispatchTests
                 return ValueTask.FromResult(new ExternalResult("unexpected"));
             },
             graph.ActionSnapshot,
-            fixture.Authority,
+            SessionProof(fixture.Authority),
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
@@ -432,7 +511,7 @@ public sealed class KernelExternalActionDispatchTests
         var fixture = CreateFixture(graph, descriptor);
         var dispatcher = KernelTestExecution.CreateDispatcher(
             graph,
-            externalAuthorityVerifier: new ExactExternalAuthorityVerifier(fixture.Authority));
+            externalAuthorityRegistry: CreateRegistry(fixture));
         var terminalCalls = 0;
 
         var outcome = await dispatcher.RunExternalAsync(
@@ -444,7 +523,7 @@ public sealed class KernelExternalActionDispatchTests
                 return ValueTask.FromResult(new ExternalResult("unexpected"));
             },
             graph.ActionSnapshot,
-            fixture.Authority,
+            SessionProof(fixture.Authority),
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
@@ -460,7 +539,7 @@ public sealed class KernelExternalActionDispatchTests
         var fixture = CreateFixture(graph, descriptor);
         var dispatcher = KernelTestExecution.CreateDispatcher(
             graph,
-            externalAuthorityVerifier: new ExactExternalAuthorityVerifier(fixture.Authority));
+            externalAuthorityRegistry: CreateRegistry(fixture));
         var terminalCalls = 0;
 
         var outcome = await dispatcher.RunExternalAsync(
@@ -472,7 +551,7 @@ public sealed class KernelExternalActionDispatchTests
                 return ValueTask.FromResult(new ExternalResult("unexpected"));
             },
             graph.ActionSnapshot,
-            fixture.Authority,
+            SessionProof(fixture.Authority),
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
@@ -502,10 +581,10 @@ public sealed class KernelExternalActionDispatchTests
             ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Cancel,
             sensitive: true);
         var fixture = CreateFixture(graph, descriptor);
-        var verifier = new ExactExternalAuthorityVerifier(fixture.Authority);
+        using var registry = CreateRegistry(fixture);
         var dispatcher = KernelTestExecution.CreateDispatcher(
             graph,
-            externalAuthorityVerifier: verifier);
+            externalAuthorityRegistry: registry);
         var terminalCalls = 0;
 
         moduleGrants["sidecar.module"] = new Dictionary<string, ActionInterceptionCapabilities>
@@ -530,7 +609,7 @@ public sealed class KernelExternalActionDispatchTests
                 return ValueTask.FromResult(new ExternalResult("unexpected"));
             },
             graph.ActionSnapshot,
-            fixture.Authority,
+            SessionProof(fixture.Authority),
             CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
@@ -815,7 +894,9 @@ public sealed class KernelExternalActionDispatchTests
         };
     }
 
-    private static SidecarCapabilitySession CreateSessionVerifier(ExternalFixture fixture)
+    private static SidecarCapabilitySession CreateSessionVerifier(
+        ExternalFixture fixture,
+        bool permissive = false)
     {
         var now = DateTimeOffset.UtcNow;
         var expiresAt = now.AddMinutes(5);
@@ -862,10 +943,14 @@ public sealed class KernelExternalActionDispatchTests
         var nonces = new HashSet<string>(StringComparer.Ordinal);
         var session = new SidecarCapabilitySession(
             binding,
-            authority => string.Equals(authority.BindingHash, bindingHash, StringComparison.Ordinal),
+            permissive
+                ? static _ => true
+                : authority => string.Equals(authority.BindingHash, bindingHash, StringComparison.Ordinal),
             nonces.Add,
             now,
-            static (authority, hash) => string.Equals(authority.Proof, hash, StringComparison.Ordinal));
+            permissive
+                ? static (_, _) => true
+                : static (authority, hash) => string.Equals(authority.Proof, hash, StringComparison.Ordinal));
         var begin = session.BeginCall(
             fixture.Authority.Call,
             SidecarCapabilityKind.Action,
@@ -876,34 +961,10 @@ public sealed class KernelExternalActionDispatchTests
         return session;
     }
 
-    private sealed class ExactExternalAuthorityVerifier(
-        SidecarExternalActionDispatchAuthority expected)
-        : ISidecarExternalActionDispatchAuthorityVerifier
+    private static KernelExternalAuthoritySessionRegistry CreateRegistry(ExternalFixture fixture)
     {
-        private int _successfulConsumptions;
-
-        public int SuccessfulConsumptions => Volatile.Read(ref _successfulConsumptions);
-
-        public SidecarCapabilityValidationResult ValidateAndConsume(
-            SidecarExternalActionDispatchAuthority authority,
-            DateTimeOffset now)
-        {
-            if (Volatile.Read(ref _successfulConsumptions) != 0)
-                return SidecarCapabilityValidationResult.Reject(
-                    SidecarCapabilityErrors.Replay,
-                    "The external action authority was already consumed.");
-
-            if (authority != expected)
-                return SidecarCapabilityValidationResult.Reject(
-                    SidecarCapabilityErrors.Unauthenticated,
-                    "The external action authority proof is not trusted.");
-
-            if (Interlocked.CompareExchange(ref _successfulConsumptions, 1, 0) != 0)
-                return SidecarCapabilityValidationResult.Reject(
-                    SidecarCapabilityErrors.Replay,
-                    "The external action authority was already consumed.");
-
-            return SidecarCapabilityValidationResult.Accept();
-        }
+        var registry = new KernelExternalAuthoritySessionRegistry();
+        registry.Register(CreateSessionVerifier(fixture));
+        return registry;
     }
 }

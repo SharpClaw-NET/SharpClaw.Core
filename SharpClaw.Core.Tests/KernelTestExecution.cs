@@ -81,7 +81,7 @@ internal static class KernelTestExecution
         ICommittedEventWriter? eventWriter = null,
         IKernelActionResultSnapshotter? resultSnapshotter = null,
         IKernelActionRepeatEvidenceAuthority? repeatEvidenceAuthority = null,
-        ISidecarExternalActionDispatchAuthorityVerifier? externalAuthorityVerifier = null) =>
+        KernelExternalAuthoritySessionRegistry? externalAuthorityRegistry = null) =>
         new(
             graph,
             CreateContext(),
@@ -89,7 +89,7 @@ internal static class KernelTestExecution
             eventWriter,
             resultSnapshotter,
             repeatEvidenceAuthority,
-            externalAuthorityVerifier);
+            externalAuthorityRegistry);
 }
 
 internal sealed class TestToolContextIssuer : IKernelToolContextIssuer

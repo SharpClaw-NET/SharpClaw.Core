@@ -15,7 +15,7 @@ public sealed class KernelActionTests
         Assert.NotNull(loadedType);
 
         var map = loadedType!.GetInterfaceMap(typeof(IActionDispatcher));
-        Assert.Equal(5, map.TargetMethods.Length);
+        Assert.Equal(4, map.TargetMethods.Length);
         Assert.Contains(map.TargetMethods, method => method.Name == nameof(IActionDispatcher.RunAsync));
         Assert.Contains(
             typeof(IActionDispatcher).GetMethods(),
@@ -23,6 +23,10 @@ public sealed class KernelActionTests
                       method.GetParameters()[2].ParameterType.ToString().Contains(
                           "ActionContext",
                           StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            typeof(IActionDispatcher).GetMethods(),
+            method => method.GetParameters().Any(parameter =>
+                parameter.ParameterType == typeof(ISidecarExternalActionDispatchAuthorityVerifier)));
     }
 
     [Fact]
