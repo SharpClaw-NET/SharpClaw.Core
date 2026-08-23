@@ -59,12 +59,13 @@ public sealed class KernelExternalActionDispatchTests
     }
 
     [Fact]
-    public async Task External_action_accepts_a_per_call_session_verifier_and_rejects_replay()
+    public async Task External_action_uses_dispatcher_owned_session_registration_and_rejects_replay()
     {
         var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
         var fixture = CreateFixture(graph);
         var session = CreateSessionVerifier(fixture);
         IActionDispatcher dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        using var registration = dispatcher.RegisterExternalAuthoritySession(session);
         var terminalCalls = 0;
 
         var forged = await dispatcher.RunExternalAsync(
@@ -77,8 +78,7 @@ public sealed class KernelExternalActionDispatchTests
             },
             graph.ActionSnapshot,
             WithProof(fixture.Authority, "forged-proof", recomputeHash: true),
-            CancellationToken.None,
-            session);
+            CancellationToken.None);
 
         Assert.Equal(ActionOutcomeKind.Failed, forged.Kind);
         Assert.Equal(SidecarCapabilityErrors.Unauthenticated, forged.Error?.Code);
@@ -94,8 +94,7 @@ public sealed class KernelExternalActionDispatchTests
             },
             graph.ActionSnapshot,
             SessionProof(fixture.Authority),
-            CancellationToken.None,
-            session);
+            CancellationToken.None);
 
         var replay = await dispatcher.RunExternalAsync(
             fixture.Descriptor,
@@ -107,8 +106,7 @@ public sealed class KernelExternalActionDispatchTests
             },
             graph.ActionSnapshot,
             SessionProof(fixture.Authority),
-            CancellationToken.None,
-            session);
+            CancellationToken.None);
 
         Assert.True(
             accepted.Kind == ActionOutcomeKind.Completed,
@@ -116,6 +114,62 @@ public sealed class KernelExternalActionDispatchTests
         Assert.Equal(ActionOutcomeKind.Failed, replay.Kind);
         Assert.Equal(SidecarCapabilityErrors.Replay, replay.Error?.Code);
         Assert.Equal(1, terminalCalls);
+    }
+
+    [Fact]
+    public async Task External_action_requires_registered_session_after_registration_disposal()
+    {
+        var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
+        var fixture = CreateFixture(graph);
+        var session = CreateSessionVerifier(fixture);
+        IActionDispatcher dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        var registration = dispatcher.RegisterExternalAuthoritySession(session);
+        registration.Dispose();
+        var terminalCalls = 0;
+
+        var outcome = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (_, _) =>
+            {
+                terminalCalls++;
+                return ValueTask.FromResult(new ExternalResult("unexpected"));
+            },
+            graph.ActionSnapshot,
+            SessionProof(fixture.Authority),
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
+        Assert.Equal("ACTION_EXTERNAL_AUTHORITY_UNAVAILABLE", outcome.Error?.Code);
+        Assert.Equal(0, terminalCalls);
+    }
+
+    [Fact]
+    public async Task External_action_rejects_fabricated_authority_with_a_real_registered_session()
+    {
+        var graph = new KernelGraphBuilder(false).Compile(options: ExternalPolicyOptions());
+        var fixture = CreateFixture(graph);
+        var session = CreateSessionVerifier(fixture);
+        IActionDispatcher dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        using var registration = dispatcher.RegisterExternalAuthoritySession(session);
+        var terminalCalls = 0;
+
+        var fabricated = WithProof(fixture.Authority, "always-accept-proof", recomputeHash: true);
+        var outcome = await dispatcher.RunExternalAsync(
+            fixture.Descriptor,
+            fixture.Action,
+            (_, _) =>
+            {
+                terminalCalls++;
+                return ValueTask.FromResult(new ExternalResult("unexpected"));
+            },
+            graph.ActionSnapshot,
+            fabricated,
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
+        Assert.Equal(SidecarCapabilityErrors.Unauthenticated, outcome.Error?.Code);
+        Assert.Equal(0, terminalCalls);
     }
 
     [Fact]

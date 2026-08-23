@@ -17,6 +17,13 @@ public sealed class KernelActionDispatcher : IActionDispatcher
     private readonly IKernelActionResultSnapshotter _resultSnapshotter;
     private readonly IKernelActionRepeatEvidenceAuthority _repeatEvidenceAuthority;
     private readonly ISidecarExternalActionDispatchAuthorityVerifier? _externalAuthorityVerifier;
+    private readonly object _externalSessionSync = new();
+    private readonly Dictionary<Guid, RegisteredExternalSession> _externalSessions = [];
+
+    private sealed record RegisteredExternalSession(
+        SidecarCapabilitySession Session,
+        string BindingHash,
+        long BindingGeneration);
 
     internal KernelActionExecutionContext ExecutionContext => _executionContext;
 
@@ -52,6 +59,31 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             snapshot,
             cancellationToken);
 
+    public IExternalActionAuthoritySessionRegistration RegisterExternalAuthoritySession(
+        SidecarCapabilitySession session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        var binding = session.Binding;
+        if (binding is null || string.IsNullOrWhiteSpace(binding.Authentication.BindingHash))
+            throw new ArgumentException("The sidecar capability session has no valid binding.", nameof(session));
+
+        lock (_externalSessionSync)
+        {
+            if (_externalSessions.ContainsKey(binding.SessionId))
+                throw new InvalidOperationException(
+                    $"An external authority session is already registered for '{binding.SessionId}'.");
+
+            _externalSessions.Add(
+                binding.SessionId,
+                new RegisteredExternalSession(
+                    session,
+                    binding.Authentication.BindingHash,
+                    session.BindingGeneration));
+        }
+
+        return new ExternalAuthoritySessionRegistration(this, binding.SessionId, session);
+    }
+
     public ValueTask<IActionOutcome<TResult>> RunWithContextAsync<TAction, TResult>(
         KernelActionExecutionContext executionContext,
         ActionDescriptor<TAction, TResult> descriptor,
@@ -73,8 +105,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         SidecarExternalActionDispatchAuthority authority,
-        CancellationToken cancellationToken,
-        ISidecarExternalActionDispatchAuthorityVerifier? authorityVerifier = null)
+        CancellationToken cancellationToken)
     {
         if (authority is null)
         {
@@ -106,18 +137,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                     "The external action snapshot is not compatible with the host graph."));
         }
 
-        var trustedAuthorityVerifier = authorityVerifier ?? _externalAuthorityVerifier;
-        if (trustedAuthorityVerifier is null)
-        {
-            return ValueTask.FromResult<IActionOutcome<TResult>>(
-                KernelActionOutcome<TResult>.Failed(
-                    "ACTION_EXTERNAL_AUTHORITY_UNAVAILABLE",
-                    "A trusted external action authority verifier is required."));
-        }
-
-        var authorityResult = trustedAuthorityVerifier.ValidateAndConsume(
-            authority,
-            DateTimeOffset.UtcNow);
+        var authorityResult = ValidateExternalAuthority(authority, DateTimeOffset.UtcNow);
         if (!authorityResult.Accepted)
         {
             return ValueTask.FromResult<IActionOutcome<TResult>>(
@@ -171,6 +191,68 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             effectiveContext.Depth,
             effectiveContext.Attempt,
             cancellationToken);
+    }
+
+    private SidecarCapabilityValidationResult ValidateExternalAuthority(
+        SidecarExternalActionDispatchAuthority authority,
+        DateTimeOffset now)
+    {
+        lock (_externalSessionSync)
+        {
+            if (_externalSessions.TryGetValue(authority.Call.SessionId, out var registered))
+            {
+                var binding = registered.Session.Binding;
+                if (registered.Session.BindingGeneration != registered.BindingGeneration ||
+                    !string.Equals(
+                        binding.Authentication.BindingHash,
+                        registered.BindingHash,
+                        StringComparison.Ordinal))
+                {
+                    _externalSessions.Remove(authority.Call.SessionId);
+                    return SidecarCapabilityValidationResult.Reject(
+                        SidecarCapabilityErrors.InvalidBinding,
+                        "The registered sidecar capability session binding changed.");
+                }
+
+                var result = registered.Session.ValidateAndConsume(authority, now);
+                if (result.Code is SidecarCapabilityErrors.Disconnected or SidecarCapabilityErrors.Expired)
+                    _externalSessions.Remove(authority.Call.SessionId);
+                return result;
+            }
+
+            if (_externalAuthorityVerifier is not null)
+                return _externalAuthorityVerifier.ValidateAndConsume(authority, now);
+        }
+
+        return SidecarCapabilityValidationResult.Reject(
+            "ACTION_EXTERNAL_AUTHORITY_UNAVAILABLE",
+            "A registered external action authority session is required.");
+    }
+
+    private void RemoveExternalAuthoritySession(Guid sessionId, SidecarCapabilitySession session)
+    {
+        lock (_externalSessionSync)
+        {
+            if (_externalSessions.TryGetValue(sessionId, out var registered) &&
+                ReferenceEquals(registered.Session, session))
+                _externalSessions.Remove(sessionId);
+        }
+    }
+
+    private sealed class ExternalAuthoritySessionRegistration(
+        KernelActionDispatcher owner,
+        Guid sessionId,
+        SidecarCapabilitySession session) : IExternalActionAuthoritySessionRegistration
+    {
+        private int _disposed;
+
+        public Guid SessionId => sessionId;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                owner.RemoveExternalAuthoritySession(sessionId, session);
+        }
     }
 
     private ValueTask<IActionOutcome<TResult>> RunCoreAsync<TAction, TResult>(
@@ -252,8 +334,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
         ActionPipelineSnapshot snapshot,
         SidecarExternalActionDispatchAuthority authority,
-        CancellationToken cancellationToken,
-        ISidecarExternalActionDispatchAuthorityVerifier? authorityVerifier = null)
+        CancellationToken cancellationToken)
     {
         var outcome = await RunExternalAsync(
             descriptor,
@@ -261,8 +342,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             terminal,
             snapshot,
             authority,
-            cancellationToken,
-            authorityVerifier);
+            cancellationToken);
         return RequireResult(descriptor, outcome);
     }
 
