@@ -1,0 +1,9 @@
+# SharpClaw.Core beta22 cancellation domain evidence
+
+The objective was to align Core beta22 with the Contracts cancellation-domain correction. The plan was to pin Core to the final Contracts beta29 source, rebuild Core once, run the complete suite, and prove that a package-only consumer loads both exact assemblies.
+
+The Core source change pins the final Contracts test commit in the tracked workflow. The final source commit is fd08edbd44d2bc26749be7d2a6213988ed9f2254. It is pushed on main. The beta22 candidate was packed from this source and has length 279027 bytes with SHA-256 D2A1074CED792F82F2944EF44C02F329A83657F03F0E58A532AC8D57D83A5198. Its packed DLL SHA-256 is B274500D8E094A32B4DA21147FBEC744D178395F6F80124BC4E85D83CBC5CA17. Its packed XML SHA-256 is FFFCAFF08EBA926AB87A6B71C818175EB328BB37049FABF35F9D505C8DD776FB. Its packed nuspec SHA-256 is 8C56809B3C83837C5FF47ADC700A86BB8673A5BA0B8F91047874D4963DBFC027. The nuspec identifies beta22, source fd08edbd44d2bc26749be7d2a6213988ed9f2254, the canonical repository, and exact Contracts [0.5.0-beta29].
+
+The complete Core suite passed 211 of 211 with no skips. Exact-head CI run 32959427508 passed for the final source commit. A fresh package-only consumer restored, built, and ran with Core beta22 and Contracts beta29. It loaded Core DLL SHA-256 B274500D8E094A32B4DA21147FBEC744D178395F6F80124BC4E85D83CBC5CA17 and Contracts DLL SHA-256 65817E8ACE02EF0487069E6C2721F5255B925868B7D155C8A6CB87A94B07CCE6. Its log SHA-256 is D7AEC64A3B8956037BF16CEC60C016819B79C51DAF6011872B85333FB7C958B0. The consumer loaded SharpClaw.Core.Kernel.KernelActionDispatcher from the package.
+
+The result improves the objective. The package remains unpublished. The build reports NU1903 for System.Security.Cryptography.Xml 10.0.7. No credentials, temporary configurations, package archives, logs, caches, or generated files are in the repository. The diff passed git diff --check. The next bounded turn is Overwatch review.
