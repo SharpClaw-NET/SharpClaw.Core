@@ -1,8 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <IsPackable>true</IsPackable>
-    <Version>0.5.0-beta.19</Version>
-    <InformationalVersion>0.5.0-beta.19</InformationalVersion>
+    <Version>0.5.0-beta.20</Version>
+    <InformationalVersion>0.5.0-beta.20</InformationalVersion>
     <PackageId>SharpClaw.Core</PackageId>
     <Authors>mkn8rn</Authors>
     <Description>Host-agnostic SharpClaw direct-chat kernel with action, event, provider, and tool dispatch.</Description>
@@ -27,6 +27,6 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.8" />
-    <PackageReference Include="SharpClaw.Contracts" Version="[0.5.0-beta.26]" />
+    <PackageReference Include="SharpClaw.Contracts" Version="[0.5.0-beta.27]" />
   </ItemGroup>
 </Project>
