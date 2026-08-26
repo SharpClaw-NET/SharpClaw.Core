@@ -1,0 +1,11 @@
+# SharpClaw.Core beta22 publication evidence
+
+The objective was to publish the accepted Core beta22 archive after Contracts beta29 became available. The plan was to verify the immutable archive, prove the Core version was absent on each target feed before its push, publish Core to both authorized feeds, and complete strict consumer checks.
+
+The exact Core archive was verified before publication. It has length 279027 bytes and SHA-256 D2A1074CED792F82F2944EF44C02F329A83657F03F0E58A532AC8D57D83A5198. Its packed DLL SHA-256 is B274500D8E094A32B4DA21147FBEC744D178395F6F80124BC4E85D83CBC5CA17. Its packed XML SHA-256 is FFFCAFF08EBA926AB87A6B71C818175EB328BB37049FABF35F9D505C8DD776FB. Its packed nuspec SHA-256 is 8C56809B3C83837C5FF47ADC700A86BB8673A5BA0B8F91047874D4963DBFC027. The package identifies source fd08edbd44d2bc26749be7d2a6213988ed9f2254, the canonical repository, and exact Contracts [0.5.0-beta.29].
+
+The Core target version was absent from NuGet.org and the canonical GitHub Packages feed before each push. Core was published to NuGet.org and then to the canonical SharpClaw-NET GitHub Packages feed. The GitHub download is 279027 bytes with SHA-256 D2A1074CED792F82F2944EF44C02F329A83657F03F0E58A532AC8D57D83A5198. The NuGet.org normalized download is 292111 bytes with SHA-256 318F2C725862BC1DA4DC1EDA189928DA06D5E130FFAE40F7350E2C7C6A28F401. Both downloads contain the accepted DLL, XML, and nuspec hashes. The nuspec keeps beta22, source fd08edbd44d2bc26749be7d2a6213988ed9f2254, the canonical repository, and exact Contracts [0.5.0-beta.29].
+
+A fresh NuGet.org-only consumer restored, built, and ran with Core beta22 and Contracts beta29. A fresh GitHub-mapped consumer also restored, built, and ran. The consumer loaded Core DLL SHA-256 B274500D8E094A32B4DA21147FBEC744D178395F6F80124BC4E85D83CBC5CA17, Contracts DLL SHA-256 65817E8ACE02EF0487069E6C2721F5255B925868B7D155C8A6CB87A94B07CCE6, and SharpClaw.Core.Kernel.KernelActionDispatcher. The consumer log SHA-256 is D7AEC64A3B8956037BF16CEC60C016819B79C51DAF6011872B85333FB7C958B0.
+
+The result improves the objective. The Core publication is complete. No credential, temporary configuration, archive, cache, or log is tracked. The next bounded turn is Overwatch publication closeout review.
