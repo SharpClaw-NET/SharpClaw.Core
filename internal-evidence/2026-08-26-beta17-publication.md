@@ -1,0 +1,13 @@
+# SharpClaw.Core beta17 publication evidence
+
+The accepted Core source commit is a86b050afbcd15bd41f3c7b4166fde59081d23a9. The accepted archive identity is D409157C13DB0114471FF39D93BC7D2CCC52C833C618EA4F048B8415DCF0E970. The packed DLL identity is 799905465CB4C3EF94653AB1D80B2595712553E86ABADDDA63E880D239BF1F6E. The packed XML identity is FFFCAFF08EBA926AB87A6B71C818175EB328BB37049FABF35F9D505C8DD776FB. The packed nuspec identity is 378AF7568294D0826E9E74B96814A592F3F05EFBD8C66D9B4CB20E6322723D9A.
+
+At the start of the resumed closeout, the Core repository was clean at later source commit aecf15b956431352f70a16b8f1e1f32ab4825c6c. No source change was required. The accepted source identity remains embedded in the published package metadata.
+
+NuGet.org listed beta17 and returned HTTP 200. The normalized download was 292121 bytes with SHA-256 62B3E07863E3D61835B584FD35E02AC01D45D72D4614D1762535057154F8AF4A. Its DLL, XML, and nuspec identities were 799905465CB4C3EF94653AB1D80B2595712553E86ABADDDA63E880D239BF1F6E, FFFCAFF08EBA926AB87A6B71C818175EB328BB37049FABF35F9D505C8DD776FB, and 378AF7568294D0826E9E74B96814A592F3F05EFBD8C66D9B4CB20E6322723D9A. The nuspec binds beta17 to source a86b050afbcd15bd41f3c7b4166fde59081d23a9, the canonical repository, and exact Contracts [0.5.0-beta.24].
+
+The canonical GitHub Packages download returned HTTP 200 and matched archive SHA-256 D409157C13DB0114471FF39D93BC7D2CCC52C833C618EA4F048B8415DCF0E970. A fresh NuGet.org-only consumer restored, built, and ran. It loaded Core DLL SHA-256 799905465CB4C3EF94653AB1D80B2595712553E86ABADDDA63E880D239BF1F6E and Contracts DLL SHA-256 C432E05E2DFF0E9537285D447103F83EA25A4186DBCC03C7EFCF15B9FB7508E6. Its consumer log identity was 259441003C48EDDCC4F205B511BD65F0D8191A2E585861C07FA14F5398A72B02.
+
+A fresh GitHub-mapped consumer restored, built, and ran. The mapping selected GitHub Packages for Core and Contracts and NuGet.org for neutral dependencies. It loaded Core DLL SHA-256 799905465CB4C3EF94653AB1D80B2595712553E86ABADDDA63E880D239BF1F6E and Contracts DLL SHA-256 C432E05E2DFF0E9537285D447103F83EA25A4186DBCC03C7EFCF15B9FB7508E6. Its consumer log identity was D2AB80B5FD45C8B83FE3CAEFC7FDBF6EDDE64258F1815883804B3EA044BAAA2E.
+
+No credential value was written to a file. The Core beta17 two-feed publication proof is complete.
