@@ -13,21 +13,23 @@ internal static class KernelTestExecution
         Guid? invocationId = null)
     {
         var id = invocationId ?? Guid.NewGuid();
+        var conversationId = Guid.NewGuid();
         var value = arguments ?? JsonSerializer.SerializeToElement(new { });
         return new ToolInvocation(
             id,
-            Guid.NewGuid(),
+            conversationId,
             "call",
             toolName,
             value,
-            CreateToolContext(id, toolName, value));
+            CreateToolContext(id, toolName, value, conversationId: conversationId));
     }
 
     public static HostActionEntryRequestContext CreateToolContext(
         Guid invocationId,
         string toolName,
         JsonElement arguments,
-        ActionContext<KernelActionEnvelope>? parent = null)
+        ActionContext<KernelActionEnvelope>? parent = null,
+        Guid? conversationId = null)
     {
         var now = DateTimeOffset.UtcNow;
         var payload = JsonSerializer.SerializeToUtf8Bytes(arguments);
@@ -49,7 +51,7 @@ internal static class KernelTestExecution
                 new HostActionEntryIngressBinding(
                     HostActionEntryIngress.Tool,
                     toolName,
-                    null!),
+                    conversationId?.ToString("D")),
                 new HostActionEntryLineage(
                     SharpClawActions.Tools.Invoke,
                     1,
@@ -107,7 +109,8 @@ internal sealed class TestToolContextIssuer : IKernelToolContextIssuer
                 request.InvocationId,
                 request.ToolName,
                 request.Arguments,
-                request.ParentActionContext));
+                request.ParentActionContext,
+                request.ConversationId));
     }
 }
 
