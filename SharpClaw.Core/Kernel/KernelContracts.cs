@@ -179,8 +179,14 @@ public sealed class KernelGraphCompileOptions
     /// <summary>Exact sensitive action approvals bound to module, version, and schema identity.</summary>
     public IReadOnlyList<KernelSensitiveActionApproval> SensitiveActionApprovals { get; init; } = [];
 
+    /// <summary>Exact sensitive action approvals for neutral external module hooks.</summary>
+    public IReadOnlyList<KernelExternalSensitiveActionApproval> ExternalSensitiveActionApprovals { get; init; } = [];
+
     /// <summary>Exact sensitive event approvals bound to module, version, and schema identity.</summary>
     public IReadOnlyList<KernelSensitiveEventApproval> SensitiveEventApprovals { get; init; } = [];
+
+    /// <summary>Exact sensitive event approvals for neutral external module hooks.</summary>
+    public IReadOnlyList<KernelExternalSensitiveEventApproval> ExternalSensitiveEventApprovals { get; init; } = [];
 
     public int MaximumActionDepth { get; init; } = 32;
 
@@ -196,7 +202,9 @@ public sealed class KernelGraphCompileOptions
             EventCapabilityGrants = FreezeDictionary(source.EventCapabilityGrants),
             EventModuleCapabilityGrants = FreezeNestedDictionary(source.EventModuleCapabilityGrants),
             SensitiveActionApprovals = FreezeList(source.SensitiveActionApprovals),
+            ExternalSensitiveActionApprovals = FreezeList(source.ExternalSensitiveActionApprovals),
             SensitiveEventApprovals = FreezeList(source.SensitiveEventApprovals),
+            ExternalSensitiveEventApprovals = FreezeList(source.ExternalSensitiveEventApprovals),
             MaximumActionDepth = source.MaximumActionDepth
         };
     }
@@ -241,12 +249,25 @@ public sealed record KernelSensitiveActionApproval(
     string ResultType,
     string SchemaIdentity);
 
+public sealed record KernelExternalSensitiveActionApproval(
+    string ModuleId,
+    SharpClawActionKey ActionKey,
+    int ActionVersion,
+    JsonSchemaReference InputSchema,
+    JsonSchemaReference ResultSchema);
+
 public sealed record KernelSensitiveEventApproval(
     string ModuleId,
     SharpClawEventKey EventKey,
     int EventVersion,
     string EventType,
     string SchemaIdentity);
+
+public sealed record KernelExternalSensitiveEventApproval(
+    string ModuleId,
+    SharpClawEventKey EventKey,
+    int EventVersion,
+    JsonSchemaReference PayloadSchema);
 
 public sealed record KernelContinuationRequest(
     Guid InvocationId,
@@ -631,7 +652,9 @@ public sealed record KernelQueuedEvent(
 public sealed record KernelToolRegistration(
     ToolDescriptor Descriptor,
     string OwnerModuleId,
-    Type HandlerType);
+    Type HandlerType,
+    IToolHandler? Handler = null,
+    string? HandlerIdentity = null);
 
 public sealed class KernelGraphCompilationException(string message) : InvalidOperationException(message);
 

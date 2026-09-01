@@ -221,10 +221,11 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
                                     tool.Descriptor.Name,
                                     handlerResolution.SelectedToolName,
                                     StringComparison.Ordinal));
-                            var handler = KernelServiceResolution.Resolve(
-                                handlerRegistration.HandlerType,
-                                _serviceProvider);
-                            if (handler is not IToolHandler typedHandler)
+                            var typedHandler = handlerRegistration.Handler
+                                ?? KernelServiceResolution.Resolve(
+                                    handlerRegistration.HandlerType,
+                                    _serviceProvider) as IToolHandler;
+                            if (typedHandler is null)
                                 throw new KernelActionExecutionException(
                                     $"Tool handler '{handlerRegistration.HandlerType.FullName}' does not implement IToolHandler.");
                             EnsureEffectiveInvocation(effectiveHandlerInvocation, authority, "handler-before-call");

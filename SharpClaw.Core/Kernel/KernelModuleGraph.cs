@@ -15,7 +15,11 @@ internal sealed record KernelModuleDeclaration(
     ExclusiveRegistration? ConversationResolverRegistration,
     Type? ProfileResolver,
     ExclusiveRegistration? ProfileResolverRegistration,
-    IReadOnlyList<Type> ContextContributors);
+    IReadOnlyList<Type> ContextContributors,
+    KernelBoundContribution<IConversationResolver>? BoundConversationResolver,
+    KernelBoundContribution<IChatProfileResolver>? BoundProfileResolver,
+    KernelBoundContribution<IConversationStore>? BoundConversationStore,
+    IReadOnlyList<KernelBoundContribution<IChatContextContributor>> BoundContextContributors);
 
 public sealed record KernelCompiledModule(
     ModuleIdentity Identity,
@@ -26,14 +30,22 @@ public sealed record KernelCompiledModule(
     ExclusiveRegistration? ConversationResolverRegistration,
     Type? ProfileResolver,
     ExclusiveRegistration? ProfileResolverRegistration,
-    IReadOnlyList<Type> ContextContributors);
+    IReadOnlyList<Type> ContextContributors,
+    string? BoundConversationResolverIdentity,
+    string? BoundProfileResolverIdentity,
+    string? BoundConversationStoreIdentity,
+    IReadOnlyList<string> BoundContextContributorIdentities);
 
 public sealed class KernelModuleGraph
 {
     internal KernelModuleGraph(
         IReadOnlyList<KernelCompiledModule> modules,
         IServiceProvider services,
-        IReadOnlyList<string> hashRecords)
+        IReadOnlyList<string> hashRecords,
+        IConversationResolver? boundConversationResolver,
+        IChatProfileResolver? boundProfileResolver,
+        IConversationStore? boundConversationStore,
+        IReadOnlyList<IChatContextContributor> boundContextContributors)
     {
         Modules = modules;
         Services = services;
@@ -43,6 +55,10 @@ public sealed class KernelModuleGraph
         ContextContributors = modules.SelectMany(module => module.ContextContributors).ToArray();
         ConversationResolver = modules.Select(module => module.ConversationResolver).SingleOrDefault(type => type is not null);
         ProfileResolver = modules.Select(module => module.ProfileResolver).SingleOrDefault(type => type is not null);
+        BoundConversationResolver = boundConversationResolver;
+        BoundProfileResolver = boundProfileResolver;
+        BoundConversationStore = boundConversationStore;
+        BoundContextContributors = boundContextContributors;
     }
 
     public IReadOnlyList<KernelCompiledModule> Modules { get; }
@@ -56,6 +72,14 @@ public sealed class KernelModuleGraph
     public Type? ConversationResolver { get; }
 
     public Type? ProfileResolver { get; }
+
+    public IConversationResolver? BoundConversationResolver { get; }
+
+    public IChatProfileResolver? BoundProfileResolver { get; }
+
+    public IConversationStore? BoundConversationStore { get; }
+
+    public IReadOnlyList<IChatContextContributor> BoundContextContributors { get; }
 
     internal IServiceProvider Services { get; }
 
@@ -105,12 +129,28 @@ internal static class KernelModuleGraphCompiler
                 declaration.ConversationResolverRegistration,
                 declaration.ProfileResolver,
                 declaration.ProfileResolverRegistration,
-                new ReadOnlyCollection<Type>(declaration.ContextContributors.ToArray())))
+                new ReadOnlyCollection<Type>(declaration.ContextContributors.ToArray()),
+                declaration.BoundConversationResolver?.Identity,
+                declaration.BoundProfileResolver?.Identity,
+                declaration.BoundConversationStore?.Identity,
+                new ReadOnlyCollection<string>(declaration.BoundContextContributors
+                    .Select(value => value.Identity)
+                    .ToArray())))
             .ToArray();
         return new KernelModuleGraph(
             new ReadOnlyCollection<KernelCompiledModule>(modules),
             provider,
-            new ReadOnlyCollection<string>(BuildHashRecords(declarations).ToArray()));
+            new ReadOnlyCollection<string>(BuildHashRecords(declarations).ToArray()),
+            declarations.Select(value => value.BoundConversationResolver?.Handler)
+                .SingleOrDefault(value => value is not null),
+            declarations.Select(value => value.BoundProfileResolver?.Handler)
+                .SingleOrDefault(value => value is not null),
+            declarations.Select(value => value.BoundConversationStore?.Handler)
+                .SingleOrDefault(value => value is not null),
+            new ReadOnlyCollection<IChatContextContributor>(declarations
+                .SelectMany(value => value.BoundContextContributors)
+                .Select(value => value.Handler)
+                .ToArray()));
     }
 
     private static void ValidateModuleIdentities(IReadOnlyList<KernelModuleDeclaration> declarations)
@@ -133,18 +173,33 @@ internal static class KernelModuleGraphCompiler
         ValidateExclusiveSlot(
             "conversation resolver",
             declarations
-                .Where(value => value.ConversationResolver is not null)
-                .Select(value => (value.Identity.Id, value.ConversationResolver!, value.ConversationResolverRegistration)));
+                .Where(value => value.ConversationResolver is not null || value.BoundConversationResolver is not null)
+                .Select(value => (
+                    value.Identity.Id,
+                    value.ConversationResolver?.AssemblyQualifiedName
+                    ?? value.BoundConversationResolver!.Identity,
+                    value.ConversationResolverRegistration)));
         ValidateExclusiveSlot(
             "chat profile resolver",
             declarations
-                .Where(value => value.ProfileResolver is not null)
-                .Select(value => (value.Identity.Id, value.ProfileResolver!, value.ProfileResolverRegistration)));
+                .Where(value => value.ProfileResolver is not null || value.BoundProfileResolver is not null)
+                .Select(value => (
+                    value.Identity.Id,
+                    value.ProfileResolver?.AssemblyQualifiedName
+                    ?? value.BoundProfileResolver!.Identity,
+                    value.ProfileResolverRegistration)));
+        var stores = declarations
+            .Where(value => value.BoundConversationStore is not null)
+            .Select(value => value.Identity.Id)
+            .ToArray();
+        if (stores.Length > 1)
+            throw new KernelGraphCompilationException(
+                $"The conversation store has competing claims from modules '{string.Join("', '", stores)}'.");
     }
 
     private static void ValidateExclusiveSlot(
         string slot,
-        IEnumerable<(string ModuleId, Type Type, ExclusiveRegistration? Registration)> claims)
+        IEnumerable<(string ModuleId, string HandlerIdentity, ExclusiveRegistration? Registration)> claims)
     {
         var values = claims.ToArray();
         foreach (var value in values)
@@ -296,13 +351,20 @@ internal static class KernelModuleGraphCompiler
                              KernelGraphHasher.Flatten("value", storage).JoinWith(";");
             yield return $"module.chat.conversation|{declaration.Identity.Id}|" +
                          $"{declaration.ConversationResolver?.AssemblyQualifiedName}|" +
+                         $"{declaration.BoundConversationResolver?.Identity}|" +
                          declaration.ConversationResolverRegistration?.Id;
             yield return $"module.chat.profile|{declaration.Identity.Id}|" +
                          $"{declaration.ProfileResolver?.AssemblyQualifiedName}|" +
+                         $"{declaration.BoundProfileResolver?.Identity}|" +
                          declaration.ProfileResolverRegistration?.Id;
+            yield return $"module.chat.store|{declaration.Identity.Id}|" +
+                         declaration.BoundConversationStore?.Identity;
             foreach (var contributor in declaration.ContextContributors
                          .OrderBy(type => type.AssemblyQualifiedName, StringComparer.Ordinal))
                 yield return $"module.chat.contributor|{declaration.Identity.Id}|{contributor.AssemblyQualifiedName}";
+            foreach (var contributor in declaration.BoundContextContributors
+                         .OrderBy(value => value.Identity, StringComparer.Ordinal))
+                yield return $"module.chat.contributor|{declaration.Identity.Id}|{contributor.Identity}";
         }
     }
 

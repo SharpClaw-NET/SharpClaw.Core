@@ -50,7 +50,23 @@ public sealed class KernelGraphBuilder
         _events.Add(new EventDefinitionRegistration<TEvent>(descriptor, ownerModuleId));
 
     public void AddTool<THandler>(ToolDescriptor descriptor, string ownerModuleId = "core") =>
-        _tools.Add(new KernelToolRegistration(descriptor, ownerModuleId, typeof(THandler)));
+        _tools.Add(new KernelToolRegistration(
+            descriptor,
+            ownerModuleId,
+            typeof(THandler),
+            HandlerIdentity: typeof(THandler).AssemblyQualifiedName));
+
+    internal void AddBoundTool(
+        ToolDescriptor descriptor,
+        string ownerModuleId,
+        IToolHandler handler,
+        string handlerIdentity) =>
+        _tools.Add(new KernelToolRegistration(
+            descriptor,
+            ownerModuleId,
+            handler.GetType(),
+            handler,
+            handlerIdentity));
 
     public KernelGraph Compile(
         IServiceProvider? serviceProvider = null,
@@ -293,9 +309,14 @@ public sealed class KernelSnapshotCompiler
             if (!typeof(IToolHandler).IsAssignableFrom(tool.HandlerType))
                 throw new KernelGraphCompilationException(
                     $"Tool handler '{tool.HandlerType.FullName}' does not implement IToolHandler.");
+            IToolHandler handler;
             try
             {
-                if (KernelServiceResolution.Resolve(tool.HandlerType, serviceProvider) is not IToolHandler)
+                handler = tool.Handler
+                    ?? KernelServiceResolution.Resolve(tool.HandlerType, serviceProvider) as IToolHandler
+                    ?? throw new KernelGraphCompilationException(
+                        $"Tool handler '{tool.HandlerType.FullName}' cannot be resolved as IToolHandler.");
+                if (handler is null)
                     throw new KernelGraphCompilationException(
                         $"Tool handler '{tool.HandlerType.FullName}' cannot be resolved as IToolHandler.");
             }
@@ -309,7 +330,11 @@ public sealed class KernelSnapshotCompiler
                     $"Module '{tool.OwnerModuleId}' tool handler '{tool.HandlerType.FullName}' " +
                     $"cannot be resolved: {exception.Message}");
             }
-            result.Add(tool);
+            result.Add(tool with
+            {
+                Handler = handler,
+                HandlerIdentity = tool.HandlerIdentity ?? tool.HandlerType.AssemblyQualifiedName,
+            });
         }
 
         return new ReadOnlyCollection<KernelToolRegistration>(result);
@@ -369,7 +394,7 @@ public sealed class KernelSnapshotCompiler
         foreach (var tool in tools.OrderBy(tool => tool.Descriptor.Name, StringComparer.Ordinal))
         {
             records.AddRange(KernelGraphHasher.Flatten("tool.descriptor", tool.Descriptor));
-            records.Add($"tool.owner|{tool.OwnerModuleId}|{tool.HandlerType.AssemblyQualifiedName}");
+            records.Add($"tool.owner|{tool.OwnerModuleId}|{tool.HandlerIdentity}");
         }
         foreach (var hook in actionHooks
                      .OrderBy(hook => hook.OwnerModuleId, StringComparer.Ordinal)
@@ -377,21 +402,29 @@ public sealed class KernelSnapshotCompiler
                      .ThenBy(hook => hook.Key?.Value, StringComparer.Ordinal)
                      .ThenBy(hook => hook.Category, StringComparer.Ordinal)
                      .ThenBy(hook => hook.Ordering.Id, StringComparer.Ordinal))
-            records.AddRange(KernelGraphHasher.Flatten("action.registration", hook));
+            records.Add(
+                $"action.registration|{hook.OwnerModuleId}|{hook.TargetKind}|{hook.Key?.Value}|" +
+                $"{hook.Category}|{hook.HandlerIdentity}|{hook.IsUntyped}|" +
+                KernelGraphHasher.Flatten("ordering", hook.Ordering).JoinWith(";"));
         foreach (var hook in eventHooks
                      .OrderBy(hook => hook.OwnerModuleId, StringComparer.Ordinal)
                      .ThenBy(hook => hook.TargetKind)
                      .ThenBy(hook => hook.Key?.Value, StringComparer.Ordinal)
                      .ThenBy(hook => hook.Category, StringComparer.Ordinal)
                      .ThenBy(hook => hook.Ordering.Id, StringComparer.Ordinal))
-            records.AddRange(KernelGraphHasher.Flatten("event.registration", hook));
+            records.Add(
+                $"event.registration|{hook.OwnerModuleId}|{hook.TargetKind}|{hook.Key?.Value}|" +
+                $"{hook.Category}|{hook.HandlerIdentity}|{hook.IsUntyped}|{hook.Kind}|{hook.Delivery}|" +
+                KernelGraphHasher.Flatten("ordering", hook.Ordering).JoinWith(";"));
         records.AddRange(modules.HashRecords);
         AddDictionary(records, "action.grant", options.ActionCapabilityGrants);
         AddDictionary(records, "event.grant", options.EventCapabilityGrants);
         AddNestedDictionary(records, "action.module-grant", options.ActionModuleCapabilityGrants);
         AddNestedDictionary(records, "event.module-grant", options.EventModuleCapabilityGrants);
         AddApprovalBoundary(records, "sensitive.action", options.SensitiveActionApprovals);
+        AddApprovalBoundary(records, "sensitive.external-action", options.ExternalSensitiveActionApprovals);
         AddApprovalBoundary(records, "sensitive.event", options.SensitiveEventApprovals);
+        AddApprovalBoundary(records, "sensitive.external-event", options.ExternalSensitiveEventApprovals);
         foreach (var approval in (options.SensitiveActionApprovals ?? []).OrderBy(approval => approval.ModuleId, StringComparer.Ordinal)
                      .ThenBy(approval => approval.ActionKey.Value, StringComparer.Ordinal)
                      .ThenBy(approval => approval.ActionVersion)
@@ -405,6 +438,14 @@ public sealed class KernelSnapshotCompiler
                      .ThenBy(approval => approval.EventType, StringComparer.Ordinal)
                      .ThenBy(approval => approval.SchemaIdentity, StringComparer.Ordinal))
             records.AddRange(KernelGraphHasher.Flatten("sensitive.event", approval));
+        foreach (var approval in (options.ExternalSensitiveActionApprovals ?? []).OrderBy(approval => approval.ModuleId, StringComparer.Ordinal)
+                     .ThenBy(approval => approval.ActionKey.Value, StringComparer.Ordinal)
+                     .ThenBy(approval => approval.ActionVersion))
+            records.AddRange(KernelGraphHasher.Flatten("sensitive.external-action", approval));
+        foreach (var approval in (options.ExternalSensitiveEventApprovals ?? []).OrderBy(approval => approval.ModuleId, StringComparer.Ordinal)
+                     .ThenBy(approval => approval.EventKey.Value, StringComparer.Ordinal)
+                     .ThenBy(approval => approval.EventVersion))
+            records.AddRange(KernelGraphHasher.Flatten("sensitive.external-event", approval));
 
         var content = string.Join("\n", records);
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(content)));
@@ -647,8 +688,9 @@ public sealed class KernelGraph
 
     public KernelChatContextAssembler CreateChatContextAssembler(KernelActionDispatcher dispatcher) =>
         new(this, dispatcher, Modules.ContextContributors.Select(type =>
-            (IChatContextContributor)(GetService(type) ?? throw new KernelGraphCompilationException(
-                $"Chat context contributor '{type.FullName}' is not registered."))));
+                (IChatContextContributor)(GetService(type) ?? throw new KernelGraphCompilationException(
+                    $"Chat context contributor '{type.FullName}' is not registered.")))
+            .Concat(Modules.BoundContextContributors));
 
     public bool ContainsAction(SharpClawActionKey key) => _actions.ContainsKey(key.Value);
 
@@ -868,7 +910,9 @@ public sealed class KernelGraph
             EventCapabilityGrants = _compileOptions.EventCapabilityGrants,
             EventModuleCapabilityGrants = _compileOptions.EventModuleCapabilityGrants,
             SensitiveActionApprovals = approvals,
+            ExternalSensitiveActionApprovals = _compileOptions.ExternalSensitiveActionApprovals,
             SensitiveEventApprovals = _compileOptions.SensitiveEventApprovals,
+            ExternalSensitiveEventApprovals = _compileOptions.ExternalSensitiveEventApprovals,
             MaximumActionDepth = _compileOptions.MaximumActionDepth,
         });
     }
@@ -992,9 +1036,11 @@ internal sealed record KernelActionHookRegistration(
     SharpClawActionKey? Key,
     string? Category,
     Type HandlerType,
+    IAnyActionInterceptor? BoundHandler,
     bool IsUntyped,
     HookOrdering Ordering,
-    string OwnerModuleId);
+    string OwnerModuleId,
+    string HandlerIdentity);
 
 internal enum KernelEventHookKind
 {
@@ -1007,11 +1053,13 @@ internal sealed record KernelEventHookRegistration(
     SharpClawEventKey? Key,
     string? Category,
     Type HandlerType,
+    object? BoundHandler,
     bool IsUntyped,
     KernelEventHookKind Kind,
     EventDelivery Delivery,
     HookOrdering Ordering,
-    string OwnerModuleId);
+    string OwnerModuleId,
+    string HandlerIdentity);
 
 internal interface IActionDefinitionRegistration
 {
@@ -1114,12 +1162,14 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
                     throw new KernelGraphCompilationException(
                         $"'{hook.HandlerType.FullName}' does not implement IAnyActionInterceptor.");
                 frames.Add(new AnyActionFrame<TAction, TResult>(
-                    (IAnyActionInterceptor)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider),
+                    hook.BoundHandler
+                    ?? (IAnyActionInterceptor)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider),
                     hook.TargetKind,
                     hook.Key,
                     hook.Category,
                     hook.Ordering,
                     hook.OwnerModuleId,
+                    hook.HandlerIdentity,
                     hookCapabilities,
                     hookSensitiveApproved));
             }
@@ -1138,6 +1188,7 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
                     hook.Category,
                     hook.Ordering,
                     hook.OwnerModuleId,
+                    hook.HandlerIdentity,
                     hookCapabilities,
                     hookSensitiveApproved));
             }
@@ -1228,6 +1279,15 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
     {
         if (!descriptor.ContainsSensitiveData)
             return true;
+        if ((options.ExternalSensitiveActionApprovals ?? []).Any(approval =>
+                approval.ModuleId == moduleId &&
+                approval.ActionKey == descriptor.Key &&
+                approval.ActionVersion == descriptor.Version &&
+                approval.InputSchema == descriptor.InputSchema &&
+                approval.ResultSchema == descriptor.ResultSchema))
+        {
+            return true;
+        }
         if (externalContractIdentity is not null)
         {
             return (options.SensitiveActionApprovals ?? []).Any(approval =>
@@ -1348,12 +1408,14 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         throw new KernelGraphCompilationException(
                             $"'{hook.HandlerType.FullName}' does not implement IAnyEventInterceptor.");
                     interceptors.Add(new AnyEventFrame<TEvent>(
-                        (IAnyEventInterceptor)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider),
+                        hook.BoundHandler as IAnyEventInterceptor
+                        ?? (IAnyEventInterceptor)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider),
                         hook.TargetKind,
                         hook.Key,
                         hook.Category,
                         hook.Ordering,
                         hook.OwnerModuleId,
+                        hook.HandlerIdentity,
                         hookCapabilities,
                         hookSensitiveApproved));
                 }
@@ -1372,6 +1434,7 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         hook.Category,
                         hook.Ordering,
                         hook.OwnerModuleId,
+                        hook.HandlerIdentity,
                         hookCapabilities,
                         hookSensitiveApproved));
                 }
@@ -1384,7 +1447,8 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         throw new KernelGraphCompilationException(
                             $"'{hook.HandlerType.FullName}' does not implement IAnyEventListener.");
                     listeners.Add(new KernelEventListener<TEvent>(
-                        (IAnyEventListener)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider),
+                        hook.BoundHandler as IAnyEventListener
+                        ?? (IAnyEventListener)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider),
                         hook.Delivery,
                         hook.Ordering.Id,
                         hook.TargetKind,
@@ -1392,6 +1456,7 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         hook.Category,
                         hook.OwnerModuleId,
                         hook.HandlerType,
+                        hook.HandlerIdentity,
                         hook.Ordering,
                         hookCapabilities,
                         hookSensitiveApproved));
@@ -1413,6 +1478,7 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         hook.Category,
                         hook.OwnerModuleId,
                         hook.HandlerType,
+                        hook.HandlerIdentity,
                         hook.Ordering,
                         hookCapabilities,
                         hookSensitiveApproved));
@@ -1505,6 +1571,15 @@ internal sealed class EventDefinitionRegistration<TEvent>(
     {
         if (!descriptor.ContainsSensitiveData)
             return true;
+        var payloadSchema = KernelSchemaIdentity.EventPayload(descriptor, eventType);
+        if ((options.ExternalSensitiveEventApprovals ?? []).Any(approval =>
+                approval.ModuleId == moduleId &&
+                approval.EventKey == descriptor.Key &&
+                approval.EventVersion == descriptor.Version &&
+                approval.PayloadSchema == payloadSchema))
+        {
+            return true;
+        }
         var schema = KernelSchemaIdentity.Event(descriptor, eventType);
         return (options.SensitiveEventApprovals ?? []).Any(approval =>
             approval.ModuleId == moduleId &&
@@ -1705,7 +1780,7 @@ public static class KernelSchemaIdentity
         return TypeSchema("action.result", descriptor.Key.Value, descriptor.Version, resultType);
     }
 
-    internal static JsonSchemaReference EventPayload<TEvent>(
+    public static JsonSchemaReference EventPayload<TEvent>(
         EventDescriptor<TEvent> descriptor,
         Type eventType) =>
         TypeSchema("event.payload", descriptor.Key.Value, descriptor.Version, eventType);
@@ -1818,7 +1893,7 @@ internal sealed class CompiledActionDefinition<TAction, TResult>(
             $"{string.Join(";", frame.Ordering.Before ?? [])}|{string.Join(";", frame.Ordering.After ?? [])}|" +
             $"{KernelGraphHasher.StableScalar(frame.Ordering.Timeout)}|" +
             $"{KernelGraphHasher.StableScalar(frame.Ordering.FailurePolicy)}|{frame.OwnerModuleId}|" +
-            $"{frame.HandlerType.AssemblyQualifiedName}|{frame.IsUntyped}|" +
+            $"{frame.HandlerIdentity}|{frame.IsUntyped}|" +
             $"{KernelGraphHasher.StableScalar((int)frame.EffectiveCapabilities)}|" +
             $"{KernelGraphHasher.StableScalar(frame.SensitiveApproved)}")]);
 
@@ -1851,6 +1926,8 @@ internal interface IActionFrame<TAction, TResult>
 
     Type HandlerType { get; }
 
+    string HandlerIdentity { get; }
+
     ActionInterceptionCapabilities EffectiveCapabilities { get; }
 
     bool SensitiveApproved { get; }
@@ -1863,6 +1940,7 @@ internal sealed class TypedActionFrame<TAction, TResult>(
     string? targetCategory,
     HookOrdering ordering,
     string ownerModuleId,
+    string handlerIdentity,
     ActionInterceptionCapabilities effectiveCapabilities,
     bool sensitiveApproved)
     : IActionFrame<TAction, TResult>
@@ -1883,6 +1961,8 @@ internal sealed class TypedActionFrame<TAction, TResult>(
 
     public Type HandlerType => Interceptor.GetType();
 
+    public string HandlerIdentity { get; } = handlerIdentity;
+
     public ActionInterceptionCapabilities EffectiveCapabilities { get; } = effectiveCapabilities;
 
     public bool SensitiveApproved { get; } = sensitiveApproved;
@@ -1895,6 +1975,7 @@ internal sealed class AnyActionFrame<TAction, TResult>(
     string? targetCategory,
     HookOrdering ordering,
     string ownerModuleId,
+    string handlerIdentity,
     ActionInterceptionCapabilities effectiveCapabilities,
     bool sensitiveApproved)
     : IActionFrame<TAction, TResult>
@@ -1914,6 +1995,8 @@ internal sealed class AnyActionFrame<TAction, TResult>(
     public string OwnerModuleId { get; } = ownerModuleId;
 
     public Type HandlerType => Interceptor.GetType();
+
+    public string HandlerIdentity { get; } = handlerIdentity;
 
     public ActionInterceptionCapabilities EffectiveCapabilities { get; } = effectiveCapabilities;
 
@@ -2003,13 +2086,13 @@ internal sealed class CompiledEventDefinition<TEvent>(
             $"{string.Join(";", frame.Ordering.Before ?? [])}|{string.Join(";", frame.Ordering.After ?? [])}|" +
             $"{KernelGraphHasher.StableScalar(frame.Ordering.Timeout)}|" +
             $"{KernelGraphHasher.StableScalar(frame.Ordering.FailurePolicy)}|{frame.OwnerModuleId}|" +
-            $"{frame.HandlerType.AssemblyQualifiedName}|{frame.IsUntyped}|" +
+            $"{frame.HandlerIdentity}|{frame.IsUntyped}|" +
             $"{KernelGraphHasher.StableScalar((int)frame.EffectiveCapabilities)}|" +
             $"{KernelGraphHasher.StableScalar(frame.SensitiveApproved)}"),
             ..Listeners.Select(listener =>
                 $"l|{KernelGraphHasher.StableScalar(listener.TargetKind)}|{listener.TargetKey?.Value}|" +
                 $"{listener.TargetCategory}|{listener.Id}|{listener.OwnerModuleId}|" +
-                $"{listener.HandlerType.AssemblyQualifiedName}|{KernelGraphHasher.StableScalar(listener.Delivery)}|" +
+                $"{listener.HandlerIdentity}|{KernelGraphHasher.StableScalar(listener.Delivery)}|" +
                 $"{KernelGraphHasher.StableScalar(listener.Ordering.Priority)}|" +
                 $"{string.Join(";", listener.Ordering.Before ?? [])}|" +
                 $"{string.Join(";", listener.Ordering.After ?? [])}|" +
@@ -2043,6 +2126,8 @@ internal interface IEventFrame<TEvent>
 
     Type HandlerType { get; }
 
+    string HandlerIdentity { get; }
+
     EventInterceptionCapabilities EffectiveCapabilities { get; }
 
     bool SensitiveApproved { get; }
@@ -2055,6 +2140,7 @@ internal sealed class TypedEventFrame<TEvent>(
     string? targetCategory,
     HookOrdering ordering,
     string ownerModuleId,
+    string handlerIdentity,
     EventInterceptionCapabilities effectiveCapabilities,
     bool sensitiveApproved) : IEventFrame<TEvent>
 {
@@ -2074,6 +2160,8 @@ internal sealed class TypedEventFrame<TEvent>(
 
     public Type HandlerType => Interceptor.GetType();
 
+    public string HandlerIdentity { get; } = handlerIdentity;
+
     public EventInterceptionCapabilities EffectiveCapabilities { get; } = effectiveCapabilities;
 
     public bool SensitiveApproved { get; } = sensitiveApproved;
@@ -2086,6 +2174,7 @@ internal sealed class AnyEventFrame<TEvent>(
     string? targetCategory,
     HookOrdering ordering,
     string ownerModuleId,
+    string handlerIdentity,
     EventInterceptionCapabilities effectiveCapabilities,
     bool sensitiveApproved) : IEventFrame<TEvent>
 {
@@ -2105,6 +2194,8 @@ internal sealed class AnyEventFrame<TEvent>(
 
     public Type HandlerType => Interceptor.GetType();
 
+    public string HandlerIdentity { get; } = handlerIdentity;
+
     public EventInterceptionCapabilities EffectiveCapabilities { get; } = effectiveCapabilities;
 
     public bool SensitiveApproved { get; } = sensitiveApproved;
@@ -2119,6 +2210,7 @@ internal sealed record KernelEventListener<TEvent>(
     string? TargetCategory,
     string OwnerModuleId,
     Type HandlerType,
+    string HandlerIdentity,
     HookOrdering Ordering,
     EventInterceptionCapabilities EffectiveCapabilities,
     bool SensitiveApproved);
@@ -2175,9 +2267,11 @@ public sealed class KernelActionHookRegistrationBuilder(
             key,
             category,
             typeof(TInterceptor),
+            null,
             false,
             ordering,
-            ownerModuleId));
+            ownerModuleId,
+            typeof(TInterceptor).AssemblyQualifiedName!));
 
     public void UseAny<TInterceptor>(HookOrdering ordering) =>
         builder.AddActionHook(new KernelActionHookRegistration(
@@ -2185,9 +2279,11 @@ public sealed class KernelActionHookRegistrationBuilder(
             key,
             category,
             typeof(TInterceptor),
+            null,
             true,
             ordering,
-            ownerModuleId));
+            ownerModuleId,
+            typeof(TInterceptor).AssemblyQualifiedName!));
 }
 
 public sealed class KernelEventHookBuilder(
@@ -2234,11 +2330,13 @@ public sealed class KernelEventHookRegistrationBuilder(
             key,
             category,
             handlerType,
+            null,
             isUntyped,
             kind,
             delivery,
             ordering,
-            ownerModuleId));
+            ownerModuleId,
+            handlerType.AssemblyQualifiedName!));
 }
 
 public sealed class KernelModuleRegistry
@@ -2339,13 +2437,15 @@ public sealed class KernelModuleRegistry
     }
 }
 
-public sealed class KernelModuleBuilder : ISharpClawModuleBuilder
+public sealed class KernelModuleBuilder : ISharpClawModuleBuilder, IBoundModuleContributionBuilder
 {
     private readonly ModuleIdentity _identity;
+    private readonly KernelGraphBuilder _graphBuilder;
 
     public KernelModuleBuilder(KernelGraphBuilder graphBuilder, ModuleIdentity identity)
     {
         _identity = identity;
+        _graphBuilder = graphBuilder;
         Actions = new KernelActionDefinitionBuilder(graphBuilder, identity.Id);
         Events = new KernelEventDefinitionBuilder(graphBuilder, identity.Id);
         Hooks = new KernelActionHookBuilder(graphBuilder, identity.Id);
@@ -2375,6 +2475,136 @@ public sealed class KernelModuleBuilder : ISharpClawModuleBuilder
 
     public IEventHookBuilder EventHooks { get; }
 
+    public void AddActionHook(
+        SidecarActionSubscription subscription,
+        IAnyActionInterceptor interceptor,
+        string handlerId)
+    {
+        ValidateBoundHandler(subscription.Ordering, subscription.PayloadMode, handlerId);
+        ArgumentNullException.ThrowIfNull(interceptor);
+        _graphBuilder.AddActionHook(new KernelActionHookRegistration(
+            ToKernelTarget(subscription.TargetKind),
+            subscription.ActionKey,
+            subscription.Category,
+            interceptor.GetType(),
+            interceptor,
+            true,
+            subscription.Ordering,
+            _identity.Id,
+            handlerId));
+    }
+
+    public void AddEventInterceptor(
+        SidecarEventSubscription subscription,
+        IAnyEventInterceptor interceptor,
+        string handlerId)
+    {
+        ArgumentNullException.ThrowIfNull(interceptor);
+        AddEventHandler(
+            subscription,
+            interceptor,
+            handlerId,
+            SidecarEventSubscriptionKind.Interceptor,
+            KernelEventHookKind.Interceptor);
+    }
+
+    public void AddEventListener(
+        SidecarEventSubscription subscription,
+        IAnyEventListener listener,
+        string handlerId)
+    {
+        ArgumentNullException.ThrowIfNull(listener);
+        AddEventHandler(
+            subscription,
+            listener,
+            handlerId,
+            SidecarEventSubscriptionKind.Listener,
+            KernelEventHookKind.Listener);
+    }
+
+    public void AddTool(
+        ToolDescriptor descriptor,
+        IToolHandler handler,
+        string handlerId)
+    {
+        ArgumentNullException.ThrowIfNull(descriptor);
+        ArgumentNullException.ThrowIfNull(handler);
+        ArgumentException.ThrowIfNullOrWhiteSpace(handlerId);
+        _graphBuilder.AddBoundTool(descriptor, _identity.Id, handler, handlerId);
+    }
+
+    public void UseConversationResolver(
+        IConversationResolver resolver,
+        ExclusiveRegistration registration,
+        string handlerId) =>
+        ((KernelChatLifecycleBuilder)Chat).UseBoundConversationResolver(
+            resolver,
+            registration,
+            handlerId);
+
+    public void UseChatProfileResolver(
+        IChatProfileResolver resolver,
+        ExclusiveRegistration registration,
+        string handlerId) =>
+        ((KernelChatLifecycleBuilder)Chat).UseBoundChatProfileResolver(
+            resolver,
+            registration,
+            handlerId);
+
+    public void UseConversationStore(IConversationStore store, string handlerId) =>
+        ((KernelChatLifecycleBuilder)Chat).UseBoundConversationStore(store, handlerId);
+
+    public void AddContextContributor(
+        IChatContextContributor contributor,
+        string handlerId) =>
+        ((KernelChatLifecycleBuilder)Chat).AddBoundContextContributor(contributor, handlerId);
+
+    private void AddEventHandler(
+        SidecarEventSubscription subscription,
+        object handler,
+        string handlerId,
+        SidecarEventSubscriptionKind expectedKind,
+        KernelEventHookKind kind)
+    {
+        ValidateBoundHandler(subscription.Ordering, subscription.PayloadMode, handlerId);
+        if (subscription.Kind != expectedKind)
+            throw new KernelGraphCompilationException("The event subscription kind does not match its bound handler.");
+        _graphBuilder.AddEventHook(new KernelEventHookRegistration(
+            ToKernelTarget(subscription.TargetKind),
+            subscription.EventKey,
+            subscription.Category,
+            handler.GetType(),
+            handler,
+            true,
+            kind,
+            subscription.Delivery,
+            subscription.Ordering,
+            _identity.Id,
+            handlerId));
+    }
+
+    private static void ValidateBoundHandler(
+        HookOrdering ordering,
+        SidecarPayloadMode payloadMode,
+        string handlerId)
+    {
+        ArgumentNullException.ThrowIfNull(ordering);
+        ArgumentException.ThrowIfNullOrWhiteSpace(handlerId);
+        if (payloadMode != SidecarPayloadMode.Untyped)
+            throw new KernelGraphCompilationException("A bound external hook must use the untyped payload mode.");
+        if (!string.Equals(ordering.Id, handlerId, StringComparison.Ordinal))
+            throw new KernelGraphCompilationException("A bound external hook id must match its ordering id.");
+    }
+
+    private static KernelHookTargetKind ToKernelTarget(SidecarHookTargetKind targetKind) =>
+        targetKind switch
+        {
+            SidecarHookTargetKind.Exact => KernelHookTargetKind.Exact,
+            SidecarHookTargetKind.Category => KernelHookTargetKind.Category,
+            SidecarHookTargetKind.Wildcard => KernelHookTargetKind.Any,
+            _ => throw new KernelGraphCompilationException("The external hook target kind is not supported."),
+        };
+
     internal KernelModuleDeclaration BuildDeclaration()
     {
         var chat = (KernelChatLifecycleBuilder)Chat;
@@ -2387,7 +2617,11 @@ public sealed class KernelModuleBuilder : ISharpClawModuleBuilder
             chat.ConversationResolverRegistration,
             chat.ProfileResolver,
             chat.ProfileResolverRegistration,
-            chat.ContextContributors.ToArray());
+            chat.ContextContributors.ToArray(),
+            chat.BoundConversationResolver,
+            chat.BoundProfileResolver,
+            chat.BoundConversationStore,
+            chat.BoundContextContributors.ToArray());
     }
 }
 
@@ -2452,6 +2686,9 @@ public sealed class KernelModuleStorageBuilder : IModuleStorageBuilder
     public void Add(ModuleStorageContractDescriptor descriptor) => _descriptors.Add(descriptor);
 }
 
+internal sealed record KernelBoundContribution<T>(T Handler, string Identity)
+    where T : class;
+
 public sealed class KernelChatLifecycleBuilder : IChatLifecycleBuilder
 {
     private readonly List<Type> _contextContributors = [];
@@ -2466,13 +2703,67 @@ public sealed class KernelChatLifecycleBuilder : IChatLifecycleBuilder
 
     public ExclusiveRegistration? ConversationResolverRegistration { get; private set; }
 
+    internal KernelBoundContribution<IConversationResolver>? BoundConversationResolver { get; private set; }
+
+    internal KernelBoundContribution<IChatProfileResolver>? BoundProfileResolver { get; private set; }
+
+    internal KernelBoundContribution<IConversationStore>? BoundConversationStore { get; private set; }
+
+    internal List<KernelBoundContribution<IChatContextContributor>> BoundContextContributors { get; } = [];
+
     public void AddContextContributor<TContributor>() where TContributor : IChatContextContributor =>
         _contextContributors.Add(typeof(TContributor));
+
+    internal void AddBoundContextContributor(
+        IChatContextContributor contributor,
+        string handlerId)
+    {
+        ArgumentNullException.ThrowIfNull(contributor);
+        ArgumentException.ThrowIfNullOrWhiteSpace(handlerId);
+        BoundContextContributors.Add(new(contributor, handlerId));
+    }
+
+    internal void UseBoundChatProfileResolver(
+        IChatProfileResolver resolver,
+        ExclusiveRegistration registration,
+        string handlerId)
+    {
+        ArgumentNullException.ThrowIfNull(resolver);
+        ArgumentNullException.ThrowIfNull(registration);
+        ArgumentException.ThrowIfNullOrWhiteSpace(handlerId);
+        if (ProfileResolver is not null || BoundProfileResolver is not null)
+            throw new KernelGraphCompilationException("A chat profile resolver was registered more than once.");
+        BoundProfileResolver = new(resolver, handlerId);
+        ProfileResolverRegistration = registration;
+    }
+
+    internal void UseBoundConversationResolver(
+        IConversationResolver resolver,
+        ExclusiveRegistration registration,
+        string handlerId)
+    {
+        ArgumentNullException.ThrowIfNull(resolver);
+        ArgumentNullException.ThrowIfNull(registration);
+        ArgumentException.ThrowIfNullOrWhiteSpace(handlerId);
+        if (ConversationResolver is not null || BoundConversationResolver is not null)
+            throw new KernelGraphCompilationException("A conversation resolver was registered more than once.");
+        BoundConversationResolver = new(resolver, handlerId);
+        ConversationResolverRegistration = registration;
+    }
+
+    internal void UseBoundConversationStore(IConversationStore store, string handlerId)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        ArgumentException.ThrowIfNullOrWhiteSpace(handlerId);
+        if (BoundConversationStore is not null)
+            throw new KernelGraphCompilationException("A conversation store was registered more than once.");
+        BoundConversationStore = new(store, handlerId);
+    }
 
     public void UseChatProfileResolver<TResolver>(ExclusiveRegistration registration)
         where TResolver : IChatProfileResolver
     {
-        if (ProfileResolver is not null)
+        if (ProfileResolver is not null || BoundProfileResolver is not null)
             throw new KernelGraphCompilationException("A chat profile resolver was registered more than once.");
         ProfileResolver = typeof(TResolver);
         ProfileResolverRegistration = registration ?? throw new ArgumentNullException(nameof(registration));
@@ -2481,7 +2772,7 @@ public sealed class KernelChatLifecycleBuilder : IChatLifecycleBuilder
     public void UseConversationResolver<TResolver>(ExclusiveRegistration registration)
         where TResolver : IConversationResolver
     {
-        if (ConversationResolver is not null)
+        if (ConversationResolver is not null || BoundConversationResolver is not null)
             throw new KernelGraphCompilationException("A conversation resolver was registered more than once.");
         ConversationResolver = typeof(TResolver);
         ConversationResolverRegistration = registration ?? throw new ArgumentNullException(nameof(registration));
