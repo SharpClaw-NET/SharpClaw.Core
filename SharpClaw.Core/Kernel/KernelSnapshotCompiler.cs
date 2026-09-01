@@ -786,8 +786,9 @@ public sealed class KernelGraph
             throw new KernelGraphCompilationException(
                 $"External action '{descriptor.Key.Value}' did not compile as a serialized descriptor.");
         var grant = SingleExternalGrant(snapshot, definition);
+        var effectiveSensitiveApproved = !definition.ContainsSensitiveData || grant.SensitiveApproved;
         if (compiled.SnapshotCapabilities != grant.Capabilities ||
-            compiled.SnapshotSensitiveApproved != grant.SensitiveApproved)
+            compiled.SnapshotSensitiveApproved != effectiveSensitiveApproved)
         {
             throw new KernelGraphCompilationException(
                 $"External action '{descriptor.Key.Value}' does not match its effective snapshot grant.");
@@ -815,6 +816,11 @@ public sealed class KernelGraph
         {
             throw new KernelGraphCompilationException(
                 $"Sensitive external action '{definition.ActionKey.Value}' lacks exact approval.");
+        }
+        if (!definition.ContainsSensitiveData && grant.SensitiveApproved)
+        {
+            throw new KernelGraphCompilationException(
+                $"Non-sensitive external action '{definition.ActionKey.Value}' has an invalid sensitive approval.");
         }
 
         var moduleGrants = new Dictionary<

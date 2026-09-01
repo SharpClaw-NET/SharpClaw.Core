@@ -1048,7 +1048,7 @@ public sealed class KernelExternalActionDispatchTests
                 descriptor.Key,
                 descriptor.Version,
                 descriptor.Capabilities,
-                sensitiveApproved || !descriptor.ContainsSensitiveData)],
+                sensitiveApproved)],
             graph.ActionSnapshot.EventGrants,
             graph.ActionSnapshot.MaximumActionDepth);
 
