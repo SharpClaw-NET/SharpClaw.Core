@@ -833,6 +833,14 @@ public sealed class KernelGraph
         ownerGrants[definition.ActionKey.Value] = grant.Capabilities;
         moduleGrants[ownerModuleId] = ownerGrants;
 
+        var actionGrants = new Dictionary<string, ActionInterceptionCapabilities>(
+            _compileOptions.ActionCapabilityGrants
+            ?? new Dictionary<string, ActionInterceptionCapabilities>(),
+            StringComparer.Ordinal)
+        {
+            [definition.ActionKey.Value] = grant.Capabilities,
+        };
+
         var approvals = (_compileOptions.SensitiveActionApprovals ?? []).ToList();
         if (definition.ContainsSensitiveData)
         {
@@ -849,7 +857,7 @@ public sealed class KernelGraph
         {
             SupportedActionCapabilities = _compileOptions.SupportedActionCapabilities,
             SupportedEventCapabilities = _compileOptions.SupportedEventCapabilities,
-            ActionCapabilityGrants = _compileOptions.ActionCapabilityGrants,
+            ActionCapabilityGrants = actionGrants,
             ActionModuleCapabilityGrants = moduleGrants,
             EventCapabilityGrants = _compileOptions.EventCapabilityGrants,
             EventModuleCapabilityGrants = _compileOptions.EventModuleCapabilityGrants,

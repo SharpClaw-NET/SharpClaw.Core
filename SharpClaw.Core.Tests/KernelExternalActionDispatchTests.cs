@@ -108,6 +108,48 @@ public sealed class KernelExternalActionDispatchTests
     }
 
     [Fact]
+    public async Task External_serialized_action_adds_its_exact_global_grant_to_an_existing_host_policy()
+    {
+        var localKey = new SharpClawActionKey("local.host.action");
+        var builder = new KernelGraphBuilder(false);
+        builder.Add(LocalDescriptor(localKey));
+        var graph = builder.Compile(options: new KernelGraphCompileOptions
+        {
+            ActionCapabilityGrants = new Dictionary<string, ActionInterceptionCapabilities>
+            {
+                [localKey.Value] = ActionInterceptionCapabilities.Inspect,
+            },
+        });
+        var descriptor = ExternalDescriptor();
+        var snapshot = ExternalSnapshot(graph, descriptor);
+        var fixture = CreateFixture(graph, descriptor, snapshot);
+        using var registry = CreateRegistry(fixture);
+        IActionDispatcher dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityRegistry: registry);
+        var terminalCalls = 0;
+
+        var outcome = await dispatcher.RunExternalSerializedAsync(
+            ExternalDefinition(descriptor),
+            fixture.Authority.Descriptor,
+            fixture.Authority.Action.Value.Clone(),
+            (_, _) =>
+            {
+                terminalCalls++;
+                return ValueTask.FromResult(JsonSerializer.SerializeToElement(
+                    new ExternalResult("accepted")));
+            },
+            snapshot,
+            SessionProof(fixture.Authority),
+            CancellationToken.None);
+
+        Assert.True(
+            outcome.Kind == ActionOutcomeKind.Completed,
+            $"Serialized dispatch failed: {outcome.Error?.Code} {outcome.Error?.Message}");
+        Assert.Equal(1, terminalCalls);
+    }
+
+    [Fact]
     public async Task External_action_uses_the_singleton_dispatcher_without_a_local_descriptor()
     {
         var builder = new KernelGraphBuilder(false);
