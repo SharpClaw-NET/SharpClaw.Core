@@ -8,6 +8,106 @@ namespace SharpClaw.Core.Tests;
 public sealed class KernelExternalActionDispatchTests
 {
     [Fact]
+    public async Task External_serialized_action_uses_discovery_identity_and_rejects_replay()
+    {
+        var graph = new KernelGraphBuilder(false).Compile();
+        var descriptor = ExternalDescriptor(sensitive: true);
+        var snapshot = ExternalSnapshot(graph, descriptor, sensitiveApproved: true);
+        var fixture = CreateFixture(graph, descriptor, snapshot);
+        using var registry = CreateRegistry(fixture);
+        IActionDispatcher dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityRegistry: registry);
+        var definition = ExternalDefinition(descriptor);
+        var action = fixture.Authority.Action.Value.Clone();
+        var terminalCalls = 0;
+
+        var accepted = await dispatcher.RunExternalSerializedAsync(
+            definition,
+            fixture.Authority.Descriptor,
+            action,
+            (context, _) =>
+            {
+                terminalCalls++;
+                Assert.Equal("payload-a", context.Action.GetProperty("value").GetString());
+                Assert.Equal(fixture.Authority.ModuleId, context.OwnerModuleId);
+                Assert.Equal(snapshot, context.Snapshot);
+                return ValueTask.FromResult(JsonSerializer.SerializeToElement(new ExternalResult("serialized")));
+            },
+            snapshot,
+            SessionProof(fixture.Authority),
+            CancellationToken.None);
+        var replay = await dispatcher.RunExternalSerializedAsync(
+            definition,
+            fixture.Authority.Descriptor,
+            action,
+            (_, _) =>
+            {
+                terminalCalls++;
+                return ValueTask.FromResult(JsonSerializer.SerializeToElement(new ExternalResult("replay")));
+            },
+            snapshot,
+            SessionProof(fixture.Authority),
+            CancellationToken.None);
+
+        Assert.True(
+            accepted.Kind == ActionOutcomeKind.Completed,
+            $"Serialized dispatch failed: {accepted.Error?.Code} {accepted.Error?.Message}");
+        Assert.Equal("serialized", accepted.Result.GetProperty("Value").GetString());
+        Assert.Equal(ActionOutcomeKind.Failed, replay.Kind);
+        Assert.Equal(SidecarCapabilityErrors.Replay, replay.Error?.Code);
+        Assert.Equal(1, terminalCalls);
+    }
+
+    [Fact]
+    public async Task External_serialized_action_rejects_changed_semantics_before_consuming_authority()
+    {
+        var graph = new KernelGraphBuilder(false).Compile();
+        var descriptor = ExternalDescriptor();
+        var snapshot = ExternalSnapshot(graph, descriptor);
+        var fixture = CreateFixture(graph, descriptor, snapshot);
+        using var registry = CreateRegistry(fixture);
+        IActionDispatcher dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            externalAuthorityRegistry: registry);
+        var definition = ExternalDefinition(descriptor);
+        var action = fixture.Authority.Action.Value.Clone();
+        var terminalCalls = 0;
+
+        var rejected = await dispatcher.RunExternalSerializedAsync(
+            definition with { HasIrreversibleEffects = true },
+            fixture.Authority.Descriptor,
+            action,
+            (_, _) =>
+            {
+                terminalCalls++;
+                return ValueTask.FromResult(JsonSerializer.SerializeToElement(new ExternalResult("invalid")));
+            },
+            snapshot,
+            SessionProof(fixture.Authority),
+            CancellationToken.None);
+        var accepted = await dispatcher.RunExternalSerializedAsync(
+            definition,
+            fixture.Authority.Descriptor,
+            action,
+            (_, _) =>
+            {
+                terminalCalls++;
+                return ValueTask.FromResult(JsonSerializer.SerializeToElement(new ExternalResult("accepted")));
+            },
+            snapshot,
+            SessionProof(fixture.Authority),
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Failed, rejected.Kind);
+        Assert.Equal("sidecar_external_invalid_descriptor", rejected.Error?.Code);
+        Assert.True(
+            accepted.Kind == ActionOutcomeKind.Completed,
+            $"Serialized dispatch failed: {accepted.Error?.Code} {accepted.Error?.Message}");
+        Assert.Equal(1, terminalCalls);
+    }
+
+    [Fact]
     public async Task External_action_uses_the_singleton_dispatcher_without_a_local_descriptor()
     {
         var builder = new KernelGraphBuilder(false);
@@ -701,10 +801,12 @@ public sealed class KernelExternalActionDispatchTests
 
     private static ExternalFixture CreateFixture(
         KernelGraph graph,
-        ActionDescriptor<ExternalInput, ExternalResult>? descriptorOverride = null)
+        ActionDescriptor<ExternalInput, ExternalResult>? descriptorOverride = null,
+        ActionPipelineSnapshot? snapshotOverride = null)
     {
         var now = DateTimeOffset.UtcNow;
         var descriptor = descriptorOverride ?? ExternalDescriptor();
+        var snapshot = snapshotOverride ?? graph.ActionSnapshot;
         var action = new ExternalInput("payload-a");
         var actionBytes = SidecarCapabilityTransportCodec.Serialize(action);
         var actionPayload = new SidecarSerializedPayload(
@@ -796,7 +898,7 @@ public sealed class KernelExternalActionDispatchTests
             SidecarActionInvocationKind.HostEntry,
             descriptorIdentity,
             actionPayload,
-            graph.ActionSnapshot,
+            snapshot,
             invocationId,
             null,
             0,
@@ -837,7 +939,7 @@ public sealed class KernelExternalActionDispatchTests
             "host-proof")
         {
             TerminalId = terminal.TerminalId,
-            SnapshotContentHash = SidecarCapabilityTransportValidation.ComputeSnapshotHash(graph.ActionSnapshot),
+            SnapshotContentHash = SidecarCapabilityTransportValidation.ComputeSnapshotHash(snapshot),
             Caller = caller,
             Features = features,
             TraceId = hostContext.TraceId,
@@ -855,6 +957,7 @@ public sealed class KernelExternalActionDispatchTests
         return new ExternalFixture(
             descriptor,
             action,
+            snapshot,
             new SidecarExternalActionDispatchAuthority(
                 moduleId,
                 graphId,
@@ -873,7 +976,39 @@ public sealed class KernelExternalActionDispatchTests
     private sealed record ExternalFixture(
         ActionDescriptor<ExternalInput, ExternalResult> Descriptor,
         ExternalInput Action,
+        ActionPipelineSnapshot Snapshot,
         SidecarExternalActionDispatchAuthority Authority);
+
+    private static SidecarActionDefinition ExternalDefinition(
+        ActionDescriptor<ExternalInput, ExternalResult> descriptor) =>
+        new(
+            descriptor.Key,
+            descriptor.Version,
+            descriptor.Category,
+            descriptor.InputSchema!,
+            descriptor.ResultSchema!,
+            descriptor.Capabilities,
+            descriptor.ContainsSensitiveData,
+            descriptor.HasIrreversibleEffects,
+            descriptor.RepeatPolicy,
+            descriptor.ContinuationPolicy,
+            descriptor.DefaultTimeout,
+            descriptor.SafePoints,
+            descriptor.ProtocolVersionRange);
+
+    private static ActionPipelineSnapshot ExternalSnapshot(
+        KernelGraph graph,
+        ActionDescriptor<ExternalInput, ExternalResult> descriptor,
+        bool sensitiveApproved = false) =>
+        new(
+            graph.ActionSnapshot.ContractHash,
+            [new ActionCapabilityGrant(
+                descriptor.Key,
+                descriptor.Version,
+                descriptor.Capabilities,
+                sensitiveApproved || !descriptor.ContainsSensitiveData)],
+            graph.ActionSnapshot.EventGrants,
+            graph.ActionSnapshot.MaximumActionDepth);
 
     private static ActionDescriptor<ExternalInput, ExternalResult> ExternalDescriptor(
         ActionInterceptionCapabilities capabilities = ActionInterceptionCapabilities.Inspect,

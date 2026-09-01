@@ -7,7 +7,7 @@ namespace SharpClaw.Core.Tests;
 public sealed class KernelActionTests
 {
     [Fact]
-    public void Dispatcher_loads_against_the_beta16_terminal_delegate_contract()
+    public void Dispatcher_loads_against_the_neutral_external_terminal_contract()
     {
         var dispatcherType = typeof(KernelActionDispatcher);
         var dispatcherAssembly = System.Reflection.Assembly.Load(dispatcherType.Assembly.FullName!);
@@ -15,8 +15,11 @@ public sealed class KernelActionTests
         Assert.NotNull(loadedType);
 
         var map = loadedType!.GetInterfaceMap(typeof(IActionDispatcher));
-        Assert.Equal(4, map.TargetMethods.Length);
+        Assert.Equal(5, map.TargetMethods.Length);
         Assert.Contains(map.TargetMethods, method => method.Name == nameof(IActionDispatcher.RunAsync));
+        Assert.Contains(
+            map.TargetMethods,
+            method => method.Name == nameof(IActionDispatcher.RunExternalSerializedAsync));
         Assert.Contains(
             typeof(IActionDispatcher).GetMethods(),
             method => method.Name == nameof(IActionDispatcher.RunAsync) &&

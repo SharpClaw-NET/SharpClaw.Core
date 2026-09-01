@@ -735,6 +735,145 @@ public sealed class KernelGraph
             authority);
     }
 
+    internal KernelExternalActionPolicy<JsonElement, JsonElement> CompileExternalSerializedAction(
+        SidecarActionDefinition definition,
+        SidecarActionDescriptorIdentity descriptorIdentity,
+        ActionPipelineSnapshot snapshot,
+        SidecarExternalActionDispatchAuthority authority)
+    {
+        ArgumentNullException.ThrowIfNull(definition);
+        ArgumentNullException.ThrowIfNull(descriptorIdentity);
+        ArgumentNullException.ThrowIfNull(snapshot);
+        ArgumentNullException.ThrowIfNull(authority);
+        var ownerModuleId = authority.ModuleId;
+        if (string.IsNullOrWhiteSpace(ownerModuleId))
+            throw new KernelGraphCompilationException("An external action owner is required.");
+
+        var descriptor = new ActionDescriptor<JsonElement, JsonElement>(
+            definition.ActionKey,
+            definition.Version,
+            definition.Category,
+            definition.Capabilities,
+            definition.ContainsSensitiveData,
+            definition.HasIrreversibleEffects,
+            definition.RepeatPolicy,
+            definition.ContinuationPolicy,
+            definition.DefaultTimeout)
+        {
+            InputSchema = definition.InputSchema,
+            ResultSchema = definition.ResultSchema,
+            SafePoints = definition.SafePoints,
+            ProtocolVersionRange = definition.ProtocolVersionRange,
+        };
+        var contractIdentity = new KernelExternalActionContractIdentity(
+            descriptorIdentity.InputTypeIdentity,
+            descriptorIdentity.ResultTypeIdentity,
+            definition.InputSchema,
+            definition.ResultSchema,
+            KernelSchemaIdentity.Action(definition, descriptorIdentity));
+        var options = ExternalSerializedOptions(
+            definition,
+            descriptorIdentity,
+            snapshot,
+            ownerModuleId,
+            contractIdentity.SchemaIdentity);
+        var registration = new ActionDefinitionRegistration<JsonElement, JsonElement>(
+            descriptor,
+            ownerModuleId,
+            contractIdentity);
+        var compiled = registration.Compile(_actionHooks, _serviceProvider, options) as
+            CompiledActionDefinition<JsonElement, JsonElement> ??
+            throw new KernelGraphCompilationException(
+                $"External action '{descriptor.Key.Value}' did not compile as a serialized descriptor.");
+        var grant = SingleExternalGrant(snapshot, definition);
+        if (compiled.SnapshotCapabilities != grant.Capabilities ||
+            compiled.SnapshotSensitiveApproved != grant.SensitiveApproved)
+        {
+            throw new KernelGraphCompilationException(
+                $"External action '{descriptor.Key.Value}' does not match its effective snapshot grant.");
+        }
+        return KernelExternalActionPolicy<JsonElement, JsonElement>.Create(
+            compiled,
+            ActionSnapshot,
+            authority);
+    }
+
+    private KernelGraphCompileOptions ExternalSerializedOptions(
+        SidecarActionDefinition definition,
+        SidecarActionDescriptorIdentity descriptorIdentity,
+        ActionPipelineSnapshot snapshot,
+        string ownerModuleId,
+        string schemaIdentity)
+    {
+        var grant = SingleExternalGrant(snapshot, definition);
+        if (grant.Capabilities != definition.Capabilities)
+        {
+            throw new KernelGraphCompilationException(
+                $"External action '{definition.ActionKey.Value}' does not have an exact capability grant.");
+        }
+        if (definition.ContainsSensitiveData && !grant.SensitiveApproved)
+        {
+            throw new KernelGraphCompilationException(
+                $"Sensitive external action '{definition.ActionKey.Value}' lacks exact approval.");
+        }
+
+        var moduleGrants = new Dictionary<
+            string,
+            IReadOnlyDictionary<string, ActionInterceptionCapabilities>>(StringComparer.Ordinal);
+        foreach (var module in _compileOptions.ActionModuleCapabilityGrants ??
+                 new Dictionary<string, IReadOnlyDictionary<string, ActionInterceptionCapabilities>>())
+        {
+            moduleGrants.Add(
+                module.Key,
+                new Dictionary<string, ActionInterceptionCapabilities>(module.Value, StringComparer.Ordinal));
+        }
+        var ownerGrants = moduleGrants.TryGetValue(ownerModuleId, out var existing)
+            ? new Dictionary<string, ActionInterceptionCapabilities>(existing, StringComparer.Ordinal)
+            : new Dictionary<string, ActionInterceptionCapabilities>(StringComparer.Ordinal);
+        ownerGrants[definition.ActionKey.Value] = grant.Capabilities;
+        moduleGrants[ownerModuleId] = ownerGrants;
+
+        var approvals = (_compileOptions.SensitiveActionApprovals ?? []).ToList();
+        if (definition.ContainsSensitiveData)
+        {
+            approvals.Add(new KernelSensitiveActionApproval(
+                ownerModuleId,
+                definition.ActionKey,
+                definition.Version,
+                descriptorIdentity.InputTypeIdentity,
+                descriptorIdentity.ResultTypeIdentity,
+                schemaIdentity));
+        }
+
+        return KernelGraphCompileOptions.Freeze(new KernelGraphCompileOptions
+        {
+            SupportedActionCapabilities = _compileOptions.SupportedActionCapabilities,
+            SupportedEventCapabilities = _compileOptions.SupportedEventCapabilities,
+            ActionCapabilityGrants = _compileOptions.ActionCapabilityGrants,
+            ActionModuleCapabilityGrants = moduleGrants,
+            EventCapabilityGrants = _compileOptions.EventCapabilityGrants,
+            EventModuleCapabilityGrants = _compileOptions.EventModuleCapabilityGrants,
+            SensitiveActionApprovals = approvals,
+            SensitiveEventApprovals = _compileOptions.SensitiveEventApprovals,
+            MaximumActionDepth = _compileOptions.MaximumActionDepth,
+        });
+    }
+
+    private static ActionCapabilityGrant SingleExternalGrant(
+        ActionPipelineSnapshot snapshot,
+        SidecarActionDefinition definition)
+    {
+        var grants = snapshot.ActionGrants
+            .Where(grant => grant.ActionKey == definition.ActionKey && grant.ActionVersion == definition.Version)
+            .ToArray();
+        if (grants.Length != 1)
+        {
+            throw new KernelGraphCompilationException(
+                $"External action '{definition.ActionKey.Value}' requires one exact snapshot grant.");
+        }
+        return grants[0];
+    }
+
     internal ICompiledEventDefinition GetEvent(SharpClawEventKey key)
     {
         if (!_events.TryGetValue(key.Value, out var definition))
@@ -884,9 +1023,17 @@ internal interface IActionDefinitionRegistration
         KernelGraphCompileOptions options);
 }
 
+internal sealed record KernelExternalActionContractIdentity(
+    string ActionTypeIdentity,
+    string ResultTypeIdentity,
+    JsonSchemaReference InputSchema,
+    JsonSchemaReference ResultSchema,
+    string SchemaIdentity);
+
 internal sealed class ActionDefinitionRegistration<TAction, TResult>(
     ActionDescriptor<TAction, TResult> descriptor,
-    string ownerModuleId) : IActionDefinitionRegistration
+    string ownerModuleId,
+    KernelExternalActionContractIdentity? externalContractIdentity = null) : IActionDefinitionRegistration
 {
     public object DescriptorObject => descriptor;
 
@@ -945,7 +1092,8 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
                 hook.OwnerModuleId,
                 options,
                 typeof(TAction),
-                typeof(TResult));
+                typeof(TResult),
+                externalContractIdentity);
             if (hook.IsUntyped)
             {
                 if (!typeof(IAnyActionInterceptor).IsAssignableFrom(hook.HandlerType))
@@ -986,7 +1134,8 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
             ownerModuleId,
             options,
             typeof(TAction),
-            typeof(TResult));
+            typeof(TResult),
+            externalContractIdentity);
         if (descriptor.ContainsSensitiveData && frames.Any(frame => !frame.SensitiveApproved))
             sensitiveApproved = false;
         if (descriptor.ContainsSensitiveData && !sensitiveApproved)
@@ -998,8 +1147,10 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
             frames,
             effectiveCapabilities,
             sensitiveApproved,
-            KernelSchemaIdentity.ActionInput(descriptor, typeof(TAction), typeof(TResult)),
-            KernelSchemaIdentity.ActionResult(descriptor, typeof(TAction), typeof(TResult)));
+            externalContractIdentity?.InputSchema ??
+                KernelSchemaIdentity.ActionInput(descriptor, typeof(TAction), typeof(TResult)),
+            externalContractIdentity?.ResultSchema ??
+                KernelSchemaIdentity.ActionResult(descriptor, typeof(TAction), typeof(TResult)));
     }
 
     private static ActionInterceptionCapabilities ResolveActionCapabilities<TActionValue, TResultValue>(
@@ -1058,10 +1209,21 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
         string moduleId,
         KernelGraphCompileOptions options,
         Type actionType,
-        Type resultType)
+        Type resultType,
+        KernelExternalActionContractIdentity? externalContractIdentity = null)
     {
         if (!descriptor.ContainsSensitiveData)
             return true;
+        if (externalContractIdentity is not null)
+        {
+            return (options.SensitiveActionApprovals ?? []).Any(approval =>
+                approval.ModuleId == moduleId &&
+                approval.ActionKey == descriptor.Key &&
+                approval.ActionVersion == descriptor.Version &&
+                approval.ActionType == externalContractIdentity.ActionTypeIdentity &&
+                approval.ResultType == externalContractIdentity.ResultTypeIdentity &&
+                approval.SchemaIdentity == externalContractIdentity.SchemaIdentity);
+        }
         if (IsCanonicalCoreSensitiveAction(descriptor, moduleId, actionType, resultType))
             return true;
         var contractTypes = KernelSchemaIdentity.ActionTypes(
@@ -1438,6 +1600,43 @@ public static class KernelSchemaIdentity
             string.Join(",", descriptor.SafePoints.Select(value => KernelGraphHasher.StableScalar(value))));
     }
 
+    public static string Action(
+        SidecarActionDefinition definition,
+        SidecarActionDescriptorIdentity descriptor)
+    {
+        ArgumentNullException.ThrowIfNull(definition);
+        ArgumentNullException.ThrowIfNull(descriptor);
+        if (!SidecarExternalActionDispatchAuthorityValidator.DescriptorMatchesDefinition(descriptor, definition))
+            throw new KernelGraphCompilationException("The external action descriptor is incomplete or inconsistent.");
+
+        var inputSchema = TypeSchema(
+            "action.input",
+            definition.ActionKey.Value,
+            definition.Version,
+            descriptor.InputTypeIdentity);
+        var resultSchema = TypeSchema(
+            "action.result",
+            definition.ActionKey.Value,
+            definition.Version,
+            descriptor.ResultTypeIdentity);
+        return string.Join(
+            "|",
+            definition.ActionKey.Value,
+            KernelGraphHasher.StableScalar(definition.Version),
+            definition.Category,
+            descriptor.InputTypeIdentity,
+            descriptor.ResultTypeIdentity,
+            inputSchema.ContractName,
+            KernelGraphHasher.StableScalar(inputSchema.Version),
+            inputSchema.ContentHash,
+            resultSchema.ContractName,
+            KernelGraphHasher.StableScalar(resultSchema.Version),
+            resultSchema.ContentHash,
+            KernelGraphHasher.StableScalar(definition.ProtocolVersionRange.Minimum),
+            KernelGraphHasher.StableScalar(definition.ProtocolVersionRange.Maximum),
+            string.Join(",", definition.SafePoints.Select(value => KernelGraphHasher.StableScalar(value))));
+    }
+
     public static (Type ActionType, Type ResultType) ActionTypes<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor,
         Type actionType,
@@ -1501,10 +1700,17 @@ public static class KernelSchemaIdentity
         string role,
         string key,
         int version,
-        Type type)
+        Type type) =>
+        TypeSchema(role, key, version, type.AssemblyQualifiedName ?? type.FullName ?? type.Name);
+
+    private static JsonSchemaReference TypeSchema(
+        string role,
+        string key,
+        int version,
+        string typeIdentity)
     {
         var contractName = $"sharpclaw.kernel.{role}.{key}";
-        var identity = $"{contractName}|{version}|{type.AssemblyQualifiedName}";
+        var identity = $"{contractName}|{version}|{typeIdentity}";
         return new JsonSchemaReference(
             contractName,
             version,

@@ -94,6 +94,64 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                 KernelActionOutcome<TResult>.Failed(validation.Code, validation.Message));
         }
 
+        return RunValidatedExternalAsync(
+            action,
+            terminal,
+            snapshot,
+            authority,
+            () => _graph.CompileExternalAction(descriptor, authority),
+            cancellationToken);
+    }
+
+    public ValueTask<IActionOutcome<JsonElement>> RunExternalSerializedAsync(
+        SidecarActionDefinition definition,
+        SidecarActionDescriptorIdentity descriptor,
+        JsonElement action,
+        Func<ActionContext<JsonElement>, CancellationToken, ValueTask<JsonElement>> terminal,
+        ActionPipelineSnapshot snapshot,
+        SidecarExternalActionDispatchAuthority authority,
+        CancellationToken cancellationToken)
+    {
+        if (authority is null)
+        {
+            return ValueTask.FromResult<IActionOutcome<JsonElement>>(
+                KernelActionOutcome<JsonElement>.Failed(
+                    "ACTION_EXTERNAL_AUTHORITY_MISSING",
+                    "The external action authority is required."));
+        }
+        var validation = SidecarExternalActionDispatchAuthorityValidator.ValidateSerialized(
+            authority,
+            definition,
+            descriptor,
+            action,
+            snapshot,
+            DateTimeOffset.UtcNow);
+        if (!validation.Accepted)
+        {
+            return ValueTask.FromResult<IActionOutcome<JsonElement>>(
+                KernelActionOutcome<JsonElement>.Failed(validation.Code, validation.Message));
+        }
+
+        return RunValidatedExternalAsync(
+            action,
+            terminal,
+            snapshot,
+            authority,
+            () => _graph.CompileExternalSerializedAction(definition, descriptor, snapshot, authority),
+            cancellationToken);
+    }
+
+    private ValueTask<IActionOutcome<TResult>> RunValidatedExternalAsync<TAction, TResult>(
+        TAction action,
+        Func<ActionContext<TAction>, CancellationToken, ValueTask<TResult>> terminal,
+        ActionPipelineSnapshot snapshot,
+        SidecarExternalActionDispatchAuthority authority,
+        Func<KernelExternalActionPolicy<TAction, TResult>> compilePolicy,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(terminal);
+        ArgumentNullException.ThrowIfNull(snapshot);
+
         if (!string.Equals(
                 snapshot.ContractHash,
                 _graph.ActionSnapshot.ContractHash,
@@ -121,7 +179,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
         KernelExternalActionPolicy<TAction, TResult> policy;
         try
         {
-            policy = _graph.CompileExternalAction(descriptor, authority);
+            policy = compilePolicy();
         }
         catch (KernelGraphCompilationException exception)
         {
