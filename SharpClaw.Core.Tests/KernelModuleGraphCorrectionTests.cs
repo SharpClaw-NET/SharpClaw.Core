@@ -226,6 +226,7 @@ public sealed class KernelModuleGraphCorrectionTests
     {
         public ValueTask<ConversationSelection> ResolveAsync(
             ChatTurnInput input,
+            ChatOperationContext context,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult(new ConversationSelection(Guid.NewGuid(), service.Value.Length > 0));
     }
@@ -234,6 +235,7 @@ public sealed class KernelModuleGraphCorrectionTests
     {
         public ValueTask<ConversationSelection> ResolveAsync(
             ChatTurnInput input,
+            ChatOperationContext context,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult(new ConversationSelection(Guid.NewGuid()));
     }
@@ -242,6 +244,7 @@ public sealed class KernelModuleGraphCorrectionTests
     {
         public ValueTask<ChatContextContribution> ContributeAsync(
             ChatContextRequest request,
+            ChatOperationContext context,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult(new ChatContextContribution(
                 [new SystemPromptSegment("module", service.Value)],
@@ -255,6 +258,7 @@ public sealed class KernelModuleGraphCorrectionTests
 
         public ValueTask<ChatContextContribution> ContributeAsync(
             ChatContextRequest request,
+            ChatOperationContext context,
             CancellationToken cancellationToken)
         {
             _ = _dependency;

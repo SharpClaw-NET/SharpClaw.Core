@@ -606,6 +606,7 @@ public sealed class KernelFlowCorrectionTests
     {
         public ValueTask<ConversationSelection> ResolveAsync(
             ChatTurnInput input,
+            ChatOperationContext context,
             CancellationToken cancellationToken)
         {
             ActionTrace.RequireCurrent("chat.conversation.resolve");
@@ -617,6 +618,7 @@ public sealed class KernelFlowCorrectionTests
     {
         public ValueTask<ChatProfile> ResolveAsync(
             ChatTurnContext turn,
+            ChatOperationContext context,
             CancellationToken cancellationToken)
         {
             ActionTrace.RequireCurrent("chat.profile.resolve");
@@ -630,6 +632,7 @@ public sealed class KernelFlowCorrectionTests
 
         public ValueTask<IReadOnlyList<ChatCompletionMessage>> LoadHistoryAsync(
             Guid conversationId,
+            ChatOperationContext context,
             CancellationToken cancellationToken)
         {
             ActionTrace.RequireCurrent("conversation.history.query");
@@ -637,7 +640,10 @@ public sealed class KernelFlowCorrectionTests
                 [new ChatCompletionMessage("assistant", "prior")]);
         }
 
-        public ValueTask CommitExchangeAsync(ChatExchange exchange, CancellationToken cancellationToken)
+        public ValueTask CommitExchangeAsync(
+            ChatExchange exchange,
+            ChatOperationContext context,
+            CancellationToken cancellationToken)
         {
             ActionTrace.RequireCurrent("conversation.message.commit");
             Commits++;
@@ -649,6 +655,7 @@ public sealed class KernelFlowCorrectionTests
     {
         public ValueTask<ChatContextContribution> ContributeAsync(
             ChatContextRequest request,
+            ChatOperationContext context,
             CancellationToken cancellationToken)
         {
             ActionTrace.RequireCurrent("chat.context.contributor.invoke");
@@ -766,6 +773,7 @@ public sealed class KernelFlowCorrectionTests
     {
         public ValueTask<ConversationSelection> ResolveAsync(
             ChatTurnInput input,
+            ChatOperationContext context,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult(new ConversationSelection(Guid.NewGuid()));
     }
@@ -774,6 +782,7 @@ public sealed class KernelFlowCorrectionTests
     {
         public ValueTask<ChatProfile> ResolveAsync(
             ChatTurnContext turn,
+            ChatOperationContext context,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult(new ChatProfile("provider", Guid.NewGuid()));
     }
@@ -782,10 +791,14 @@ public sealed class KernelFlowCorrectionTests
     {
         public ValueTask<IReadOnlyList<ChatCompletionMessage>> LoadHistoryAsync(
             Guid conversationId,
+            ChatOperationContext context,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult<IReadOnlyList<ChatCompletionMessage>>([]);
 
-        public ValueTask CommitExchangeAsync(ChatExchange exchange, CancellationToken cancellationToken) =>
+        public ValueTask CommitExchangeAsync(
+            ChatExchange exchange,
+            ChatOperationContext context,
+            CancellationToken cancellationToken) =>
             ValueTask.CompletedTask;
     }
 

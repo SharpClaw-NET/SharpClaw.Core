@@ -368,6 +368,7 @@ public sealed class KernelDirectTurnStreamingTests
     {
         public ValueTask<ConversationSelection> ResolveAsync(
             ChatTurnInput input,
+            ChatOperationContext context,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult(new ConversationSelection(Guid.NewGuid()));
     }
@@ -376,6 +377,7 @@ public sealed class KernelDirectTurnStreamingTests
     {
         public ValueTask<ChatProfile> ResolveAsync(
             ChatTurnContext turn,
+            ChatOperationContext context,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult(new ChatProfile("provider", Guid.NewGuid(), SystemPrompt: "system"));
     }
@@ -388,11 +390,13 @@ public sealed class KernelDirectTurnStreamingTests
 
         public ValueTask<IReadOnlyList<ChatCompletionMessage>> LoadHistoryAsync(
             Guid conversationId,
+            ChatOperationContext context,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult<IReadOnlyList<ChatCompletionMessage>>([]);
 
         public ValueTask CommitExchangeAsync(
             ChatExchange exchange,
+            ChatOperationContext context,
             CancellationToken cancellationToken)
         {
             Interlocked.Increment(ref _commits);

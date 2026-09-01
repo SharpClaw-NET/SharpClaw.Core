@@ -343,13 +343,27 @@ public sealed class DirectTurnRunner
         ChatPipelineSnapshot snapshot,
         CancellationToken cancellationToken)
     {
-        var conversationStage = await RunStageWithInputAsync(
+        ChatOperationContext? conversationContext = null;
+        var conversationStage = await RunStageWithActionContextAsync(
             SharpClawActions.Chat.ResolveConversation,
             input,
-            (effectiveInput, ct) => _conversationResolver.ResolveAsync(effectiveInput, ct),
+            (effectiveInput, actionContext, ct) =>
+            {
+                var operationContext = CreateOperationContext(actionContext);
+                conversationContext = operationContext;
+                effectiveInput = NormalizeInput(effectiveInput, operationContext);
+                return _conversationResolver.ResolveAsync(
+                    effectiveInput,
+                    operationContext,
+                    ct);
+            },
             snapshot.Actions,
             cancellationToken);
-        var effectiveInput = conversationStage.Input;
+        var effectiveInput = NormalizeInput(
+            conversationStage.Input,
+            conversationContext
+                ?? throw new KernelActionExecutionException(
+                    "The conversation resolver did not receive action authority."));
         var turn = new ChatTurnContext(
             Guid.NewGuid(),
             effectiveInput,
@@ -366,22 +380,37 @@ public sealed class DirectTurnRunner
             static (value, _) => ValueTask.FromResult(value),
             snapshot.Actions,
             cancellationToken);
-        var profileStage = await RunStageWithInputAsync(
+        ChatOperationContext? profileContext = null;
+        var profileStage = await RunStageWithActionContextAsync(
             SharpClawActions.Chat.ResolveProfile,
             turn,
-            (effectiveTurn, ct) => _profileResolver.ResolveAsync(effectiveTurn, ct),
+            (effectiveTurn, actionContext, ct) =>
+            {
+                var operationContext = CreateOperationContext(actionContext);
+                profileContext = operationContext;
+                effectiveTurn = NormalizeTurn(effectiveTurn, operationContext);
+                return _profileResolver.ResolveAsync(effectiveTurn, operationContext, ct);
+            },
             snapshot.Actions,
             cancellationToken);
-        turn = profileStage.Input;
-        var historyStage = await RunStageWithInputAsync(
+        turn = NormalizeTurn(
+            profileStage.Input,
+            profileContext
+                ?? throw new KernelActionExecutionException(
+                    "The profile resolver did not receive action authority."));
+        var historyStage = await RunStageWithActionContextAsync(
             SharpClawActions.Chat.LoadHistory,
             turn,
-            (effectiveTurn, ct) => RunStageAsync(
-                new SharpClawActionKey("conversation.history.query"),
-                effectiveTurn.Conversation.ConversationId,
-                (conversationId, queryCt) => _conversationStore.LoadHistoryAsync(conversationId, queryCt),
-                snapshot.Actions,
-                ct),
+            async (effectiveTurn, _, ct) =>
+                (await RunStageWithActionContextAsync(
+                    new SharpClawActionKey("conversation.history.query"),
+                    effectiveTurn.Conversation.ConversationId,
+                    (conversationId, actionContext, queryCt) => _conversationStore.LoadHistoryAsync(
+                        conversationId,
+                        CreateOperationContext(actionContext),
+                        queryCt),
+                    snapshot.Actions,
+                    ct)).Result,
             snapshot.Actions,
             cancellationToken);
         turn = historyStage.Input;
@@ -429,17 +458,21 @@ public sealed class DirectTurnRunner
             static (value, _) => ValueTask.FromResult(value),
             snapshot.Actions,
             cancellationToken);
-        await RunStageAsync(
+        await RunStageWithActionContextAsync(
             SharpClawActions.Chat.CommitExchange,
             exchange,
-            async (effectiveExchange, ct) =>
+            async (effectiveExchange, _, ct) =>
             {
-                await RunStageAsync(
+                await RunStageWithActionContextAsync(
                     new SharpClawActionKey("conversation.message.commit"),
                     effectiveExchange,
-                    async (value, commitCt) =>
+                    async (value, actionContext, commitCt) =>
                     {
-                        await _conversationStore.CommitExchangeAsync(value, commitCt);
+                        var operationContext = CreateOperationContext(actionContext);
+                        await _conversationStore.CommitExchangeAsync(
+                            value with { Turn = NormalizeTurn(value.Turn, operationContext) },
+                            operationContext,
+                            commitCt);
                         return true;
                     },
                     snapshot.Actions,
@@ -568,6 +601,41 @@ public sealed class DirectTurnRunner
 
     private sealed record StageResult<TInput, TResult>(TInput Input, TResult Result);
 
+    private static ChatOperationContext CreateOperationContext(
+        ActionContext<KernelActionEnvelope> context) =>
+        new(
+            context.InvocationId,
+            context.ParentInvocationId,
+            context.TraceId,
+            context.IdempotencyKey,
+            context.Depth,
+            context.Attempt,
+            context.Deadline,
+            context.Caller,
+            context.Features,
+            context.HostActionEntry);
+
+    private static ChatTurnContext NormalizeTurn(
+        ChatTurnContext turn,
+        ChatOperationContext context) =>
+        turn with
+        {
+            Input = turn.Input with
+            {
+                Caller = context.Caller,
+                Features = context.Features,
+            },
+        };
+
+    private static ChatTurnInput NormalizeInput(
+        ChatTurnInput input,
+        ChatOperationContext context) =>
+        input with
+        {
+            Caller = context.Caller,
+            Features = context.Features,
+        };
+
     private async ValueTask TryDispatchTerminalAsync<TInput>(
         SharpClawActionKey key,
         TInput input,
@@ -657,7 +725,10 @@ public sealed class KernelChatContextAssembler : IChatContextAssembler
                         !string.Equals(effective.ContributorType, invocation.ContributorType, StringComparison.Ordinal))
                         throw new KernelActionExecutionException(
                             "A context contributor replacement cannot select a different contributor.");
-                    return (object)await contributor.ContributeAsync(effective.Request, ct);
+                    return (object)await contributor.ContributeAsync(
+                        effective.Request,
+                        CreateOperationContext(context),
+                        ct);
                 },
                 _graph.ActionSnapshot,
                 cancellationToken);
@@ -703,7 +774,22 @@ public sealed class KernelChatContextAssembler : IChatContextAssembler
             _ => throw new KernelActionExecutionException(
                 "The context contributor action received an invalid invocation.")
         };
+
+    private static ChatOperationContext CreateOperationContext(
+        ActionContext<KernelActionEnvelope> context) =>
+        new(
+            context.InvocationId,
+            context.ParentInvocationId,
+            context.TraceId,
+            context.IdempotencyKey,
+            context.Depth,
+            context.Attempt,
+            context.Deadline,
+            context.Caller,
+            context.Features,
+            context.HostActionEntry);
 }
+
 
 public sealed record KernelChatUserMessage(ChatTurnContext Turn, string Message);
 

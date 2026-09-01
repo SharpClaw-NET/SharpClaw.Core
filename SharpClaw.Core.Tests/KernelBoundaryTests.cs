@@ -1181,6 +1181,38 @@ public sealed class KernelBoundaryTests
         Assert.Equal("commit", store.LastExchange!.UserMessage);
         Assert.Equal(DirectReplacementInterceptor.HistoryConversationId, result.ConversationId);
         Assert.NotEqual(result.TurnId, result.ConversationId);
+        var operationContexts = new[]
+        {
+            conversation.LastContext!,
+            profile.LastContext!,
+            store.LastHistoryContext!,
+            contextContributor.LastContext!,
+            store.LastCommitContext!,
+        };
+        Assert.All(operationContexts, context =>
+        {
+            Assert.True(context.IsWellFormed(DateTimeOffset.UtcNow));
+            Assert.Equal(RequestPrincipal.Anonymous.SubjectId, context.Caller.SubjectId);
+            Assert.Equal(RequestPrincipal.Anonymous.IsAuthenticated, context.Caller.IsAuthenticated);
+            Assert.NotNull(context.ParentInvocationId);
+        });
+        Assert.All(operationContexts, context =>
+        {
+            Assert.Equal(operationContexts[0].TraceId, context.TraceId);
+            Assert.Equal(operationContexts[0].IdempotencyKey, context.IdempotencyKey);
+        });
+        Assert.Equal(
+            operationContexts.Length,
+            operationContexts.Select(context => context.InvocationId).Distinct().Count());
+        Assert.Equal(
+            conversation.LastContext!.Caller.SubjectId,
+            conversation.LastInput!.Caller!.SubjectId);
+        Assert.Equal(
+            profile.LastContext!.Caller.SubjectId,
+            profile.LastTurn!.Input.Caller!.SubjectId);
+        Assert.Equal(
+            store.LastCommitContext!.Caller.SubjectId,
+            store.LastExchange!.Turn.Input.Caller!.SubjectId);
     }
 
     [Fact]
@@ -1887,7 +1919,11 @@ public sealed class KernelBoundaryTests
                 "chat.turn.start" when context.Action.Payload is ChatTurnInput input =>
                     input with { Message = "outer" },
                 "chat.conversation.resolve" when context.Action.Payload is ChatTurnInput input =>
-                    input with { Message = "conversation" },
+                    input with
+                    {
+                        Message = "conversation",
+                        Caller = new RequestPrincipal("forged-caller"),
+                    },
                 "chat.profile.resolve" when context.Action.Payload is ChatTurnContext turn =>
                     turn with { Input = turn.Input with { Message = "profile" } },
                 "chat.history.load" when context.Action.Payload is ChatTurnContext turn =>
@@ -1914,10 +1950,15 @@ public sealed class KernelBoundaryTests
     private sealed class DirectConversationResolver : IConversationResolver
     {
         public ChatTurnInput? LastInput { get; private set; }
+        public ChatOperationContext? LastContext { get; private set; }
 
-        public ValueTask<ConversationSelection> ResolveAsync(ChatTurnInput input, CancellationToken ct)
+        public ValueTask<ConversationSelection> ResolveAsync(
+            ChatTurnInput input,
+            ChatOperationContext context,
+            CancellationToken ct)
         {
             LastInput = input;
+            LastContext = context;
             return ValueTask.FromResult(new ConversationSelection(Guid.NewGuid()));
         }
     }
@@ -1925,10 +1966,15 @@ public sealed class KernelBoundaryTests
     private sealed class DirectProfileResolver : IChatProfileResolver
     {
         public ChatTurnContext? LastTurn { get; private set; }
+        public ChatOperationContext? LastContext { get; private set; }
 
-        public ValueTask<ChatProfile> ResolveAsync(ChatTurnContext turn, CancellationToken ct)
+        public ValueTask<ChatProfile> ResolveAsync(
+            ChatTurnContext turn,
+            ChatOperationContext context,
+            CancellationToken ct)
         {
             LastTurn = turn;
+            LastContext = context;
             return ValueTask.FromResult(new ChatProfile("provider", Guid.NewGuid()));
         }
     }
@@ -1937,18 +1983,26 @@ public sealed class KernelBoundaryTests
     {
         public Guid LastHistoryConversationId { get; private set; }
         public ChatExchange? LastExchange { get; private set; }
+        public ChatOperationContext? LastHistoryContext { get; private set; }
+        public ChatOperationContext? LastCommitContext { get; private set; }
 
         public ValueTask<IReadOnlyList<ChatCompletionMessage>> LoadHistoryAsync(
             Guid conversationId,
+            ChatOperationContext context,
             CancellationToken ct)
         {
             LastHistoryConversationId = conversationId;
+            LastHistoryContext = context;
             return ValueTask.FromResult<IReadOnlyList<ChatCompletionMessage>>([]);
         }
 
-        public ValueTask CommitExchangeAsync(ChatExchange exchange, CancellationToken ct)
+        public ValueTask CommitExchangeAsync(
+            ChatExchange exchange,
+            ChatOperationContext context,
+            CancellationToken ct)
         {
             LastExchange = exchange;
+            LastCommitContext = context;
             return ValueTask.CompletedTask;
         }
     }
@@ -1956,10 +2010,15 @@ public sealed class KernelBoundaryTests
     private sealed class DirectContextContributor : IChatContextContributor
     {
         public ChatContextRequest? LastRequest { get; private set; }
+        public ChatOperationContext? LastContext { get; private set; }
 
-        public ValueTask<ChatContextContribution> ContributeAsync(ChatContextRequest request, CancellationToken ct)
+        public ValueTask<ChatContextContribution> ContributeAsync(
+            ChatContextRequest request,
+            ChatOperationContext context,
+            CancellationToken ct)
         {
             LastRequest = request;
+            LastContext = context;
             return ValueTask.FromResult(ChatContextContribution.Empty);
         }
     }

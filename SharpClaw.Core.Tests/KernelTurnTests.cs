@@ -71,6 +71,7 @@ public sealed class KernelTurnTests
 
         public ValueTask<ConversationSelection> ResolveAsync(
             ChatTurnInput input,
+            ChatOperationContext context,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult(new ConversationSelection(ConversationId, true));
     }
@@ -81,6 +82,7 @@ public sealed class KernelTurnTests
 
         public ValueTask<ChatProfile> ResolveAsync(
             ChatTurnContext turn,
+            ChatOperationContext context,
             CancellationToken cancellationToken) =>
             Resolve(turn);
 
@@ -102,10 +104,14 @@ public sealed class KernelTurnTests
 
         public ValueTask<IReadOnlyList<ChatCompletionMessage>> LoadHistoryAsync(
             Guid conversationId,
+            ChatOperationContext context,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult<IReadOnlyList<ChatCompletionMessage>>(Array.Empty<ChatCompletionMessage>());
 
-        public ValueTask CommitExchangeAsync(ChatExchange exchange, CancellationToken cancellationToken)
+        public ValueTask CommitExchangeAsync(
+            ChatExchange exchange,
+            ChatOperationContext context,
+            CancellationToken cancellationToken)
         {
             Commits++;
             return ValueTask.CompletedTask;
