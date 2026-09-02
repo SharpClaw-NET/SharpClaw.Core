@@ -64,11 +64,23 @@ public sealed class KernelJobsCoordinator
 
         public KernelActionExecutionContext? ExecutionContext { get; set; }
 
-        public bool ControlRequested { get; set; }
+        private int _controlRequested;
 
         public JobStatus? RequestedStatus { get; set; }
 
-        public bool ControlTransitionCompleted { get; set; }
+        private int _controlTransitionCompleted;
+
+        public bool ControlRequested
+        {
+            get => Volatile.Read(ref _controlRequested) != 0;
+            set => Volatile.Write(ref _controlRequested, value ? 1 : 0);
+        }
+
+        public bool ControlTransitionCompleted
+        {
+            get => Volatile.Read(ref _controlTransitionCompleted) != 0;
+            set => Volatile.Write(ref _controlTransitionCompleted, value ? 1 : 0);
+        }
 
         public TaskCompletionSource<bool> ControlTransitionSignal { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -599,7 +611,7 @@ public sealed class KernelJobsCoordinator
         }
         catch (KernelActionCancelledException exception)
         {
-            var cancelled = await FinalizeCancellationAsync(job, executionContext);
+            var cancelled = await FinalizeCancellationAsync(job, active, executionContext);
             return new JobExecutionResult<TResult>(
                 cancelled,
                 default,
@@ -608,7 +620,7 @@ public sealed class KernelJobsCoordinator
         }
         catch (ActionOutcomeUncertainException exception)
         {
-            var uncertain = await FinalizeUncertaintyAsync(job, executionContext, exception.Uncertainty);
+            var uncertain = await FinalizeUncertaintyAsync(job, active, executionContext, exception.Uncertainty);
             return new JobExecutionResult<TResult>(
                 uncertain,
                 default,
@@ -618,7 +630,7 @@ public sealed class KernelJobsCoordinator
         }
         catch (KernelActionDeferredException exception)
         {
-            var held = await FinalizeHeldAsync(job, executionContext);
+            var held = await FinalizeHeldAsync(job, active, executionContext);
             return new JobExecutionResult<TResult>(
                 held,
                 default,
@@ -627,7 +639,7 @@ public sealed class KernelJobsCoordinator
         }
         catch (OperationCanceledException exception)
         {
-            var cancelled = await FinalizeCancellationAsync(job, executionContext);
+            var cancelled = await FinalizeCancellationAsync(job, active, executionContext);
             return new JobExecutionResult<TResult>(
                 cancelled,
                 default,
@@ -636,7 +648,7 @@ public sealed class KernelJobsCoordinator
         }
         catch (KernelActionFailedException exception)
         {
-            var failed = await FinalizeFailureAsync(job, executionContext, exception.Error);
+            var failed = await FinalizeFailureAsync(job, active, executionContext, exception.Error);
             return new JobExecutionResult<TResult>(
                 failed,
                 default,
@@ -646,7 +658,7 @@ public sealed class KernelJobsCoordinator
         catch (Exception exception)
         {
             var error = new ExecutionError("JOBS_FAILED", exception.Message);
-            var failed = await FinalizeFailureAsync(job, executionContext, error);
+            var failed = await FinalizeFailureAsync(job, active, executionContext, error);
             return new JobExecutionResult<TResult>(failed, default, ActionOutcomeKind.Failed, error);
         }
         finally
@@ -1214,6 +1226,7 @@ public sealed class KernelJobsCoordinator
 
     private async ValueTask<JobDocument> FinalizeFailureAsync(
         JobDocument job,
+        ActiveJobExecution active,
         KernelActionExecutionContext executionContext,
         ExecutionError error)
     {
@@ -1223,6 +1236,8 @@ public sealed class KernelJobsCoordinator
             if (record?.Value is not { } currentJob)
                 throw new KernelActionExecutionException(
                     $"Jobs record '{job.Id:D}' disappeared during failure finalization.");
+            if (active.ControlRequested)
+                return await AwaitControlTransitionAsync(job.Id, active, executionContext, currentJob);
             if (currentJob.Status != JobStatus.Running ||
                 currentJob.ActiveAttemptId != job.ActiveAttemptId ||
                 IsControlRequested(job.Id))
@@ -1257,14 +1272,15 @@ public sealed class KernelJobsCoordinator
 
     private async ValueTask<JobDocument> FinalizeCancellationAsync(
         JobDocument job,
+        ActiveJobExecution active,
         KernelActionExecutionContext executionContext)
     {
         var current = await GetJobAsync(job.Id, executionContext, CancellationToken.None);
         if (current?.Value is not { } currentJob)
             throw new KernelActionExecutionException(
                 $"Jobs record '{job.Id:D}' disappeared during cancellation finalization.");
-        if (IsControlRequested(job.Id))
-            return currentJob;
+        if (active.ControlRequested)
+            return await AwaitControlTransitionAsync(job.Id, active, executionContext, currentJob);
         if (currentJob.Status is not (JobStatus.Pending or JobStatus.Queued or JobStatus.Running))
             return currentJob;
         return await CancelAsync(job.Id, executionContext, CancellationToken.None);
@@ -1272,6 +1288,7 @@ public sealed class KernelJobsCoordinator
 
     private async ValueTask<JobDocument> FinalizeUncertaintyAsync(
         JobDocument job,
+        ActiveJobExecution active,
         KernelActionExecutionContext executionContext,
         ActionUncertainty uncertainty)
     {
@@ -1279,8 +1296,8 @@ public sealed class KernelJobsCoordinator
         if (record?.Value is not { } currentJob)
             throw new KernelActionExecutionException(
                 $"Jobs record '{job.Id:D}' disappeared during uncertainty finalization.");
-        if (IsControlRequested(job.Id))
-            return currentJob;
+        if (active.ControlRequested)
+            return await AwaitControlTransitionAsync(job.Id, active, executionContext, currentJob);
         return await RunFamilyAsync<KernelJobsOperationFamilies.ExternalEffectUncertain>(
             new SharpClawActionKey("jobs.external_effect.uncertain"),
             currentJob,
@@ -1302,14 +1319,15 @@ public sealed class KernelJobsCoordinator
 
     private async ValueTask<JobDocument> FinalizeHeldAsync(
         JobDocument job,
+        ActiveJobExecution active,
         KernelActionExecutionContext executionContext)
     {
         var record = await GetJobAsync(job.Id, executionContext, CancellationToken.None);
         if (record?.Value is not { } currentJob)
             throw new KernelActionExecutionException(
                 $"Jobs record '{job.Id:D}' disappeared during hold finalization.");
-        if (IsControlRequested(job.Id))
-            return currentJob;
+        if (active.ControlRequested)
+            return await AwaitControlTransitionAsync(job.Id, active, executionContext, currentJob);
         return await RunFamilyAsync<KernelJobsOperationFamilies.HoldEvaluate>(
             new SharpClawActionKey("jobs.hold.evaluate"),
             currentJob,
@@ -1322,6 +1340,24 @@ public sealed class KernelJobsCoordinator
             executionContext,
             CancellationToken.None,
             record.Revision);
+    }
+
+    private async ValueTask<JobDocument> AwaitControlTransitionAsync(
+        Guid jobId,
+        ActiveJobExecution active,
+        KernelActionExecutionContext executionContext,
+        JobDocument currentJob)
+    {
+        if (active.RequestedStatus is null)
+            return currentJob;
+        if (!active.ControlTransitionCompleted)
+            await active.ControlTransitionSignal.Task;
+
+        var controlled = await GetJobAsync(jobId, executionContext, CancellationToken.None);
+        if (controlled?.Value is not { } controlledJob)
+            throw new KernelActionExecutionException(
+                $"Jobs record '{jobId:D}' disappeared after its control transition.");
+        return controlledJob;
     }
 
     private async ValueTask<JobDocument> TransitionJobAsync(
@@ -1400,40 +1436,48 @@ public sealed class KernelJobsCoordinator
         if (record.Value is not { } ownedJob)
             throw new KernelActionExecutionException($"Jobs record '{jobId:D}' was not found.");
 
+        ActiveJobExecution? controlledExecution = null;
+        ModuleStorageClaimAuthority? controlAuthority = null;
         if (status is JobStatus.Paused or JobStatus.Cancelled)
-            await FenceActiveExecutionAsync(jobId, status);
-
-        record = await RequireOwnedJobAsync(jobId, executionContext, cancellationToken);
-        ownedJob = record.Value!;
-        if (ownedJob.Status is JobStatus.Completed or JobStatus.Failed or JobStatus.Cancelled or JobStatus.Expired)
-            return ownedJob;
-
-        if (status is JobStatus.Queued && ownedJob.ActiveAttemptId is not null)
-            throw new KernelActionExecutionException(
-                $"JOBS_ACTIVE_ATTEMPT: Jobs record '{jobId:D}' cannot resume while attempt " +
-                $"'{ownedJob.ActiveAttemptId:D}' still has durable execution authority.");
-
-        var controlAuthority = GetActiveControlClaim(jobId);
-        var controlledExecution = _activeExecutions.TryGetValue(jobId, out var activeExecution)
-            ? activeExecution
-            : null;
-        if (ownedJob.Status == JobStatus.Running &&
-            (status is JobStatus.Paused or JobStatus.Cancelled) &&
-            controlAuthority is null)
         {
-            record = await AcquireControlClaimAsync(record, executionContext, cancellationToken);
-            controlAuthority = _claims.TryGetValue(jobId, out var acquiredAuthority)
-                ? acquiredAuthority
+            await FenceActiveExecutionAsync(jobId, status);
+            controlledExecution = _activeExecutions.TryGetValue(jobId, out var activeExecution)
+                ? activeExecution
                 : null;
         }
 
-        ownedJob = record.Value!;
-        if (!IsAllowedStatusTransition(ownedJob.Status, status))
-            throw new KernelActionExecutionException(
-                $"Jobs record '{jobId:D}' cannot change from '{ownedJob.Status}' to '{status}'.");
-
         try
         {
+            record = await RequireOwnedJobAsync(jobId, executionContext, cancellationToken);
+            ownedJob = record.Value!;
+            if (ownedJob.Status is JobStatus.Completed or JobStatus.Failed or JobStatus.Cancelled or JobStatus.Expired)
+            {
+                if (status is JobStatus.Paused or JobStatus.Cancelled)
+                    await CompleteControlTransitionAsync(jobId, controlledExecution);
+                return ownedJob;
+            }
+
+            if (status is JobStatus.Queued && ownedJob.ActiveAttemptId is not null)
+                throw new KernelActionExecutionException(
+                    $"JOBS_ACTIVE_ATTEMPT: Jobs record '{jobId:D}' cannot resume while attempt " +
+                    $"'{ownedJob.ActiveAttemptId:D}' still has durable execution authority.");
+
+            controlAuthority = GetActiveControlClaim(jobId);
+            if (ownedJob.Status == JobStatus.Running &&
+                (status is JobStatus.Paused or JobStatus.Cancelled) &&
+                controlAuthority is null)
+            {
+                record = await AcquireControlClaimAsync(record, executionContext, cancellationToken);
+                controlAuthority = _claims.TryGetValue(jobId, out var acquiredAuthority)
+                    ? acquiredAuthority
+                    : null;
+            }
+
+            ownedJob = record.Value!;
+            if (!IsAllowedStatusTransition(ownedJob.Status, status))
+                throw new KernelActionExecutionException(
+                    $"Jobs record '{jobId:D}' cannot change from '{ownedJob.Status}' to '{status}'.");
+
             var transitioned = await RunFamilyAsync<TFamily>(
                 new SharpClawActionKey(key),
                 ownedJob,

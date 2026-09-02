@@ -373,6 +373,54 @@ public sealed class KernelCanonicalJobsTests
     }
 
     [Fact]
+    public async Task Paused_dispatch_waits_for_the_committed_control_state()
+    {
+        var graph = CreateGraph();
+        var gateway = new InMemoryJobsGateway();
+        var handler = new NonCooperativeHandler();
+        var context = CreateContext("paused-dispatch-owner");
+        var coordinator = new KernelJobsCoordinator(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph),
+            new KernelJobsStore(gateway),
+            [handler]);
+        var job = await coordinator.SubmitAsync(
+            new JobSubmission<ReadRequest>(
+                new SharpClawActionKey("tool.fetch"),
+                new ReadRequest("paused-dispatch"),
+                context.Caller,
+                context.Features),
+            context);
+        var dispatch = coordinator.DispatchAsync<ReadResult>(job.Id, context).AsTask();
+        await handler.FirstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var commitStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCommit = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        gateway.BeforeCommitAsync = async (_, cancellationToken) =>
+        {
+            commitStarted.TrySetResult(true);
+            await releaseCommit.Task.WaitAsync(cancellationToken);
+        };
+
+        var pause = coordinator.PauseAsync(job.Id, context).AsTask();
+        await commitStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var dispatchCompletedBeforeCommit = ReferenceEquals(
+            await Task.WhenAny(dispatch, Task.Delay(100)),
+            dispatch);
+
+        releaseCommit.TrySetResult(true);
+        var paused = await pause.WaitAsync(TimeSpan.FromSeconds(5));
+        var outcome = await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        handler.ReleaseFirst.TrySetResult(true);
+        await handler.FirstFinished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.False(dispatchCompletedBeforeCommit);
+        Assert.Equal(JobStatus.Paused, paused.Status);
+        Assert.Equal(JobStatus.Paused, outcome.Job.Status);
+        Assert.NotEqual(ActionOutcomeKind.Completed, outcome.Outcome);
+    }
+
+    [Fact]
     public async Task Two_coordinators_cannot_resume_a_paused_job_while_the_old_attempt_is_running()
     {
         var graph = CreateGraph();
@@ -1382,6 +1430,8 @@ public sealed class KernelCanonicalJobsTests
 
         public TaskCompletionSource<bool>? ClaimBarrier { get; set; }
 
+        public Func<ModuleStorageMutationAndOutboxRequest, CancellationToken, Task>? BeforeCommitAsync { get; set; }
+
         public bool RejectRenewals { get; set; }
 
         public bool FailNextCommit { get; set; }
@@ -1506,13 +1556,15 @@ public sealed class KernelCanonicalJobsTests
             return Task.FromResult(response);
         }
 
-        public Task<ModuleStorageMutationAndOutboxResult> CommitMutationAndOutboxAsync(
+        public async Task<ModuleStorageMutationAndOutboxResult> CommitMutationAndOutboxAsync(
             string moduleId,
             string storageName,
             ModuleStorageMutationAndOutboxRequest request,
             CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
+            if (BeforeCommitAsync is { } beforeCommit)
+                await beforeCommit(request, ct);
             if (FailNextCommit)
             {
                 FailNextCommit = false;
@@ -1523,7 +1575,7 @@ public sealed class KernelCanonicalJobsTests
             lock (_sync)
             {
                 if (_commits.TryGetValue(request.Commit.IdempotencyKey, out var committed))
-                    return Task.FromResult(committed with { AlreadyCommitted = true });
+                    return committed with { AlreadyCommitted = true };
 
                 var revisions = new List<ModuleStorageRevision>();
                 foreach (var mutation in request.Mutations)
@@ -1588,7 +1640,7 @@ public sealed class KernelCanonicalJobsTests
                     [],
                     revisions.Count == 0 ? 0 : revisions[^1].Revision);
                 _commits[request.Commit.IdempotencyKey] = result;
-                return Task.FromResult(result);
+                return result;
             }
         }
 
