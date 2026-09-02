@@ -21,7 +21,7 @@ WRITTEN OFFER
 
 The source code for any program binaries or compressed scripts that are
 included with SharpClaw.Core can be freely obtained at the following URL:
-https://github.com/mkn8rn/SharpClaw.Core
+https://github.com/SharpClaw-NET/SharpClaw.Core
 
 =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
