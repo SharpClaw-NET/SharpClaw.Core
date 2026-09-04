@@ -33,13 +33,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: SharpClaw-NET/SharpClaw.Contracts
-          ref: 11b7815e2524c387eb31dfc5b438a47479a1bf05
+          ref: 4cf302ddff93271dfa91688f61f8b23c201a965c
           path: .ci/contracts
 
       - name: Pack exact Contracts source to the local feed
         run: >-
           dotnet pack .ci/contracts/SharpClaw.Contracts/SharpClaw.Contracts.csproj
           --configuration Release --output "$GITHUB_WORKSPACE/.ci/feed"
+          -p:PackageVersion=0.5.0-dev.20260904.5
+          -p:Version=0.5.0-dev.20260904.5
+          -p:InformationalVersion=0.5.0-dev.20260904.5
 
       - name: Configure the isolated package source map
         shell: bash
