@@ -396,9 +396,8 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                 throw new TimeoutException("The event hook timeout is not positive.");
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             linked.CancelAfter(timeout);
-            var operationTask = Task.Run(
-                () => operation(linked.Token).AsTask(),
-                CancellationToken.None);
+            var operationTask = KernelExecutionScope.RunRetainedAsync(
+                () => operation(linked.Token));
             try
             {
                 return await operationTask.WaitAsync(timeout, cancellationToken);

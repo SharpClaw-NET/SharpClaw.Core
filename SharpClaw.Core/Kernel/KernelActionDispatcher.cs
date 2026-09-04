@@ -1002,9 +1002,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
 
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             linked.CancelAfter(remaining);
-            var operationTask = Task.Run(
-                () => operation(linked.Token).AsTask(),
-                CancellationToken.None);
+            var operationTask = KernelExecutionScope.RunRetainedAsync(
+                () => operation(linked.Token));
             try
             {
                 return await operationTask.WaitAsync(remaining, cancellationToken);
