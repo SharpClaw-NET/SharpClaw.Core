@@ -23,8 +23,8 @@ public sealed class KernelServiceGraphCorrectionTests
         Assert.Equal(2, graph.Services.Contracts.Count);
         Assert.Equal("documents", storage.StorageName);
         Assert.Equal(4096, storage.MaxDocumentBytes);
-        Assert.IsType<RegistrationConversationResolver>(graph.Services.ConversationResolver);
-        Assert.Contains(graph.Services.ContextContributors, value => value is RegistrationContributor);
+        Assert.NotNull(graph.Services.ConversationResolver);
+        Assert.Single(graph.Services.ContextContributors);
 
         var dispatcher = KernelTestExecution.CreateDispatcher(graph);
         var contribution = await graph.CreateChatContextAssembler(dispatcher).BuildAsync(
@@ -76,13 +76,27 @@ public sealed class KernelServiceGraphCorrectionTests
     }
 
     [Fact]
-    public void Competing_exclusive_resolver_slots_fail_graph_compilation()
+    public async Task Competing_exclusive_resolver_slots_fail_before_chat_work()
     {
         var registry = new ServiceCollection();
         registry.Add(new ResolverRegistration("resolver.one", "one"));
         registry.Add(new ResolverRegistration("resolver.two", "two"));
 
-        var exception = Assert.Throws<KernelGraphCompilationException>(() => registry.Compile());
+        var graph = registry.Compile();
+        var exception = await Assert.ThrowsAsync<KernelGraphCompilationException>(async () =>
+            await graph.Services.ConversationResolver!.ResolveAsync(
+                new ChatTurnInput("test", null, new RequestPrincipal("test")),
+                new ChatOperationContext(
+                    Guid.NewGuid(),
+                    null,
+                    Guid.NewGuid(),
+                    Guid.NewGuid(),
+                    0,
+                    1,
+                    DateTimeOffset.UtcNow.AddMinutes(1),
+                    new RequestPrincipal("test"),
+                    ExtensionFeatureSet.Empty),
+                CancellationToken.None));
 
         Assert.Contains(nameof(IConversationResolver), exception.Message, StringComparison.Ordinal);
         Assert.Contains("more than one", exception.Message, StringComparison.Ordinal);

@@ -491,30 +491,8 @@ public sealed class KernelSnapshotCompiler
             if (!typeof(IToolHandler).IsAssignableFrom(tool.HandlerType))
                 throw new KernelGraphCompilationException(
                     $"Tool handler '{tool.HandlerType.FullName}' does not implement IToolHandler.");
-            IToolHandler handler;
-            try
-            {
-                handler = tool.Handler
-                    ?? KernelServiceResolution.Resolve(tool.HandlerType, serviceProvider) as IToolHandler
-                    ?? throw new KernelGraphCompilationException(
-                        $"Tool handler '{tool.HandlerType.FullName}' cannot be resolved as IToolHandler.");
-                if (handler is null)
-                    throw new KernelGraphCompilationException(
-                        $"Tool handler '{tool.HandlerType.FullName}' cannot be resolved as IToolHandler.");
-            }
-            catch (KernelGraphCompilationException)
-            {
-                throw;
-            }
-            catch (Exception exception)
-            {
-                throw new KernelGraphCompilationException(
-                    $"Registration '{tool.OwnerId}' tool handler '{tool.HandlerType.FullName}' " +
-                    $"cannot be resolved: {exception.Message}");
-            }
             result.Add(tool with
             {
-                Handler = handler,
                 HandlerIdentity = tool.HandlerIdentity ?? tool.HandlerType.AssemblyQualifiedName,
             });
         }
@@ -864,6 +842,17 @@ public sealed class KernelGraph
 
     public object? GetService(Type serviceType) => Services.Services.GetService(serviceType);
 
+    internal IServiceProvider RootServices => _serviceProvider;
+
+    public ValueTask<TResult> RunInServiceScopeAsync<TResult>(
+        Func<IServiceProvider, ValueTask<TResult>> operation) =>
+        KernelExecutionScope.RunAsync(_serviceProvider, operation);
+
+    public IAsyncEnumerable<TResult> StreamInServiceScopeAsync<TResult>(
+        Func<IServiceProvider, IAsyncEnumerable<TResult>> operation,
+        CancellationToken cancellationToken = default) =>
+        KernelExecutionScope.StreamAsync(_serviceProvider, operation, cancellationToken);
+
     public TService GetRequiredService<TService>() where TService : notnull =>
         (TService)(GetService(typeof(TService)) ?? throw new KernelGraphCompilationException(
             $"Kernel registration service '{typeof(TService).FullName}' is not registered."));
@@ -874,6 +863,10 @@ public sealed class KernelGraph
     public bool ContainsAction(SharpClawActionKey key) => _actions.ContainsKey(key.Value);
 
     public bool ContainsEvent(SharpClawEventKey key) => _events.ContainsKey(key.Value);
+
+    public ActionDescriptor<TAction, TResult> GetActionDescriptor<TAction, TResult>(
+        SharpClawActionKey key) =>
+        GetAction<TAction, TResult>(key).Descriptor;
 
     public ActionDescriptor<KernelActionEnvelope, object> GetStandardAction(SharpClawActionKey key)
     {
@@ -1341,8 +1334,8 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
                     throw new KernelGraphCompilationException(
                         $"'{hook.HandlerType.FullName}' does not implement IAnyActionInterceptor.");
                 frames.Add(new AnyActionFrame<TAction, TResult>(
-                    hook.BoundHandler
-                    ?? (IAnyActionInterceptor)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider),
+                    hook.HandlerType,
+                    hook.BoundHandler,
                     hook.TargetKind,
                     hook.Key,
                     hook.Category,
@@ -1359,9 +1352,8 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
                     throw new KernelGraphCompilationException(
                         $"'{hook.HandlerType.FullName}' does not implement '{expected.FullName}'.");
                 frames.Add(new TypedActionFrame<TAction, TResult>(
-                    (IActionInterceptor<TAction, TResult>)KernelServiceResolution.Resolve(
-                        hook.HandlerType,
-                        serviceProvider),
+                    hook.HandlerType,
+                    hook.BoundHandler as IActionInterceptor<TAction, TResult>,
                     hook.TargetKind,
                     hook.Key,
                     hook.Category,
@@ -1587,8 +1579,8 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         throw new KernelGraphCompilationException(
                             $"'{hook.HandlerType.FullName}' does not implement IAnyEventInterceptor.");
                     interceptors.Add(new AnyEventFrame<TEvent>(
-                        hook.BoundHandler as IAnyEventInterceptor
-                        ?? (IAnyEventInterceptor)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider),
+                        hook.HandlerType,
+                        hook.BoundHandler as IAnyEventInterceptor,
                         hook.TargetKind,
                         hook.Key,
                         hook.Category,
@@ -1605,9 +1597,8 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         throw new KernelGraphCompilationException(
                             $"'{hook.HandlerType.FullName}' does not implement '{expected.FullName}'.");
                     interceptors.Add(new TypedEventFrame<TEvent>(
-                        (IEventInterceptor<TEvent>)KernelServiceResolution.Resolve(
-                            hook.HandlerType,
-                            serviceProvider),
+                        hook.HandlerType,
+                        hook.BoundHandler as IEventInterceptor<TEvent>,
                         hook.TargetKind,
                         hook.Key,
                         hook.Category,
@@ -1626,15 +1617,14 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         throw new KernelGraphCompilationException(
                             $"'{hook.HandlerType.FullName}' does not implement IAnyEventListener.");
                     listeners.Add(new KernelEventListener<TEvent>(
-                        hook.BoundHandler as IAnyEventListener
-                        ?? (IAnyEventListener)KernelServiceResolution.Resolve(hook.HandlerType, serviceProvider),
+                        hook.HandlerType,
+                        hook.BoundHandler as IAnyEventListener,
                         hook.Delivery,
                         hook.Ordering.Id,
                         hook.TargetKind,
                         hook.Key,
                         hook.Category,
                         hook.OwnerId,
-                        hook.HandlerType,
                         hook.HandlerIdentity,
                         hook.Ordering,
                         hookCapabilities,
@@ -1647,16 +1637,14 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         throw new KernelGraphCompilationException(
                             $"'{hook.HandlerType.FullName}' does not implement '{expected.FullName}'.");
                     listeners.Add(new KernelEventListener<TEvent>(
-                        (IEventListener<TEvent>)KernelServiceResolution.Resolve(
-                            hook.HandlerType,
-                            serviceProvider),
+                        hook.HandlerType,
+                        hook.BoundHandler as IEventListener<TEvent>,
                         hook.Delivery,
                         hook.Ordering.Id,
                         hook.TargetKind,
                         hook.Key,
                         hook.Category,
                         hook.OwnerId,
-                        hook.HandlerType,
                         hook.HandlerIdentity,
                         hook.Ordering,
                         hookCapabilities,
@@ -2113,7 +2101,8 @@ internal interface IActionFrame<TAction, TResult>
 }
 
 internal sealed class TypedActionFrame<TAction, TResult>(
-    IActionInterceptor<TAction, TResult> interceptor,
+    Type handlerType,
+    IActionInterceptor<TAction, TResult>? boundInterceptor,
     KernelHookTargetKind targetKind,
     SharpClawActionKey? targetKey,
     string? targetCategory,
@@ -2124,7 +2113,9 @@ internal sealed class TypedActionFrame<TAction, TResult>(
     bool sensitiveApproved)
     : IActionFrame<TAction, TResult>
 {
-    public IActionInterceptor<TAction, TResult> Interceptor { get; } = interceptor;
+    public IActionInterceptor<TAction, TResult> Resolve(IServiceProvider services) =>
+        boundInterceptor
+        ?? (IActionInterceptor<TAction, TResult>)KernelServiceResolution.Resolve(HandlerType, services);
 
     public bool IsUntyped => false;
 
@@ -2138,7 +2129,7 @@ internal sealed class TypedActionFrame<TAction, TResult>(
 
     public string OwnerId { get; } = OwnerId;
 
-    public Type HandlerType => Interceptor.GetType();
+    public Type HandlerType { get; } = handlerType;
 
     public string HandlerIdentity { get; } = handlerIdentity;
 
@@ -2148,7 +2139,8 @@ internal sealed class TypedActionFrame<TAction, TResult>(
 }
 
 internal sealed class AnyActionFrame<TAction, TResult>(
-    IAnyActionInterceptor interceptor,
+    Type handlerType,
+    IAnyActionInterceptor? boundInterceptor,
     KernelHookTargetKind targetKind,
     SharpClawActionKey? targetKey,
     string? targetCategory,
@@ -2159,7 +2151,9 @@ internal sealed class AnyActionFrame<TAction, TResult>(
     bool sensitiveApproved)
     : IActionFrame<TAction, TResult>
 {
-    public IAnyActionInterceptor Interceptor { get; } = interceptor;
+    public IAnyActionInterceptor Resolve(IServiceProvider services) =>
+        boundInterceptor
+        ?? (IAnyActionInterceptor)KernelServiceResolution.Resolve(HandlerType, services);
 
     public bool IsUntyped => true;
 
@@ -2173,7 +2167,7 @@ internal sealed class AnyActionFrame<TAction, TResult>(
 
     public string OwnerId { get; } = OwnerId;
 
-    public Type HandlerType => Interceptor.GetType();
+    public Type HandlerType { get; } = handlerType;
 
     public string HandlerIdentity { get; } = handlerIdentity;
 
@@ -2313,7 +2307,8 @@ internal interface IEventFrame<TEvent>
 }
 
 internal sealed class TypedEventFrame<TEvent>(
-    IEventInterceptor<TEvent> interceptor,
+    Type handlerType,
+    IEventInterceptor<TEvent>? boundInterceptor,
     KernelHookTargetKind targetKind,
     SharpClawEventKey? targetKey,
     string? targetCategory,
@@ -2323,7 +2318,9 @@ internal sealed class TypedEventFrame<TEvent>(
     EventInterceptionCapabilities effectiveCapabilities,
     bool sensitiveApproved) : IEventFrame<TEvent>
 {
-    public IEventInterceptor<TEvent> Interceptor { get; } = interceptor;
+    public IEventInterceptor<TEvent> Resolve(IServiceProvider services) =>
+        boundInterceptor
+        ?? (IEventInterceptor<TEvent>)KernelServiceResolution.Resolve(HandlerType, services);
 
     public bool IsUntyped => false;
 
@@ -2337,7 +2334,7 @@ internal sealed class TypedEventFrame<TEvent>(
 
     public string OwnerId { get; } = OwnerId;
 
-    public Type HandlerType => Interceptor.GetType();
+    public Type HandlerType { get; } = handlerType;
 
     public string HandlerIdentity { get; } = handlerIdentity;
 
@@ -2347,7 +2344,8 @@ internal sealed class TypedEventFrame<TEvent>(
 }
 
 internal sealed class AnyEventFrame<TEvent>(
-    IAnyEventInterceptor interceptor,
+    Type handlerType,
+    IAnyEventInterceptor? boundInterceptor,
     KernelHookTargetKind targetKind,
     SharpClawEventKey? targetKey,
     string? targetCategory,
@@ -2357,7 +2355,9 @@ internal sealed class AnyEventFrame<TEvent>(
     EventInterceptionCapabilities effectiveCapabilities,
     bool sensitiveApproved) : IEventFrame<TEvent>
 {
-    public IAnyEventInterceptor Interceptor { get; } = interceptor;
+    public IAnyEventInterceptor Resolve(IServiceProvider services) =>
+        boundInterceptor
+        ?? (IAnyEventInterceptor)KernelServiceResolution.Resolve(HandlerType, services);
 
     public bool IsUntyped => true;
 
@@ -2371,7 +2371,7 @@ internal sealed class AnyEventFrame<TEvent>(
 
     public string OwnerId { get; } = OwnerId;
 
-    public Type HandlerType => Interceptor.GetType();
+    public Type HandlerType { get; } = handlerType;
 
     public string HandlerIdentity { get; } = handlerIdentity;
 
@@ -2381,15 +2381,19 @@ internal sealed class AnyEventFrame<TEvent>(
 }
 
 internal sealed record KernelEventListener<TEvent>(
-    object Listener,
+    Type HandlerType,
+    object? BoundListener,
     EventDelivery Delivery,
     string Id,
     KernelHookTargetKind TargetKind,
     SharpClawEventKey? TargetKey,
     string? TargetCategory,
     string OwnerId,
-    Type HandlerType,
     string HandlerIdentity,
     HookOrdering Ordering,
     EventInterceptionCapabilities EffectiveCapabilities,
-    bool SensitiveApproved);
+    bool SensitiveApproved)
+{
+    public object Resolve(IServiceProvider services) =>
+        BoundListener ?? KernelServiceResolution.Resolve(HandlerType, services);
+}

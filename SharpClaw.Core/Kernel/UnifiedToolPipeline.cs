@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.Extensions.DependencyInjection;
 using SharpClaw.Contracts.Kernel;
 
 namespace SharpClaw.Core.Kernel;
@@ -14,8 +15,8 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
     private static readonly SharpClawActionKey Cancellation = new("tool.call.cancel");
     private readonly KernelGraph _graph;
     private readonly KernelActionDispatcher _dispatcher;
-    private readonly IReadOnlyList<IToolInvocationGate> _gates;
-    private readonly IToolExecutionCoordinator _coordinator;
+    private readonly IReadOnlyList<IToolInvocationGate>? _gates;
+    private readonly IToolExecutionCoordinator? _coordinator;
     private readonly IServiceProvider _serviceProvider;
 
     public UnifiedToolPipeline(
@@ -27,8 +28,8 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
     {
         _graph = graph ?? throw new ArgumentNullException(nameof(graph));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
-        _gates = gates?.ToArray() ?? [];
-        _coordinator = coordinator ?? new ImmediateToolExecutionCoordinator();
+        _gates = gates?.ToArray();
+        _coordinator = coordinator;
         _serviceProvider = serviceProvider ?? graph.Services.Services;
     }
 
@@ -141,7 +142,8 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
             {
                 EnsureEffectiveInvocation(effectiveInvocation, authority, "check");
                 var holds = new List<ToolHoldRequirement>();
-                foreach (var gate in _gates)
+                var services = KernelExecutionScope.Current(_serviceProvider);
+                foreach (var gate in _gates ?? services.GetServices<IToolInvocationGate>().ToArray())
                 {
                     var decision = await gate.EvaluateAsync(effectiveInvocation, ct);
                     switch (decision)
@@ -224,7 +226,7 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
                             var typedHandler = handlerRegistration.Handler
                                 ?? KernelServiceResolution.Resolve(
                                     handlerRegistration.HandlerType,
-                                    _serviceProvider) as IToolHandler;
+                                    KernelExecutionScope.Current(_serviceProvider)) as IToolHandler;
                             if (typedHandler is null)
                                 throw new KernelActionExecutionException(
                                     $"Tool handler '{handlerRegistration.HandlerType.FullName}' does not implement IToolHandler.");
@@ -268,7 +270,11 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
                     return returned as ToolResult
                         ?? ToolResult.Error("The tool handler returned no result.");
                 };
-                return (object)await _coordinator.CoordinateAsync(plan, terminal, ct);
+                var coordinator = _coordinator
+                    ?? KernelExecutionScope.Current(_serviceProvider)
+                        .GetService<IToolExecutionCoordinator>()
+                    ?? new ImmediateToolExecutionCoordinator();
+                return (object)await coordinator.CoordinateAsync(plan, terminal, ct);
             },
             cancellationToken);
         return coordinated is ToolInvocationOutcome result

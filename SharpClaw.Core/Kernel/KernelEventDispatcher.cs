@@ -27,7 +27,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
             ExtensionFeatureSet.Empty,
             cancellationToken);
 
-    public async ValueTask<IEventInterception<TEvent>> DispatchAsync<TEvent>(
+    public ValueTask<IEventInterception<TEvent>> DispatchAsync<TEvent>(
         EventDescriptor<TEvent> descriptor,
         TEvent payload,
         ActionPipelineSnapshot snapshot,
@@ -37,6 +37,27 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
     {
         ArgumentNullException.ThrowIfNull(descriptor);
         ArgumentNullException.ThrowIfNull(snapshot);
+        return KernelExecutionScope.RunAsync(
+            _graph.RootServices,
+            services => DispatchCoreAsync(
+                descriptor,
+                payload,
+                snapshot,
+                caller,
+                features,
+                services,
+                cancellationToken));
+    }
+
+    private async ValueTask<IEventInterception<TEvent>> DispatchCoreAsync<TEvent>(
+        EventDescriptor<TEvent> descriptor,
+        TEvent payload,
+        ActionPipelineSnapshot snapshot,
+        RequestPrincipal? caller,
+        ExtensionFeatureSet? features,
+        IServiceProvider services,
+        CancellationToken cancellationToken)
+    {
         if (!string.Equals(
                 snapshot.ContractHash,
                 _graph.ActionSnapshot.ContractHash,
@@ -63,6 +84,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
             snapshot,
             caller ?? RequestPrincipal.Anonymous,
             features ?? ExtensionFeatureSet.Empty,
+            services,
             _deliverySink,
             cancellationToken);
         var result = await invocation.InvokeAsync(payload, 0, cancellationToken);
@@ -93,6 +115,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
         private readonly ActionPipelineSnapshot _snapshot;
         private readonly RequestPrincipal _caller;
         private readonly ExtensionFeatureSet _features;
+        private readonly IServiceProvider _services;
         private readonly IKernelEventDeliverySink _deliverySink;
         private readonly Guid _eventId = Guid.NewGuid();
         private readonly Guid _traceId = Guid.NewGuid();
@@ -102,6 +125,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
             ActionPipelineSnapshot snapshot,
             RequestPrincipal caller,
             ExtensionFeatureSet features,
+            IServiceProvider services,
             IKernelEventDeliverySink deliverySink,
             CancellationToken rootCancellationToken)
         {
@@ -109,6 +133,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
             _snapshot = snapshot;
             _caller = caller;
             _features = features;
+            _services = services;
             _deliverySink = deliverySink;
         }
 
@@ -141,7 +166,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                 if (frame is TypedEventFrame<TEvent> typed)
                 {
                     outcome = await InvokeBoundedAsync(
-                        token => typed.Interceptor.InterceptAsync(context, control, token),
+                        token => typed.Resolve(_services).InterceptAsync(context, control, token),
                         frame.Ordering,
                         cancellationToken);
                 }
@@ -164,7 +189,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                         KernelJson.Serialize(payload));
                     var untypedControl = new UntypedEventControl(control);
                     var untypedOutcome = await InvokeBoundedAsync(
-                        token => any.Interceptor.InterceptAsync(
+                        token => any.Resolve(_services).InterceptAsync(
                             new UntypedEventContext(untypedEnvelope),
                             untypedControl,
                             token),
@@ -269,9 +294,10 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                 payload);
             foreach (var listener in _definition.Listeners)
             {
+                var resolvedListener = listener.Resolve(_services);
                 if (listener.Delivery == EventDelivery.Inline)
                 {
-                    if (listener.Listener is IEventListener<TEvent> typed)
+                    if (resolvedListener is IEventListener<TEvent> typed)
                     {
                         await InvokeListenerAsync(
                             token => typed.OnEventAsync(envelope, token),
@@ -281,7 +307,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                     else
                     {
                         await InvokeListenerAsync(
-                            token => ((IAnyEventListener)listener.Listener).OnEventAsync(
+                            token => ((IAnyEventListener)resolvedListener).OnEventAsync(
                                 new UntypedEventEnvelope(
                                     CreateUntypedDescriptor(listener.EffectiveCapabilities),
                                     envelope.EventId,
@@ -300,7 +326,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                     if (listener.Delivery == EventDelivery.Durable && !_deliverySink.SupportsDurable)
                         throw new KernelActionExecutionException(
                             $"Event '{_definition.Descriptor.Key.Value}' requires a durable event sink.");
-                    object value = listener.Listener is IEventListener<TEvent>
+                    object value = resolvedListener is IEventListener<TEvent>
                         ? envelope
                         : new UntypedEventEnvelope(
                             CreateUntypedDescriptor(listener.EffectiveCapabilities),
