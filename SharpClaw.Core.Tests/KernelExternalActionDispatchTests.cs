@@ -1,6 +1,6 @@
 using System.Security.Cryptography;
 using System.Text.Json;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 using SharpClaw.Core.Kernel;
 
 namespace SharpClaw.Core.Tests;
@@ -30,7 +30,7 @@ public sealed class KernelExternalActionDispatchTests
             {
                 terminalCalls++;
                 Assert.Equal("payload-a", context.Action.GetProperty("value").GetString());
-                Assert.Equal(fixture.Authority.ModuleId, context.OwnerModuleId);
+                Assert.Equal(fixture.Authority.SourceId, context.OwnerId);
                 Assert.Equal(snapshot, context.Snapshot);
                 return ValueTask.FromResult(JsonSerializer.SerializeToElement(new ExternalResult("serialized")));
             },
@@ -171,7 +171,7 @@ public sealed class KernelExternalActionDispatchTests
             {
                 terminalCalls++;
                 Assert.Equal(fixture.Action, context.Action);
-                Assert.Equal(fixture.Authority.ModuleId, context.OwnerModuleId);
+                Assert.Equal(fixture.Authority.SourceId, context.OwnerId);
                 Assert.Equal(fixture.Authority.EffectiveHostEntry.EffectiveContext.Snapshot, context.Snapshot);
                 return ValueTask.FromResult(new ExternalResult("sidecar-result"));
             },
@@ -333,7 +333,7 @@ public sealed class KernelExternalActionDispatchTests
         var cases = new[]
         {
             ("missing", (SidecarExternalActionDispatchAuthority)null!),
-            ("module", SessionProof(fixture.Authority) with { ModuleId = "other.module" }),
+            ("registration", SessionProof(fixture.Authority) with { SourceId = "other.registration" }),
             ("graph", SessionProof(fixture.Authority) with { GraphId = "other.graph" }),
             ("descriptor", SessionProof(fixture.Authority) with
             {
@@ -652,7 +652,7 @@ public sealed class KernelExternalActionDispatchTests
         var policyCapabilities = ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap;
         var graph = builder.Compile(options: new KernelGraphCompileOptions
         {
-            ActionModuleCapabilityGrants = ModuleGrant(policyCapabilities)
+            ActionRegistrationCapabilityGrants = OwnerGrant(policyCapabilities)
         });
         var fixture = CreateFixture(graph, ExternalDescriptor(policyCapabilities));
         var dispatcher = KernelTestExecution.CreateDispatcher(
@@ -684,7 +684,7 @@ public sealed class KernelExternalActionDispatchTests
         var graph = new KernelGraphBuilder(false).Compile(options: new KernelGraphCompileOptions
         {
             SupportedActionCapabilities = ActionInterceptionCapabilities.Inspect,
-            ActionModuleCapabilityGrants = ModuleGrant(ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Cancel)
+            ActionRegistrationCapabilityGrants = OwnerGrant(ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Cancel)
         });
         var descriptor = ExternalDescriptor(ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Cancel);
         var fixture = CreateFixture(graph, descriptor);
@@ -769,9 +769,9 @@ public sealed class KernelExternalActionDispatchTests
     [Fact]
     public async Task External_policy_freezes_mutable_grants_and_sensitive_approvals()
     {
-        var moduleGrants = new Dictionary<string, IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
+        var registrationGrants = new Dictionary<string, IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
         {
-            ["sidecar.module"] = new Dictionary<string, ActionInterceptionCapabilities>
+            ["sidecar.registration"] = new Dictionary<string, ActionInterceptionCapabilities>
             {
                 ["sidecar.external.action"] = ActionInterceptionCapabilities.Inspect
             }
@@ -779,7 +779,7 @@ public sealed class KernelExternalActionDispatchTests
         var approvals = new List<KernelSensitiveActionApproval>();
         var options = new KernelGraphCompileOptions
         {
-            ActionModuleCapabilityGrants = moduleGrants,
+            ActionRegistrationCapabilityGrants = registrationGrants,
             SensitiveActionApprovals = approvals
         };
         var graph = new KernelGraphBuilder(false).Compile(options: options);
@@ -794,13 +794,13 @@ public sealed class KernelExternalActionDispatchTests
             externalAuthorityRegistry: registry);
         var terminalCalls = 0;
 
-        moduleGrants["sidecar.module"] = new Dictionary<string, ActionInterceptionCapabilities>
+        registrationGrants["sidecar.registration"] = new Dictionary<string, ActionInterceptionCapabilities>
         {
             ["sidecar.external.action"] =
                 ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Cancel
         };
         approvals.Add(new KernelSensitiveActionApproval(
-            "sidecar.module",
+            "sidecar.registration",
             descriptor.Key,
             descriptor.Version,
             typeof(ExternalInput).AssemblyQualifiedName!,
@@ -868,7 +868,7 @@ public sealed class KernelExternalActionDispatchTests
             descriptor.ResultSchema!.ContentHash!,
             descriptor.ResultSchema.Version,
             HostActionEntryAuthorityValidator.ComputeDescriptorHash(descriptor));
-        var moduleId = "sidecar.module";
+        var SourceId = "sidecar.registration";
         var graphId = "sidecar.graph";
         var invocationId = Guid.NewGuid();
         var requestId = Guid.NewGuid();
@@ -880,7 +880,7 @@ public sealed class KernelExternalActionDispatchTests
         var hostContext = new HostActionEntryRequestContext(
             Guid.NewGuid(),
             "external-entry",
-            HostActionEntryIngress.CrossModule,
+            HostActionEntryIngress.CrossRegistration,
             invocationId,
             requestId,
             cancellationId,
@@ -893,9 +893,9 @@ public sealed class KernelExternalActionDispatchTests
         {
             Contribution = new HostActionEntryContribution(
                 new HostActionEntryIngressBinding(
-                    HostActionEntryIngress.CrossModule,
-                    "source.module",
-                    moduleId),
+                    HostActionEntryIngress.CrossRegistration,
+                    "source.registration",
+                    SourceId),
                 new HostActionEntryLineage(
                     descriptor.Key,
                     descriptor.Version,
@@ -914,7 +914,7 @@ public sealed class KernelExternalActionDispatchTests
             cancellationId,
             callId,
             "external-replay",
-            moduleId,
+            SourceId,
             graphId,
             SidecarCapabilityKind.Action,
             1,
@@ -958,7 +958,7 @@ public sealed class KernelExternalActionDispatchTests
             call.RequestId,
             call.CancellationId,
             call.CallId,
-            moduleId,
+            SourceId,
             graphId,
             SidecarActionInvocationKind.HostEntry,
             descriptor.Key,
@@ -1001,7 +1001,7 @@ public sealed class KernelExternalActionDispatchTests
             action,
             snapshot,
             new SidecarExternalActionDispatchAuthority(
-                moduleId,
+                SourceId,
                 graphId,
                 call,
                 descriptorIdentity,
@@ -1075,14 +1075,14 @@ public sealed class KernelExternalActionDispatchTests
 
     private static KernelGraphCompileOptions ExternalPolicyOptions() => new()
     {
-        ActionModuleCapabilityGrants = ModuleGrant(ActionInterceptionCapabilities.Inspect)
+        ActionRegistrationCapabilityGrants = OwnerGrant(ActionInterceptionCapabilities.Inspect)
     };
 
     private static IReadOnlyDictionary<string, IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
-        ModuleGrant(ActionInterceptionCapabilities capabilities) =>
+        OwnerGrant(ActionInterceptionCapabilities capabilities) =>
         new Dictionary<string, IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
         {
-            ["sidecar.module"] = new Dictionary<string, ActionInterceptionCapabilities>
+            ["sidecar.registration"] = new Dictionary<string, ActionInterceptionCapabilities>
             {
                 ["sidecar.external.action"] = capabilities
             }
@@ -1151,12 +1151,12 @@ public sealed class KernelExternalActionDispatchTests
             now,
             expiresAt);
         var binding = new SidecarCapabilitySessionBinding(
-            fixture.Authority.ModuleId,
+            fixture.Authority.SourceId,
             fixture.Authority.GraphId,
             1,
             new SidecarCapabilityGrant(
                 "core-test-grant",
-                fixture.Authority.ModuleId,
+                fixture.Authority.SourceId,
                 fixture.Authority.GraphId,
                 [SidecarCapabilityKind.Action],
                 "authorization-hash",

@@ -2,7 +2,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 using SharpClaw.Contracts.Providers;
 using SharpClaw.Core.Kernel;
 
@@ -164,14 +164,14 @@ public sealed class KernelAuthorityCorrectionTests
     {
         var key = new SharpClawEventKey("sensitive.event");
         var descriptor = SensitiveDescriptor(key, true);
-        var registry = new KernelModuleRegistry();
-        registry.Add(new EventOwnerModule(descriptor));
-        registry.Add(new EventListenerModule(key));
+        var registry = new ServiceCollection();
+        registry.Add(new EventOwnerRegistration(descriptor));
+        registry.Add(new EventListenerRegistration(key));
 
         var exception = Assert.Throws<KernelGraphCompilationException>(() => registry.Compile(
             options: new KernelGraphCompileOptions
             {
-                EventModuleCapabilityGrants = new Dictionary<
+                EventRegistrationCapabilityGrants = new Dictionary<
                     string,
                     IReadOnlyDictionary<string, EventInterceptionCapabilities>>
                 {
@@ -180,7 +180,7 @@ public sealed class KernelAuthorityCorrectionTests
                         [key.Value] = EventInterceptionCapabilities.Inspect |
                                       EventInterceptionCapabilities.Observe
                     },
-                    ["listener.module"] = new Dictionary<string, EventInterceptionCapabilities>
+                    ["listener.registration"] = new Dictionary<string, EventInterceptionCapabilities>
                     {
                         [key.Value] = EventInterceptionCapabilities.Inspect |
                                       EventInterceptionCapabilities.Observe
@@ -205,14 +205,14 @@ public sealed class KernelAuthorityCorrectionTests
     public void Event_listener_without_observation_authority_cannot_compile()
     {
         var key = new SharpClawEventKey("grant.listener");
-        var registry = new KernelModuleRegistry();
-        registry.Add(new EventOwnerModule(SensitiveDescriptor(key, false)));
-        registry.Add(new EventListenerModule(key));
+        var registry = new ServiceCollection();
+        registry.Add(new EventOwnerRegistration(SensitiveDescriptor(key, false)));
+        registry.Add(new EventListenerRegistration(key));
 
         var exception = Assert.Throws<KernelGraphCompilationException>(() => registry.Compile(
             options: new KernelGraphCompileOptions
             {
-                EventModuleCapabilityGrants = new Dictionary<
+                EventRegistrationCapabilityGrants = new Dictionary<
                     string,
                     IReadOnlyDictionary<string, EventInterceptionCapabilities>>
                 {
@@ -221,7 +221,7 @@ public sealed class KernelAuthorityCorrectionTests
                         [key.Value] = EventInterceptionCapabilities.Inspect |
                                       EventInterceptionCapabilities.Observe
                     },
-                    ["listener.module"] = new Dictionary<string, EventInterceptionCapabilities>
+                    ["listener.registration"] = new Dictionary<string, EventInterceptionCapabilities>
                     {
                         [key.Value] = EventInterceptionCapabilities.Inspect
                     }
@@ -292,10 +292,6 @@ public sealed class KernelAuthorityCorrectionTests
         Assert.Contains(ActionSafePoint.BeforeCommit, storageCommit.SafePoints);
         Assert.Contains(ActionSafePoint.AfterCommit, storageCommit.SafePoints);
 
-        var moduleStart = KernelActionCatalog.DescriptorFor(new("module.start"));
-        Assert.True(moduleStart.HasIrreversibleEffects);
-        Assert.Equal(ActionRepeatKind.None, moduleStart.RepeatPolicy.Kind);
-
         var turnComplete = KernelActionCatalog.DescriptorFor(new("chat.turn.complete"));
         Assert.False(turnComplete.HasIrreversibleEffects);
         Assert.True(turnComplete.Capabilities.HasFlag(ActionInterceptionCapabilities.Defer));
@@ -328,8 +324,8 @@ public sealed class KernelAuthorityCorrectionTests
                 entry.Key.Value,
                 entry.Version.ToString(CultureInfo.InvariantCulture),
                 entry.Category,
-                entry.InputPayloadType?.AssemblyQualifiedName ?? "module-typed",
-                entry.ResultPayloadType?.AssemblyQualifiedName ?? "module-typed",
+                entry.InputPayloadType?.AssemblyQualifiedName ?? "custom-typed",
+                entry.ResultPayloadType?.AssemblyQualifiedName ?? "custom-typed",
                 entry.InputSchema.ContractName,
                 entry.InputSchema.Version.ToString(CultureInfo.InvariantCulture),
                 entry.InputSchema.ContentHash,
@@ -350,15 +346,15 @@ public sealed class KernelAuthorityCorrectionTests
                 string.Join(',', entry.SafePoints.Select(value => ((int)value).ToString(CultureInfo.InvariantCulture))),
                 ((int)entry.Profile).ToString(CultureInfo.InvariantCulture)));
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join("\n", records))));
-        Assert.Equal("1694E44DFFB1C91251E500579D2AC7A28B86B611EF52EC927383B2B564FA6D7E", hash);
+        Assert.Equal("5B50D1B33414EEEAC5594D33C3F5B31E9A0292359E12FC54962A794F9C7E0024", hash);
     }
 
     [Fact]
-    public void Module_hook_effects_must_fit_descriptor_host_and_administrator_grants()
+    public void Registration_hook_effects_must_fit_descriptor_host_and_administrator_grants()
     {
         var key = SharpClawActions.Chat.Turn;
-        var registry = new KernelModuleRegistry();
-        registry.Add(new GrantRequestModule(key));
+        var registry = new ServiceCollection();
+        registry.Add(new GrantRequestRegistration(key));
 
         var exception = Assert.Throws<KernelGraphCompilationException>(() => registry.Compile(
             options: new KernelGraphCompileOptions
@@ -368,11 +364,11 @@ public sealed class KernelAuthorityCorrectionTests
                     [key.Value] = ActionInterceptionCapabilities.Inspect |
                                   ActionInterceptionCapabilities.Wrap
                 },
-                ActionModuleCapabilityGrants = new Dictionary<
+                ActionRegistrationCapabilityGrants = new Dictionary<
                     string,
                     IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
                 {
-                    ["grant.request.module"] = new Dictionary<string, ActionInterceptionCapabilities>
+                    ["grant.request.registration"] = new Dictionary<string, ActionInterceptionCapabilities>
                     {
                         [key.Value] = ActionInterceptionCapabilities.Inspect |
                                       ActionInterceptionCapabilities.Cancel
@@ -380,7 +376,7 @@ public sealed class KernelAuthorityCorrectionTests
                 }
             }));
 
-        Assert.Contains("grant.request.module", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("grant.request.registration", exception.Message, StringComparison.Ordinal);
         Assert.Contains(nameof(ActionInterceptionCapabilities.Cancel), exception.Message, StringComparison.Ordinal);
         Assert.Contains("unauthorized", exception.Message, StringComparison.OrdinalIgnoreCase);
     }
@@ -788,13 +784,16 @@ public sealed class KernelAuthorityCorrectionTests
         }
     }
 
-    private sealed class GrantRequestModule(SharpClawActionKey key) : ISharpClawModule
+    private sealed class GrantRequestRegistration(SharpClawActionKey key) : ITestServiceRegistration
     {
-        public ModuleIdentity Identity { get; } =
-            new("grant.request.module", "Grant request module", "grant_request");
+        public TestSourceIdentity Identity { get; } =
+            new("grant.request.registration", "Grant request registration", "grant_request");
 
-        public void Configure(ISharpClawModuleBuilder module) =>
-            module.Hooks.For(key).Use<CancellationTypedInterceptor>(Order("grant-request"));
+        public void Configure(IServiceCollection services) =>
+            services.AddActionHook<CancellationTypedInterceptor>(
+                Identity.Id,
+                key,
+                Order("grant-request"));
     }
 
     private sealed class StandardWildcardContractInterceptor : IAnyActionInterceptor
@@ -834,19 +833,24 @@ public sealed class KernelAuthorityCorrectionTests
 
     private sealed record SensitivePayload(string Value);
 
-    private sealed class EventOwnerModule(EventDescriptor<SensitivePayload> descriptor) : ISharpClawModule
+    private sealed class EventOwnerRegistration(EventDescriptor<SensitivePayload> descriptor) : ITestServiceRegistration
     {
-        public ModuleIdentity Identity { get; } = new("event.owner", "Event owner", "event_owner");
+        public TestSourceIdentity Identity { get; } = new("event.owner", "Event owner", "event_owner");
 
-        public void Configure(ISharpClawModuleBuilder module) => module.Events.Add(descriptor);
+        public void Configure(IServiceCollection services) =>
+            services.AddEvent(Identity.Id, descriptor);
     }
 
-    private sealed class EventListenerModule(SharpClawEventKey key) : ISharpClawModule
+    private sealed class EventListenerRegistration(SharpClawEventKey key) : ITestServiceRegistration
     {
-        public ModuleIdentity Identity { get; } = new("listener.module", "Listener module", "listener");
+        public TestSourceIdentity Identity { get; } = new("listener.registration", "Listener registration", "listener");
 
-        public void Configure(ISharpClawModuleBuilder module) =>
-            module.Events.For(key).Listen<SensitiveListener>(EventDelivery.Inline, Order("listener"));
+        public void Configure(IServiceCollection services) =>
+            services.AddEventListener<SensitiveListener>(
+                Identity.Id,
+                key,
+                EventDelivery.Inline,
+                Order("listener"));
     }
 
     private sealed class SensitiveListener : IEventListener<SensitivePayload>

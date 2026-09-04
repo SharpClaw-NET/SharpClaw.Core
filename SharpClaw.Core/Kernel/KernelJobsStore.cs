@@ -1,11 +1,11 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 
 namespace SharpClaw.Core.Kernel;
 
-/// <summary>Stores the complete Jobs aggregate through the neutral module storage contract.</summary>
+/// <summary>Stores the complete Jobs aggregate through the neutral registration storage contract.</summary>
 public sealed class KernelJobsStore
 {
     private const int MaxRetainedAttempts = 32;
@@ -15,33 +15,33 @@ public sealed class KernelJobsStore
     private const int MaxHistoryDocumentBytes = 40_000;
     private const int MaxPayloadEnvelopeBytes = 12_000;
 
-    private readonly IModuleStorageGateway _gateway;
-    private readonly ModuleDocumentStore<KernelJobsAggregate> _records;
-    private readonly string _ownerModuleId;
+    private readonly IScopedStorageGateway _gateway;
+    private readonly ScopedDocumentStore<KernelJobsAggregate> _records;
+    private readonly string _ownerRegistrationId;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true,
     };
 
     public KernelJobsStore(
-        IModuleStorageGateway gateway,
-        string ownerModuleId = KernelJobsStorage.OwnerModuleId)
+        IScopedStorageGateway gateway,
+        string OwnerId = KernelJobsStorage.OwnerId)
     {
         ArgumentNullException.ThrowIfNull(gateway);
-        if (string.IsNullOrWhiteSpace(ownerModuleId))
-            throw new ArgumentException("A Jobs store requires an owner module.", nameof(ownerModuleId));
+        if (string.IsNullOrWhiteSpace(OwnerId))
+            throw new ArgumentException("A Jobs store requires an owner registration.", nameof(OwnerId));
 
         _jsonOptions.Converters.Add(new ReadOnlySetJsonConverterFactory());
-        _ownerModuleId = ownerModuleId;
+        _ownerRegistrationId = OwnerId;
         _gateway = gateway;
-        _records = new ModuleDocumentStore<KernelJobsAggregate>(
+        _records = new ScopedDocumentStore<KernelJobsAggregate>(
             gateway,
-            ownerModuleId,
+            OwnerId,
             KernelJobsStorage.Jobs,
-            ownerModuleId);
+            OwnerId);
     }
 
-    public async Task<ModuleDocumentRecord<JobDocument>?> GetJobAsync(
+    public async Task<ScopedDocumentRecord<JobDocument>?> GetJobAsync(
         Guid jobId,
         CancellationToken cancellationToken = default)
     {
@@ -49,7 +49,7 @@ public sealed class KernelJobsStore
         return record is null ? null : ToJobRecord(record);
     }
 
-    public async Task<IReadOnlyList<ModuleDocumentRecord<JobDocument>>> ListJobRecordsAsync(
+    public async Task<IReadOnlyList<ScopedDocumentRecord<JobDocument>>> ListJobRecordsAsync(
         string? callerSubjectId = null,
         Guid? idempotencyKey = null,
         CancellationToken cancellationToken = default)
@@ -66,7 +66,7 @@ public sealed class KernelJobsStore
         return records.Select(ToJobRecord).ToArray();
     }
 
-    public Task<IReadOnlyList<ModuleDocumentRecord<JobDocument>>> FindJobRecordsByIdempotencyAsync(
+    public Task<IReadOnlyList<ScopedDocumentRecord<JobDocument>>> FindJobRecordsByIdempotencyAsync(
         Guid idempotencyKey,
         CancellationToken cancellationToken = default) =>
         ListJobRecordsAsync(idempotencyKey: idempotencyKey, cancellationToken: cancellationToken);
@@ -75,7 +75,7 @@ public sealed class KernelJobsStore
         JobDocument job,
         long? expectedRevision = null,
         CancellationToken cancellationToken = default,
-        ModuleStorageClaimAuthority? authority = null)
+        ScopedStorageClaimAuthority? authority = null)
     {
         var current = await FindAggregateRecordByJobIdAsync(job.Id, cancellationToken);
         var expected = expectedRevision ?? current?.Revision ?? 0;
@@ -84,7 +84,7 @@ public sealed class KernelJobsStore
             current?.Key ?? AggregateKey(job.IdempotencyKey),
             aggregate,
             expected,
-            ModuleStorageOperations.Upsert,
+            ScopedStorageOperations.Upsert,
             authority,
             cancellationToken);
     }
@@ -149,25 +149,25 @@ public sealed class KernelJobsStore
             claim.Authority);
     }
 
-    public async Task<ModuleStorageClaimAuthority> RenewJobClaimAsync(
-        ModuleStorageClaimAuthority authority,
+    public async Task<ScopedStorageClaimAuthority> RenewJobClaimAsync(
+        ScopedStorageClaimAuthority authority,
         DateTimeOffset requestedLeaseExpiresAt,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(authority);
         var result = await _gateway.RenewClaimAsync(
-            _ownerModuleId,
+            _ownerRegistrationId,
             KernelJobsStorage.Jobs,
-            new ModuleStorageClaimRenewalRequest(
-                _ownerModuleId,
+            new ScopedStorageClaimRenewalRequest(
+                _ownerRegistrationId,
                 authority.HostToken,
                 authority.Generation,
                 requestedLeaseExpiresAt),
             cancellationToken);
         if (!result.Renewed || result.Authority is null)
         {
-            throw new ModuleStorageContractException(new ModuleStorageContractFailure(
-                result.ErrorCode ?? ModuleStorageErrors.StaleClaim,
+            throw new ScopedStorageContractException(new ScopedStorageContractFailure(
+                result.ErrorCode ?? ScopedStorageErrors.StaleClaim,
                 "The Jobs storage claim could not be renewed."));
         }
 
@@ -175,16 +175,16 @@ public sealed class KernelJobsStore
     }
 
     public async Task<bool> RecoverJobClaimAsync(
-        ModuleStorageClaimAuthority authority,
+        ScopedStorageClaimAuthority authority,
         DateTimeOffset observedAt,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(authority);
         var result = await _gateway.RecoverClaimAsync(
-            _ownerModuleId,
+            _ownerRegistrationId,
             KernelJobsStorage.Jobs,
-            new ModuleStorageClaimRecoveryRequest(
-                _ownerModuleId,
+            new ScopedStorageClaimRecoveryRequest(
+                _ownerRegistrationId,
                 authority.HostToken,
                 authority.Generation,
                 observedAt),
@@ -196,7 +196,7 @@ public sealed class KernelJobsStore
         JobAttemptDocument attempt,
         long? expectedRevision = null,
         CancellationToken cancellationToken = default,
-        ModuleStorageClaimAuthority? authority = null)
+        ScopedStorageClaimAuthority? authority = null)
     {
         var current = await RequireAggregateRecordAsync(attempt.JobId, cancellationToken);
         var expected = expectedRevision ?? current.Revision;
@@ -207,12 +207,12 @@ public sealed class KernelJobsStore
             current.Key,
             current.Value with { Attempts = attempts },
             expected,
-            ModuleStorageOperations.Upsert,
+            ScopedStorageOperations.Upsert,
             authority,
             cancellationToken);
     }
 
-    public async Task<ModuleDocumentRecord<JobAttemptDocument>?> GetAttemptAsync(
+    public async Task<ScopedDocumentRecord<JobAttemptDocument>?> GetAttemptAsync(
         Guid jobId,
         Guid attemptId,
         CancellationToken cancellationToken = default)
@@ -221,20 +221,20 @@ public sealed class KernelJobsStore
         var attempt = aggregate?.Value?.Attempts.FirstOrDefault(item => item.AttemptId == attemptId);
         return aggregate is null || attempt is null
             ? null
-            : new ModuleDocumentRecord<JobAttemptDocument>(
+            : new ScopedDocumentRecord<JobAttemptDocument>(
                 AttemptKey(attemptId),
                 attempt,
                 aggregate.Revision,
                 aggregate.Indexes);
     }
 
-    public async Task<IReadOnlyList<ModuleDocumentRecord<JobAttemptDocument>>> ListAttemptRecordsAsync(
+    public async Task<IReadOnlyList<ScopedDocumentRecord<JobAttemptDocument>>> ListAttemptRecordsAsync(
         Guid jobId,
         CancellationToken cancellationToken = default)
     {
         var aggregate = await FindAggregateRecordByJobIdAsync(jobId, cancellationToken);
         return aggregate?.Value?.Attempts
-            .Select(attempt => new ModuleDocumentRecord<JobAttemptDocument>(
+            .Select(attempt => new ScopedDocumentRecord<JobAttemptDocument>(
                 AttemptKey(attempt.AttemptId),
                 attempt,
                 aggregate.Revision,
@@ -247,7 +247,7 @@ public sealed class KernelJobsStore
         JobAttemptDocument finishedAttempt,
         JobPayloadEnvelope result,
         long expectedRevision,
-        ModuleStorageClaimAuthority? authority = null,
+        ScopedStorageClaimAuthority? authority = null,
         CancellationToken cancellationToken = default)
     {
         var current = await RequireAggregateRecordAsync(completedJob.Id, cancellationToken);
@@ -263,32 +263,32 @@ public sealed class KernelJobsStore
                 Result = result,
             },
             expectedRevision,
-            ModuleStorageOperations.Upsert,
+            ScopedStorageOperations.Upsert,
             authority,
             cancellationToken);
     }
 
-    public async Task<ModuleDocumentRecord<JobPayloadEnvelope>?> GetResultAsync(
+    public async Task<ScopedDocumentRecord<JobPayloadEnvelope>?> GetResultAsync(
         Guid jobId,
         CancellationToken cancellationToken = default)
     {
         var aggregate = await FindAggregateRecordByJobIdAsync(jobId, cancellationToken);
         return aggregate?.Value?.Result is not { } result
             ? null
-            : new ModuleDocumentRecord<JobPayloadEnvelope>(
+            : new ScopedDocumentRecord<JobPayloadEnvelope>(
                 JobKey(jobId),
                 result,
                 aggregate.Revision,
                 aggregate.Indexes);
     }
 
-    public async Task<IReadOnlyList<ModuleDocumentRecord<JobProgress>>> ListProgressRecordsAsync(
+    public async Task<IReadOnlyList<ScopedDocumentRecord<JobProgress>>> ListProgressRecordsAsync(
         Guid jobId,
         CancellationToken cancellationToken = default)
     {
         var aggregate = await FindAggregateRecordByJobIdAsync(jobId, cancellationToken);
         return aggregate?.Value?.Progress
-            .Select((progress, index) => new ModuleDocumentRecord<JobProgress>(
+            .Select((progress, index) => new ScopedDocumentRecord<JobProgress>(
                 $"{jobId:N}:{index:D8}",
                 progress,
                 aggregate.Revision,
@@ -299,7 +299,7 @@ public sealed class KernelJobsStore
     public async Task SaveProgressAsync(
         JobProgress progress,
         CancellationToken cancellationToken = default,
-        ModuleStorageClaimAuthority? authority = null)
+        ScopedStorageClaimAuthority? authority = null)
     {
         ValidateProgress(progress);
         var current = await RequireAggregateRecordAsync(progress.JobId, cancellationToken);
@@ -308,7 +308,7 @@ public sealed class KernelJobsStore
             current.Key,
             current.Value with { Progress = next },
             current.Revision,
-            ModuleStorageOperations.Upsert,
+            ScopedStorageOperations.Upsert,
             authority,
             cancellationToken);
     }
@@ -317,7 +317,7 @@ public sealed class KernelJobsStore
         Guid jobId,
         long? expectedRevision = null,
         CancellationToken cancellationToken = default,
-        ModuleStorageClaimAuthority? authority = null)
+        ScopedStorageClaimAuthority? authority = null)
     {
         var current = await FindAggregateRecordByJobIdAsync(jobId, cancellationToken);
         if (current is null)
@@ -327,13 +327,13 @@ public sealed class KernelJobsStore
             current.Key,
             null,
             expectedRevision ?? current.Revision,
-            ModuleStorageOperations.Delete,
+            ScopedStorageOperations.Delete,
             authority,
             cancellationToken);
         return true;
     }
 
-    private async Task<ModuleDocumentRecord<KernelJobsAggregate>?> FindAggregateRecordByJobIdAsync(
+    private async Task<ScopedDocumentRecord<KernelJobsAggregate>?> FindAggregateRecordByJobIdAsync(
         Guid jobId,
         CancellationToken cancellationToken)
     {
@@ -345,7 +345,7 @@ public sealed class KernelJobsStore
         return records.FirstOrDefault();
     }
 
-    private async Task<ModuleDocumentRecord<KernelJobsAggregate>> RequireAggregateRecordAsync(
+    private async Task<ScopedDocumentRecord<KernelJobsAggregate>> RequireAggregateRecordAsync(
         Guid jobId,
         CancellationToken cancellationToken)
     {
@@ -359,7 +359,7 @@ public sealed class KernelJobsStore
         KernelJobsAggregate? aggregate,
         long expectedRevision,
         string operation,
-        ModuleStorageClaimAuthority? authority,
+        ScopedStorageClaimAuthority? authority,
         CancellationToken cancellationToken)
     {
         JsonElement? serializedAggregate = null;
@@ -378,7 +378,7 @@ public sealed class KernelJobsStore
             serializedAggregate = serialized;
         }
 
-        var mutation = new ModuleStorageMutation(
+        var mutation = new ScopedStorageMutation(
             operation,
             key,
             serializedAggregate,
@@ -386,18 +386,18 @@ public sealed class KernelJobsStore
             aggregate is null ? null : JobIndexes(aggregate.Job),
             expectedRevision,
             authority);
-        var request = new ModuleStorageMutationAndOutboxRequest(
-            new ModuleStorageCommitIdentity(
+        var request = new ScopedStorageMutationAndOutboxRequest(
+            new ScopedStorageCommitIdentity(
                 Guid.TryParse(key, out var keyIdentity) ? keyIdentity : Guid.NewGuid(),
                 $"jobs:{key}:{expectedRevision}:{operation}"),
             [mutation],
             []);
         var result = await _gateway.CommitMutationAndOutboxAsync(
-            _ownerModuleId,
+            _ownerRegistrationId,
             KernelJobsStorage.Jobs,
             request,
             cancellationToken);
-        ModuleStorageCommitValidation.Validate(request, result);
+        ScopedStorageCommitValidation.Validate(request, result);
         if (result.AlreadyCommitted)
         {
             throw RevisionConflict(
@@ -484,12 +484,12 @@ public sealed class KernelJobsStore
         }
     }
 
-    private static ModuleDocumentRecord<JobDocument> ToJobRecord(
-        ModuleDocumentRecord<KernelJobsAggregate> record) =>
+    private static ScopedDocumentRecord<JobDocument> ToJobRecord(
+        ScopedDocumentRecord<KernelJobsAggregate> record) =>
         new(record.Key, record.Value!.Job, record.Revision, record.Indexes);
 
-    private static ModuleDocumentRecord<JobDocument> ToJobRecord(
-        ModuleStorageClaimRecord<KernelJobsAggregate> record) =>
+    private static ScopedDocumentRecord<JobDocument> ToJobRecord(
+        ScopedStorageClaimRecord<KernelJobsAggregate> record) =>
         new(record.Key, record.Value!.Job, record.Revision, record.Indexes);
 
     private static object JobIndexes(JobDocument job) => new
@@ -510,12 +510,12 @@ public sealed class KernelJobsStore
 
     private static string AttemptKey(Guid attemptId) => attemptId.ToString("N");
 
-    private static ModuleStorageContractException RevisionConflict(
+    private static ScopedStorageContractException RevisionConflict(
         string key,
         long? expectedRevision,
         long? actualRevision) =>
-        new(new ModuleStorageContractFailure(
-            ModuleStorageErrors.RevisionConflict,
+        new(new ScopedStorageContractFailure(
+            ScopedStorageErrors.RevisionConflict,
             $"The Jobs aggregate revision for '{key}' changed before the requested mutation.",
             key,
             expectedRevision,
@@ -551,8 +551,8 @@ public sealed class KernelJobsStore
 }
 
 internal sealed record KernelJobsClaim(
-    ModuleDocumentRecord<JobDocument> Job,
-    ModuleStorageClaimAuthority Authority);
+    ScopedDocumentRecord<JobDocument> Job,
+    ScopedStorageClaimAuthority Authority);
 
 internal sealed record KernelJobsAggregate(
     JobDocument Job,

@@ -1,6 +1,6 @@
 using System.Collections.Frozen;
 using System.Collections.ObjectModel;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 
 namespace SharpClaw.Core.Kernel;
 
@@ -29,7 +29,7 @@ public sealed class KernelActionExecutionContext
             features.Items.Select(feature => new ExtensionFeature(
                 feature.ContractName,
                 feature.SchemaVersion,
-                feature.OwnerModuleId,
+                feature.OwnerId,
                 feature.MaxBytes,
                 feature.Value.ValueKind == System.Text.Json.JsonValueKind.Undefined
                     ? default

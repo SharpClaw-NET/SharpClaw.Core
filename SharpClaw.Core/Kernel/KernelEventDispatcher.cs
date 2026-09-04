@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 
 namespace SharpClaw.Core.Kernel;
 
@@ -125,7 +125,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                 null,
                 _traceId,
                 DateTimeOffset.UtcNow,
-                _definition.OwnerModuleId,
+                _definition.OwnerId,
                 payload);
             var context = new EventContext<TEvent>(
                 _definition.Descriptor,
@@ -160,7 +160,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                         envelope.ActionInvocationId,
                         envelope.TraceId,
                         envelope.Timestamp,
-                        envelope.OwnerModuleId,
+                        envelope.OwnerId,
                         KernelJson.Serialize(payload));
                     var untypedControl = new UntypedEventControl(control);
                     var untypedOutcome = await InvokeBoundedAsync(
@@ -265,7 +265,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                 null,
                 _traceId,
                 DateTimeOffset.UtcNow,
-                _definition.OwnerModuleId,
+                _definition.OwnerId,
                 payload);
             foreach (var listener in _definition.Listeners)
             {
@@ -288,7 +288,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                                     envelope.ActionInvocationId,
                                     envelope.TraceId,
                                     envelope.Timestamp,
-                                    envelope.OwnerModuleId,
+                                    envelope.OwnerId,
                                     KernelJson.Serialize(payload)),
                                 token),
                             listener.Ordering,
@@ -308,7 +308,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                             envelope.ActionInvocationId,
                             envelope.TraceId,
                             envelope.Timestamp,
-                            envelope.OwnerModuleId,
+                            envelope.OwnerId,
                             KernelJson.Serialize(payload));
                     await _deliverySink.EnqueueAsync(
                         _definition.Descriptor.Key,
@@ -543,7 +543,7 @@ public sealed class KernelEventDispatcher : ICommittedEventWriter
                 if (!frame.EffectiveCapabilities.HasFlag(capability))
                 {
                     throw new KernelCapabilityException(
-                        $"Module '{frame.OwnerModuleId}' does not have effective capability '{capability}' " +
+                        $"Registration '{frame.OwnerId}' does not have effective capability '{capability}' " +
                         $"for event '{owner._definition.Descriptor.Key.Value}'.");
                 }
                 _used = true;

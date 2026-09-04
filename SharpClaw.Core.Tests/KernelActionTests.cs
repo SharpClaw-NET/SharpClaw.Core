@@ -1,5 +1,5 @@
 using System.Text.Json;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 using SharpClaw.Core.Kernel;
 
 namespace SharpClaw.Core.Tests;
@@ -68,7 +68,7 @@ public sealed class KernelActionTests
             new HashSet<string>(["operator"], StringComparer.Ordinal),
             true);
         var features = new ExtensionFeatureSet(
-            [new ExtensionFeature("feature", 1, "sample.module", 100, JsonSerializer.SerializeToElement(true))]);
+            [new ExtensionFeature("feature", 1, "sample.registration", 100, JsonSerializer.SerializeToElement(true))]);
         var traceId = Guid.NewGuid();
         var idempotencyKey = Guid.NewGuid();
         var dispatcher = new KernelActionDispatcher(
@@ -202,40 +202,42 @@ public sealed class KernelActionTests
     }
 
     [Fact]
-    public void K01_through_K14_compile_as_a_single_action_catalog()
+    public void Kernel_boundaries_compile_as_one_action_catalog()
     {
         var graph = new KernelGraphBuilder().Compile();
 
-        Assert.Equal(14, KernelActionCatalog.Coverage.Count);
+        Assert.Equal(13, KernelActionCatalog.Coverage.Count);
         Assert.Equal(
-            14,
+            13,
             KernelActionCatalog.Coverage.Select(entry => entry.Id).Distinct(StringComparer.Ordinal).Count());
         Assert.All(KernelActionCatalog.Coverage, entry => Assert.True(graph.ContainsAction(entry.ActionKey)));
         Assert.NotEmpty(graph.ActionSnapshot.ContractHash);
     }
 
     [Fact]
-    public void Module_registry_compiles_module_actions_without_host_policy_types()
+    public void Registration_registry_compiles_registration_actions_without_host_policy_types()
     {
-        var registry = new KernelModuleRegistry();
-        registry.Add(new SampleModule());
+        var registry = new ServiceCollection();
+        registry.Add(new SampleRegistration());
 
         var graph = registry.Compile(
             options: new KernelGraphCompileOptions
             {
-                ActionModuleCapabilityGrants = new Dictionary<
+                ActionRegistrationCapabilityGrants = new Dictionary<
                     string,
                     IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
                 {
-                    ["sample.module"] = new Dictionary<string, ActionInterceptionCapabilities>
+                    ["sample.registration"] = new Dictionary<string, ActionInterceptionCapabilities>
                     {
-                        ["module.action"] = KernelActionCapabilities
+                        ["registration.action"] = KernelActionCapabilities
                     }
                 }
             });
 
-        Assert.Single(registry.Modules);
-        Assert.True(graph.ContainsAction(new SharpClawActionKey("module.action")));
+        Assert.Single(
+            registry,
+            descriptor => descriptor.ServiceType == typeof(IActionDefinitionBinding));
+        Assert.True(graph.ContainsAction(new SharpClawActionKey("registration.action")));
     }
 
     private static ActionDescriptor<KernelActionEnvelope, object> Descriptor(
@@ -325,13 +327,13 @@ public sealed class KernelActionTests
                 cancellationToken);
     }
 
-    private sealed class SampleModule : ISharpClawModule
+    private sealed class SampleRegistration : ITestServiceRegistration
     {
-        public ModuleIdentity Identity { get; } = new("sample.module", "Sample", "sample");
+        public TestSourceIdentity Identity { get; } = new("sample.registration", "Sample", "sample");
 
-        public void Configure(ISharpClawModuleBuilder builder)
-        {
-            builder.Actions.Add(Descriptor(new SharpClawActionKey("module.action")));
-        }
+        public void Configure(IServiceCollection services) =>
+            services.AddAction(
+                Identity.Id,
+                Descriptor(new SharpClawActionKey("registration.action")));
     }
 }

@@ -2,8 +2,7 @@ using System.Collections.ObjectModel;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using Microsoft.Extensions.DependencyInjection;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 using SharpClaw.Contracts.Providers;
 
 namespace SharpClaw.Core.Kernel;
@@ -86,7 +85,6 @@ public static class KernelActionCatalog
             new("K08", "tool invocation", SharpClawActions.Tools.Invoke),
             new("K09", "storage operation", new("storage.get")),
             new("K10", "transaction commit", new("storage.transaction.commit")),
-            new("K11", "module lifecycle", new("module.start")),
             new("K12", "event delivery", new("event.deliver")),
             new("K13", "background execution", new("background.tick.execute")),
             new("K14", "gateway boundary", new("gateway.request.receive"))
@@ -116,7 +114,6 @@ public static class KernelActionCatalog
             var value when value.StartsWith("client.", StringComparison.Ordinal) => "client",
             var value when value.StartsWith("storage.", StringComparison.Ordinal) => "storage",
             var value when value.StartsWith("transaction.", StringComparison.Ordinal) => "transaction",
-            var value when value.StartsWith("module.", StringComparison.Ordinal) => "module",
             var value when value.StartsWith("event.", StringComparison.Ordinal) => "event",
             var value when value.StartsWith("background.", StringComparison.Ordinal) => "background",
             var value when value.StartsWith("gateway.", StringComparison.Ordinal) => "gateway",
@@ -163,29 +160,29 @@ public sealed class KernelGraphCompileOptions
     /// <summary>Administrator grants keyed by action key. A missing key uses the descriptor grant.</summary>
     public IReadOnlyDictionary<string, ActionInterceptionCapabilities>? ActionCapabilityGrants { get; init; }
 
-    /// <summary>Module manifest grants keyed by module id and action key.</summary>
+    /// <summary>Registration manifest grants keyed by registration id and action key.</summary>
     public IReadOnlyDictionary<string, IReadOnlyDictionary<string, ActionInterceptionCapabilities>>?
-        ActionModuleCapabilityGrants
+        ActionRegistrationCapabilityGrants
     { get; init; }
 
     /// <summary>Administrator grants keyed by event key. A missing key uses the descriptor grant.</summary>
     public IReadOnlyDictionary<string, EventInterceptionCapabilities>? EventCapabilityGrants { get; init; }
 
-    /// <summary>Module manifest grants keyed by module id and event key.</summary>
+    /// <summary>Registration manifest grants keyed by registration id and event key.</summary>
     public IReadOnlyDictionary<string, IReadOnlyDictionary<string, EventInterceptionCapabilities>>?
-        EventModuleCapabilityGrants
+        EventRegistrationCapabilityGrants
     { get; init; }
 
-    /// <summary>Exact sensitive action approvals bound to module, version, and schema identity.</summary>
+    /// <summary>Exact sensitive action approvals bound to registration, version, and schema identity.</summary>
     public IReadOnlyList<KernelSensitiveActionApproval> SensitiveActionApprovals { get; init; } = [];
 
-    /// <summary>Exact sensitive action approvals for neutral external module hooks.</summary>
+    /// <summary>Exact sensitive action approvals for neutral external registration hooks.</summary>
     public IReadOnlyList<KernelExternalSensitiveActionApproval> ExternalSensitiveActionApprovals { get; init; } = [];
 
-    /// <summary>Exact sensitive event approvals bound to module, version, and schema identity.</summary>
+    /// <summary>Exact sensitive event approvals bound to registration, version, and schema identity.</summary>
     public IReadOnlyList<KernelSensitiveEventApproval> SensitiveEventApprovals { get; init; } = [];
 
-    /// <summary>Exact sensitive event approvals for neutral external module hooks.</summary>
+    /// <summary>Exact sensitive event approvals for neutral external registration hooks.</summary>
     public IReadOnlyList<KernelExternalSensitiveEventApproval> ExternalSensitiveEventApprovals { get; init; } = [];
 
     public int MaximumActionDepth { get; init; } = 32;
@@ -198,9 +195,9 @@ public sealed class KernelGraphCompileOptions
             SupportedActionCapabilities = source.SupportedActionCapabilities,
             SupportedEventCapabilities = source.SupportedEventCapabilities,
             ActionCapabilityGrants = FreezeDictionary(source.ActionCapabilityGrants),
-            ActionModuleCapabilityGrants = FreezeNestedDictionary(source.ActionModuleCapabilityGrants),
+            ActionRegistrationCapabilityGrants = FreezeNestedDictionary(source.ActionRegistrationCapabilityGrants),
             EventCapabilityGrants = FreezeDictionary(source.EventCapabilityGrants),
-            EventModuleCapabilityGrants = FreezeNestedDictionary(source.EventModuleCapabilityGrants),
+            EventRegistrationCapabilityGrants = FreezeNestedDictionary(source.EventRegistrationCapabilityGrants),
             SensitiveActionApprovals = FreezeList(source.SensitiveActionApprovals),
             ExternalSensitiveActionApprovals = FreezeList(source.ExternalSensitiveActionApprovals),
             SensitiveEventApprovals = FreezeList(source.SensitiveEventApprovals),
@@ -242,7 +239,7 @@ public sealed class KernelGraphCompileOptions
 }
 
 public sealed record KernelSensitiveActionApproval(
-    string ModuleId,
+    string SourceId,
     SharpClawActionKey ActionKey,
     int ActionVersion,
     string ActionType,
@@ -250,21 +247,21 @@ public sealed record KernelSensitiveActionApproval(
     string SchemaIdentity);
 
 public sealed record KernelExternalSensitiveActionApproval(
-    string ModuleId,
+    string SourceId,
     SharpClawActionKey ActionKey,
     int ActionVersion,
     JsonSchemaReference InputSchema,
     JsonSchemaReference ResultSchema);
 
 public sealed record KernelSensitiveEventApproval(
-    string ModuleId,
+    string SourceId,
     SharpClawEventKey EventKey,
     int EventVersion,
     string EventType,
     string SchemaIdentity);
 
 public sealed record KernelExternalSensitiveEventApproval(
-    string ModuleId,
+    string SourceId,
     SharpClawEventKey EventKey,
     int EventVersion,
     JsonSchemaReference PayloadSchema);
@@ -651,7 +648,7 @@ public sealed record KernelQueuedEvent(
 
 public sealed record KernelToolRegistration(
     ToolDescriptor Descriptor,
-    string OwnerModuleId,
+    string OwnerId,
     Type HandlerType,
     IToolHandler? Handler = null,
     string? HandlerIdentity = null);
@@ -697,27 +694,16 @@ public sealed class KernelActionFailedException : Exception
 
 internal static class KernelServiceResolution
 {
-    public static object Resolve(Type serviceType, IServiceProvider? serviceProvider)
+    public static object Resolve(Type serviceType, IServiceProvider serviceProvider)
     {
-        var service = serviceProvider?.GetService(serviceType);
-        if (service is not null)
-            return service;
-
-        try
-        {
-            return serviceProvider is null
-                ? (Activator.CreateInstance(serviceType)
-                   ?? throw new KernelGraphCompilationException($"Cannot create service '{serviceType.FullName}'."))
-                : ActivatorUtilities.CreateInstance(serviceProvider, serviceType);
-        }
-        catch (Exception exception) when (exception is MissingMethodException or MemberAccessException)
-        {
-            throw new KernelGraphCompilationException(
-                $"Service '{serviceType.FullName}' requires a host service provider.");
-        }
+        ArgumentNullException.ThrowIfNull(serviceType);
+        ArgumentNullException.ThrowIfNull(serviceProvider);
+        return serviceProvider.GetService(serviceType)
+            ?? throw new KernelGraphCompilationException(
+                $"Service '{serviceType.FullName}' is not registered in the host service provider.");
     }
 
-    public static T Resolve<T>(IServiceProvider? serviceProvider) where T : notnull =>
+    public static T Resolve<T>(IServiceProvider serviceProvider) where T : notnull =>
         (T)Resolve(typeof(T), serviceProvider);
 }
 

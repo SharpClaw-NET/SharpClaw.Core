@@ -1,4 +1,4 @@
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 using SharpClaw.Core.Kernel;
 
 namespace SharpClaw.Core.Tests;
@@ -66,17 +66,17 @@ public sealed class KernelJobsCatalogTests
         }).ToArray();
         var graph = CreateJobsGraph();
 
-        Assert.Equal(172, SharpClawActionCatalog.Kernel.Count);
+        Assert.Equal(157, SharpClawActionCatalog.Kernel.Count);
         Assert.Equal(ExpectedFamilies, SharpClawActionCatalog.JobsFamilies);
         Assert.Equal(expectedKeys, SharpClawActionCatalog.Jobs.Select(key => key.Value));
-        Assert.Equal(310, SharpClawActionCatalog.All.Count);
-        Assert.Equal(310, SharpClawActionCatalog.All.Select(key => key.Value).Distinct().Count());
-        Assert.Equal(310, graph.ActionSnapshot.ActionGrants.Count);
+        Assert.Equal(295, SharpClawActionCatalog.All.Count);
+        Assert.Equal(295, SharpClawActionCatalog.All.Select(key => key.Value).Distinct().Count());
+        Assert.Equal(295, graph.ActionSnapshot.ActionGrants.Count);
         Assert.All(SharpClawActionCatalog.All, key => Assert.True(graph.ContainsAction(key)));
     }
 
     [Fact]
-    public void Jobs_manifest_uses_module_typed_descriptors_without_placeholders()
+    public void Jobs_manifest_uses_registration_typed_descriptors_without_placeholders()
     {
         var jobsEntries = KernelActionCatalog.Descriptors
             .Where(entry => entry.Key.Value.StartsWith("jobs.", StringComparison.Ordinal))
@@ -120,7 +120,7 @@ public sealed class KernelJobsCatalogTests
     }
 
     [Fact]
-    public void Jobs_module_owns_distinct_typed_root_and_checkpoint_descriptors()
+    public void Jobs_registration_owns_distinct_typed_root_and_checkpoint_descriptors()
     {
         var graph = CreateJobsGraph();
         var readKey = new SharpClawActionKey("jobs.read");
@@ -219,10 +219,10 @@ public sealed class KernelJobsCatalogTests
         var builder = new KernelGraphBuilder();
         builder.Add(
             Descriptor<JobsInput<ReadFamily>, JobsResult<ReadFamily>>("jobs.read"),
-            "partial.jobs.module");
+            "partial.jobs.registration");
 
         var exception = Assert.Throws<KernelGraphCompilationException>(() =>
-            builder.Compile(null, new KernelGraphCompileOptions()));
+            builder.Compile(new KernelGraphCompileOptions()));
 
         Assert.Contains("must register the catalog exactly once", exception.Message, StringComparison.Ordinal);
         Assert.Contains("jobs.submit", exception.Message, StringComparison.Ordinal);
@@ -235,10 +235,10 @@ public sealed class KernelJobsCatalogTests
         builder.Add(
             Descriptor<JobActionInput<System.Text.Json.JsonElement>, JobActionResult<System.Text.Json.JsonElement>>(
                 "jobs.read"),
-            "placeholder.jobs.module");
+            "placeholder.jobs.registration");
 
         var exception = Assert.Throws<KernelGraphCompilationException>(() =>
-            builder.Compile(null, new KernelGraphCompileOptions()));
+            builder.Compile(new KernelGraphCompileOptions()));
 
         Assert.Contains("typed descriptor", exception.Message, StringComparison.Ordinal);
         Assert.Contains("jobs.read", exception.Message, StringComparison.Ordinal);
@@ -275,26 +275,26 @@ public sealed class KernelJobsCatalogTests
     }
 
     [Fact]
-    public void Jobs_family_requires_one_module_owner()
+    public void Jobs_family_requires_one_registration_owner()
     {
-        var registry = new KernelModuleRegistry();
-        var jobs = new JobsDescriptorModule(
+        var registry = new ServiceCollection();
+        var jobs = new JobsDescriptorRegistration(
             skippedKeys: new HashSet<string>(StringComparer.Ordinal) { "jobs.read.before" });
-        var other = new ReadBeforeOwnerModule();
+        var other = new ReadBeforeOwnerRegistration();
         registry.Add(jobs);
         registry.Add(other);
 
         var exception = Assert.Throws<KernelGraphCompilationException>(() =>
-            registry.Compile(null, CreateOptions(jobs, [other], includeHookApprovals: true)));
+            registry.CompileForTest(CreateOptions(jobs, [other], includeHookApprovals: true)));
 
         Assert.Contains("jobs.read", exception.Message, StringComparison.Ordinal);
-        Assert.Contains("one module owner", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("one registration owner", exception.Message, StringComparison.Ordinal);
     }
 
     [Fact]
     public async Task Replace_input_cannot_redirect_the_operation_key()
     {
-        var hook = new JobsHookModule<ReadReplaceInputInterceptor, JobsInput<ReadFamily>, JobsResult<ReadFamily>>(
+        var hook = new JobsHookRegistration<ReadReplaceInputInterceptor, JobsInput<ReadFamily>, JobsResult<ReadFamily>>(
             new("jobs.replace.input", "Jobs replace input", "jobs_replace_input"),
             new SharpClawActionKey("jobs.read"),
             new("replace-input"));
@@ -323,13 +323,12 @@ public sealed class KernelJobsCatalogTests
     [Fact]
     public void Jobs_sensitive_hooks_require_exact_approval()
     {
-        var hook = new JobsHookModule<SensitiveJobsHook, JobsInput<ReadFamily>, JobsResult<ReadFamily>>(
-            new("jobs.hook.module", "Jobs hook module", "jobs_hook"),
+        var hook = new JobsHookRegistration<SensitiveJobsHook, JobsInput<ReadFamily>, JobsResult<ReadFamily>>(
+            new("jobs.hook.registration", "Jobs hook registration", "jobs_hook"),
             new SharpClawActionKey("jobs.read"),
             new("sensitive"));
         var (missingRegistry, missingJobs) = BuildJobsRegistry(false, hook);
-        var missing = Assert.Throws<KernelGraphCompilationException>(() => missingRegistry.Compile(
-            null,
+        var missing = Assert.Throws<KernelGraphCompilationException>(() => missingRegistry.CompileForTest(
             CreateOptions(missingJobs, [hook], includeHookApprovals: false)));
 
         Assert.Contains("Sensitive action", missing.Message, StringComparison.Ordinal);
@@ -343,7 +342,7 @@ public sealed class KernelJobsCatalogTests
     public async Task Jobs_progress_allows_cancel_wrap_and_denies_repeat()
     {
         var key = new SharpClawActionKey("jobs.progress.report");
-        var cancelHook = new JobsHookModule<ProgressCancelInterceptor, JobsInput<ProgressFamily>, JobsResult<ProgressFamily>>(
+        var cancelHook = new JobsHookRegistration<ProgressCancelInterceptor, JobsInput<ProgressFamily>, JobsResult<ProgressFamily>>(
             new("jobs.progress.cancel", "Jobs progress cancel", "jobs_progress_cancel"),
             key,
             new("cancel"));
@@ -364,7 +363,7 @@ public sealed class KernelJobsCatalogTests
         Assert.Equal(ActionOutcomeKind.Cancelled, cancelled.Kind);
         Assert.Equal(0, cancelTerminalCalls);
 
-        var wrapHook = new JobsHookModule<ProgressWrapInterceptor, JobsInput<ProgressFamily>, JobsResult<ProgressFamily>>(
+        var wrapHook = new JobsHookRegistration<ProgressWrapInterceptor, JobsInput<ProgressFamily>, JobsResult<ProgressFamily>>(
             new("jobs.progress.wrap", "Jobs progress wrap", "jobs_progress_wrap"),
             key,
             new("wrap"));
@@ -387,7 +386,7 @@ public sealed class KernelJobsCatalogTests
         Assert.Equal("terminal", wrapped.Result!.Value);
         Assert.True(ProgressWrapInterceptor.Invoked);
 
-        var repeatHook = new JobsHookModule<ProgressRepeatInterceptor, JobsInput<ProgressFamily>, JobsResult<ProgressFamily>>(
+        var repeatHook = new JobsHookRegistration<ProgressRepeatInterceptor, JobsInput<ProgressFamily>, JobsResult<ProgressFamily>>(
             new("jobs.progress.repeat", "Jobs progress repeat", "jobs_progress_repeat"),
             key,
             new("repeat"));
@@ -403,33 +402,33 @@ public sealed class KernelJobsCatalogTests
         Assert.Contains("capability", repeated.Error?.Message ?? string.Empty, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static KernelGraph CreateJobsGraph(params IJobsHookModule[] hooks)
+    private static KernelGraph CreateJobsGraph(params IJobsHookRegistration[] hooks)
     {
         var (registry, jobs) = BuildJobsRegistry(true, hooks);
-        return registry.Compile(null, CreateOptions(jobs, hooks, includeHookApprovals: true));
+        return registry.CompileForTest(CreateOptions(jobs, hooks, includeHookApprovals: true));
     }
 
     private static KernelGraph CreateJobsGraph(
         JobsDescriptorVariant variant,
-        params IJobsHookModule[] hooks)
+        params IJobsHookRegistration[] hooks)
     {
         var (registry, jobs) = BuildJobsRegistry(variant, hooks);
-        return registry.Compile(null, CreateOptions(jobs, hooks, includeHookApprovals: true));
+        return registry.CompileForTest(CreateOptions(jobs, hooks, includeHookApprovals: true));
     }
 
-    private static (KernelModuleRegistry Registry, JobsDescriptorModule Jobs) BuildJobsRegistry(
+    private static (ServiceCollection Registry, JobsDescriptorRegistration Jobs) BuildJobsRegistry(
         bool includeHookApprovals,
-        params IJobsHookModule[] hooks)
+        params IJobsHookRegistration[] hooks)
     {
         return BuildJobsRegistry(JobsDescriptorVariant.Valid, hooks);
     }
 
-    private static (KernelModuleRegistry Registry, JobsDescriptorModule Jobs) BuildJobsRegistry(
+    private static (ServiceCollection Registry, JobsDescriptorRegistration Jobs) BuildJobsRegistry(
         JobsDescriptorVariant variant,
-        params IJobsHookModule[] hooks)
+        params IJobsHookRegistration[] hooks)
     {
-        var registry = new KernelModuleRegistry();
-        var jobs = new JobsDescriptorModule(variant);
+        var registry = new ServiceCollection();
+        var jobs = new JobsDescriptorRegistration(variant);
         registry.Add(jobs);
         foreach (var hook in hooks)
             registry.Add(hook);
@@ -437,8 +436,8 @@ public sealed class KernelJobsCatalogTests
     }
 
     private static KernelGraphCompileOptions CreateOptions(
-        JobsDescriptorModule jobs,
-        IReadOnlyList<IJobsHookModule> hooks,
+        JobsDescriptorRegistration jobs,
+        IReadOnlyList<IJobsHookRegistration> hooks,
         bool includeHookApprovals)
     {
         var grants = new Dictionary<string, IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
@@ -455,7 +454,7 @@ public sealed class KernelJobsCatalogTests
 
         return new KernelGraphCompileOptions
         {
-            ActionModuleCapabilityGrants = grants,
+            ActionRegistrationCapabilityGrants = grants,
             SensitiveActionApprovals = approvals
         };
     }
@@ -495,23 +494,23 @@ public sealed class KernelJobsCatalogTests
 
     private interface IJobsGrantSource
     {
-        string ModuleId { get; }
+        string SourceId { get; }
 
         IReadOnlyDictionary<string, ActionInterceptionCapabilities> Grants { get; }
 
         IReadOnlyList<KernelSensitiveActionApproval> Approvals { get; }
     }
 
-    private interface IJobsHookModule : ISharpClawModule, IJobsGrantSource;
+    private interface IJobsHookRegistration : ITestServiceRegistration, IJobsGrantSource;
 
-    private sealed class JobsDescriptorModule : ISharpClawModule, IJobsGrantSource
+    private sealed class JobsDescriptorRegistration : ITestServiceRegistration, IJobsGrantSource
     {
         private readonly JobsDescriptorVariant _variant;
         private readonly IReadOnlySet<string> _skippedKeys;
         private readonly Dictionary<string, ActionInterceptionCapabilities> _grants = new(StringComparer.Ordinal);
         private readonly List<KernelSensitiveActionApproval> _approvals = [];
 
-        public JobsDescriptorModule(
+        public JobsDescriptorRegistration(
             JobsDescriptorVariant variant = JobsDescriptorVariant.Valid,
             IReadOnlySet<string>? skippedKeys = null)
         {
@@ -519,65 +518,65 @@ public sealed class KernelJobsCatalogTests
             _skippedKeys = skippedKeys ?? new HashSet<string>(StringComparer.Ordinal);
         }
 
-        public ModuleIdentity Identity { get; } = new("jobs.module", "Jobs module", "jobs");
+        public TestSourceIdentity Identity { get; } = new("jobs.registration", "Jobs registration", "jobs");
 
-        public string ModuleId => Identity.Id;
+        public string SourceId => Identity.Id;
 
         public IReadOnlyDictionary<string, ActionInterceptionCapabilities> Grants => _grants;
 
         public IReadOnlyList<KernelSensitiveActionApproval> Approvals => _approvals;
 
-        public void Configure(ISharpClawModuleBuilder module)
+        public void Configure(IServiceCollection registration)
         {
-            AddFamily<SubmitFamily>(module, "jobs.submit");
-            AddFamily<ValidateFamily>(module, "jobs.validate");
-            AddFamily<IdentityCreateFamily>(module, "jobs.identity.create");
-            AddFamily<QueuePersistFamily>(module, "jobs.queue.persist");
-            AddFamily<HoldEvaluateFamily>(module, "jobs.hold.evaluate");
-            AddFamily<HoldResolveFamily>(module, "jobs.hold.resolve");
-            AddFamily<DispatchFamily>(module, "jobs.dispatch");
-            AddFamily<StartFamily>(module, "jobs.start");
-            AddFamily<HandlerInvokeFamily>(module, "jobs.handler.invoke");
-            AddFamily<ProgressFamily>(module, "jobs.progress.report");
-            AddFamily<ArtifactSealFamily>(module, "jobs.artifact.seal");
-            AddFamily<CompleteFamily>(module, "jobs.complete");
-            AddFamily<FailFamily>(module, "jobs.fail");
-            AddFamily<CancelFamily>(module, "jobs.cancel");
-            AddFamily<CancelRequestFamily>(module, "jobs.cancel.request");
-            AddFamily<CancelApplyFamily>(module, "jobs.cancel.apply");
-            AddFamily<PauseFamily>(module, "jobs.pause");
-            AddFamily<StopFamily>(module, "jobs.stop");
-            AddFamily<RecoveryFamily>(module, "jobs.recovery");
-            AddFamily<RecoveryScanFamily>(module, "jobs.recovery.scan");
-            AddFamily<RecoveryClassifyFamily>(module, "jobs.recovery.classify");
-            AddFamily<RetryFamily>(module, "jobs.retry");
-            AddFamily<RetryEvaluateFamily>(module, "jobs.retry.evaluate");
-            AddFamily<RetryScheduleFamily>(module, "jobs.retry.schedule");
-            AddFamily<ResumeFamily>(module, "jobs.resume");
-            AddFamily<DeleteFamily>(module, "jobs.delete");
-            AddFamily<ReadFamily>(module, "jobs.read");
-            AddFamily<ListFamily>(module, "jobs.list");
-            AddFamily<LogsReadFamily>(module, "jobs.logs.read");
-            AddFamily<AuditReadFamily>(module, "jobs.audit.read");
-            AddFamily<ArtifactReadFamily>(module, "jobs.artifact.read");
-            AddFamily<EventDeliverFamily>(module, "jobs.event.deliver");
-            AddFamily<StateTransitionFamily>(module, "jobs.state.transition");
-            AddFamily<StateTransitionPrepareFamily>(module, "jobs.state.transition.prepare");
-            AddFamily<StateTransitionCommitFamily>(module, "jobs.state.transition.commit");
-            AddFamily<StateTransitionRollbackFamily>(module, "jobs.state.transition.rollback");
-            AddFamily<PersistenceFamily>(module, "jobs.persistence");
-            AddFamily<PersistencePrepareFamily>(module, "jobs.persistence.prepare");
-            AddFamily<PersistenceCommitFamily>(module, "jobs.persistence.commit");
-            AddFamily<PersistenceRollbackFamily>(module, "jobs.persistence.rollback");
-            AddFamily<InterruptionCheckFamily>(module, "jobs.interruption.check");
-            AddFamily<ExternalCallFamily>(module, "jobs.external_call");
-            AddFamily<IrreversibleEffectFamily>(module, "jobs.irreversible_effect");
-            AddFamily<ExternalEffectPrepareFamily>(module, "jobs.external_effect.prepare");
-            AddFamily<ExternalEffectReceiptFamily>(module, "jobs.external_effect.receipt");
-            AddFamily<ExternalEffectUncertainFamily>(module, "jobs.external_effect.uncertain");
+            AddFamily<SubmitFamily>(registration, "jobs.submit");
+            AddFamily<ValidateFamily>(registration, "jobs.validate");
+            AddFamily<IdentityCreateFamily>(registration, "jobs.identity.create");
+            AddFamily<QueuePersistFamily>(registration, "jobs.queue.persist");
+            AddFamily<HoldEvaluateFamily>(registration, "jobs.hold.evaluate");
+            AddFamily<HoldResolveFamily>(registration, "jobs.hold.resolve");
+            AddFamily<DispatchFamily>(registration, "jobs.dispatch");
+            AddFamily<StartFamily>(registration, "jobs.start");
+            AddFamily<HandlerInvokeFamily>(registration, "jobs.handler.invoke");
+            AddFamily<ProgressFamily>(registration, "jobs.progress.report");
+            AddFamily<ArtifactSealFamily>(registration, "jobs.artifact.seal");
+            AddFamily<CompleteFamily>(registration, "jobs.complete");
+            AddFamily<FailFamily>(registration, "jobs.fail");
+            AddFamily<CancelFamily>(registration, "jobs.cancel");
+            AddFamily<CancelRequestFamily>(registration, "jobs.cancel.request");
+            AddFamily<CancelApplyFamily>(registration, "jobs.cancel.apply");
+            AddFamily<PauseFamily>(registration, "jobs.pause");
+            AddFamily<StopFamily>(registration, "jobs.stop");
+            AddFamily<RecoveryFamily>(registration, "jobs.recovery");
+            AddFamily<RecoveryScanFamily>(registration, "jobs.recovery.scan");
+            AddFamily<RecoveryClassifyFamily>(registration, "jobs.recovery.classify");
+            AddFamily<RetryFamily>(registration, "jobs.retry");
+            AddFamily<RetryEvaluateFamily>(registration, "jobs.retry.evaluate");
+            AddFamily<RetryScheduleFamily>(registration, "jobs.retry.schedule");
+            AddFamily<ResumeFamily>(registration, "jobs.resume");
+            AddFamily<DeleteFamily>(registration, "jobs.delete");
+            AddFamily<ReadFamily>(registration, "jobs.read");
+            AddFamily<ListFamily>(registration, "jobs.list");
+            AddFamily<LogsReadFamily>(registration, "jobs.logs.read");
+            AddFamily<AuditReadFamily>(registration, "jobs.audit.read");
+            AddFamily<ArtifactReadFamily>(registration, "jobs.artifact.read");
+            AddFamily<EventDeliverFamily>(registration, "jobs.event.deliver");
+            AddFamily<StateTransitionFamily>(registration, "jobs.state.transition");
+            AddFamily<StateTransitionPrepareFamily>(registration, "jobs.state.transition.prepare");
+            AddFamily<StateTransitionCommitFamily>(registration, "jobs.state.transition.commit");
+            AddFamily<StateTransitionRollbackFamily>(registration, "jobs.state.transition.rollback");
+            AddFamily<PersistenceFamily>(registration, "jobs.persistence");
+            AddFamily<PersistencePrepareFamily>(registration, "jobs.persistence.prepare");
+            AddFamily<PersistenceCommitFamily>(registration, "jobs.persistence.commit");
+            AddFamily<PersistenceRollbackFamily>(registration, "jobs.persistence.rollback");
+            AddFamily<InterruptionCheckFamily>(registration, "jobs.interruption.check");
+            AddFamily<ExternalCallFamily>(registration, "jobs.external_call");
+            AddFamily<IrreversibleEffectFamily>(registration, "jobs.irreversible_effect");
+            AddFamily<ExternalEffectPrepareFamily>(registration, "jobs.external_effect.prepare");
+            AddFamily<ExternalEffectReceiptFamily>(registration, "jobs.external_effect.receipt");
+            AddFamily<ExternalEffectUncertainFamily>(registration, "jobs.external_effect.uncertain");
         }
 
-        private void AddFamily<TFamily>(ISharpClawModuleBuilder module, string family)
+        private void AddFamily<TFamily>(IServiceCollection registration, string family)
         {
             var contract = new JobActionContract<JobsInput<TFamily>, JobsResult<TFamily>>(
                 Descriptor<JobCheckpoint<JobsInput<TFamily>>, JobCheckpoint<JobsInput<TFamily>>>($"{family}.before"),
@@ -590,44 +589,44 @@ public sealed class KernelJobsCatalogTests
                 {
                     case JobsDescriptorVariant.WrongBeforeType:
                         AddDescriptor(
-                            module,
+                            registration,
                             Descriptor<JobCheckpoint<JobsInput<ProgressFamily>>, JobCheckpoint<JobsInput<ProgressFamily>>>(
                                 $"{family}.before"));
-                        AddDescriptor(module, contract.Action);
-                        AddDescriptor(module, contract.After);
+                        AddDescriptor(registration, contract.Action);
+                        AddDescriptor(registration, contract.After);
                         return;
                     case JobsDescriptorVariant.WrongAfterType:
-                        AddDescriptor(module, contract.Before);
-                        AddDescriptor(module, contract.Action);
+                        AddDescriptor(registration, contract.Before);
+                        AddDescriptor(registration, contract.Action);
                         AddDescriptor(
-                            module,
+                            registration,
                             Descriptor<JobCheckpoint<JobsResult<ProgressFamily>>, JobCheckpoint<JobsResult<ProgressFamily>>>(
                                 $"{family}.after"));
                         return;
                     case JobsDescriptorVariant.UnequalAfterTypes:
-                        AddDescriptor(module, contract.Before);
-                        AddDescriptor(module, contract.Action);
+                        AddDescriptor(registration, contract.Before);
+                        AddDescriptor(registration, contract.Action);
                         AddDescriptor(
-                            module,
+                            registration,
                             Descriptor<JobCheckpoint<JobsResult<ReadFamily>>, JobCheckpoint<JobsResult<ProgressFamily>>>(
                                 $"{family}.after"));
                         return;
                 }
             }
 
-            AddDescriptor(module, contract.Before);
-            AddDescriptor(module, contract.Action);
-            AddDescriptor(module, contract.After);
+            AddDescriptor(registration, contract.Before);
+            AddDescriptor(registration, contract.Action);
+            AddDescriptor(registration, contract.After);
         }
 
         private void AddDescriptor<TAction, TResult>(
-            ISharpClawModuleBuilder module,
+            IServiceCollection registration,
             ActionDescriptor<TAction, TResult> descriptor)
         {
             if (_skippedKeys.Contains(descriptor.Key.Value))
                 return;
 
-            module.Actions.Add(descriptor);
+            registration.AddAction(Identity.Id, descriptor);
             AddAuthority(descriptor);
         }
 
@@ -644,7 +643,7 @@ public sealed class KernelJobsCatalogTests
         }
     }
 
-    private sealed class ReadBeforeOwnerModule : IJobsHookModule
+    private sealed class ReadBeforeOwnerRegistration : IJobsHookRegistration
     {
         private static readonly ActionDescriptor<
             JobCheckpoint<JobsInput<ReadFamily>>,
@@ -652,10 +651,10 @@ public sealed class KernelJobsCatalogTests
             Descriptor<JobCheckpoint<JobsInput<ReadFamily>>, JobCheckpoint<JobsInput<ReadFamily>>>(
                 "jobs.read.before");
 
-        public ModuleIdentity Identity { get; } =
-            new("jobs.other.module", "Other Jobs module", "jobs-other");
+        public TestSourceIdentity Identity { get; } =
+            new("jobs.other.registration", "Other Jobs registration", "jobs-other");
 
-        public string ModuleId => Identity.Id;
+        public string SourceId => Identity.Id;
 
         public IReadOnlyDictionary<string, ActionInterceptionCapabilities> Grants { get; } =
             new Dictionary<string, ActionInterceptionCapabilities>
@@ -666,7 +665,7 @@ public sealed class KernelJobsCatalogTests
         public IReadOnlyList<KernelSensitiveActionApproval> Approvals { get; } =
         [
             new KernelSensitiveActionApproval(
-                "jobs.other.module",
+                "jobs.other.registration",
                 DescriptorInstance.Key,
                 DescriptorInstance.Version,
                 typeof(JobCheckpoint<JobsInput<ReadFamily>>).AssemblyQualifiedName!,
@@ -674,18 +673,19 @@ public sealed class KernelJobsCatalogTests
                 KernelSchemaIdentity.Action(DescriptorInstance))
         ];
 
-        public void Configure(ISharpClawModuleBuilder module) =>
-            module.Actions.Add(DescriptorInstance);
+        public void Configure(IServiceCollection registration) =>
+            registration.AddAction(Identity.Id, DescriptorInstance);
     }
 
-    private sealed class JobsHookModule<TInterceptor, TAction, TResult>(
-        ModuleIdentity identity,
+    private sealed class JobsHookRegistration<TInterceptor, TAction, TResult>(
+        TestSourceIdentity identity,
         SharpClawActionKey key,
-        HookOrdering ordering) : IJobsHookModule
+        HookOrdering ordering) : IJobsHookRegistration
+        where TInterceptor : class
     {
-        public ModuleIdentity Identity { get; } = identity;
+        public TestSourceIdentity Identity { get; } = identity;
 
-        public string ModuleId => Identity.Id;
+        public string SourceId => Identity.Id;
 
         public IReadOnlyDictionary<string, ActionInterceptionCapabilities> Grants { get; } =
             new Dictionary<string, ActionInterceptionCapabilities>
@@ -704,8 +704,8 @@ public sealed class KernelJobsCatalogTests
                 KernelSchemaIdentity.Action(Descriptor<TAction, TResult>(key.Value)))
         ];
 
-        public void Configure(ISharpClawModuleBuilder module) =>
-            module.Hooks.For(key).Use<TInterceptor>(ordering);
+        public void Configure(IServiceCollection registration) =>
+            registration.AddActionHook<TInterceptor>(Identity.Id, key, ordering);
     }
 
     private sealed record JobsInput<TFamily>(string Value);

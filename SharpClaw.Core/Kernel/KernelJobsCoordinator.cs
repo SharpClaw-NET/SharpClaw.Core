@@ -1,5 +1,5 @@
 using System.Collections.Concurrent;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 
 namespace SharpClaw.Core.Kernel;
 
@@ -13,7 +13,7 @@ public sealed class KernelJobsCoordinator
     private readonly KernelJobsStore _store;
     private readonly IReadOnlyDictionary<string, IJobHandler> _handlers;
     private readonly ConcurrentDictionary<Guid, ActiveJobExecution> _activeExecutions = new();
-    private readonly ConcurrentDictionary<Guid, ModuleStorageClaimAuthority> _claims = new();
+    private readonly ConcurrentDictionary<Guid, ScopedStorageClaimAuthority> _claims = new();
 
     public KernelJobsCoordinator(
         KernelGraph graph,
@@ -54,7 +54,7 @@ public sealed class KernelJobsCoordinator
 
         public CancellationTokenSource LeaseCancellation { get; } = new();
 
-        public ModuleStorageClaimAuthority? Claim { get; set; }
+        public ScopedStorageClaimAuthority? Claim { get; set; }
 
         public Task? RenewalTask { get; set; }
 
@@ -112,7 +112,7 @@ public sealed class KernelJobsCoordinator
     }
 
     /// <summary>
-    /// Submits a module-owned serialized payload through the same typed Jobs lifecycle.
+    /// Submits a registration-owned serialized payload through the same typed Jobs lifecycle.
     /// The registered handler decodes the envelope through its typed codec during dispatch.
     /// </summary>
     public async ValueTask<JobDocument> SubmitAsync(
@@ -235,7 +235,7 @@ public sealed class KernelJobsCoordinator
             allowEnvelopeResult: false);
 
     /// <summary>
-    /// Dispatches a Jobs record without requiring the host to know the module result CLR type.
+    /// Dispatches a Jobs record without requiring the host to know the registration result CLR type.
     /// </summary>
     public ValueTask<JobExecutionResult<JobPayloadEnvelope>> DispatchAsync(
         Guid jobId,
@@ -842,7 +842,7 @@ public sealed class KernelJobsCoordinator
                             return renewed?.Value ?? scanned;
                         }
 
-                        ModuleDocumentRecord<JobDocument>? recoveryRecord;
+                        ScopedDocumentRecord<JobDocument>? recoveryRecord;
                         try
                         {
                             var fresh = await GetJobAsync(
@@ -932,7 +932,7 @@ public sealed class KernelJobsCoordinator
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(executionContext);
-        var records = await RunStorageResultAsync<StorageListRequest, IReadOnlyList<ModuleDocumentRecord<JobDocument>>>(
+        var records = await RunStorageResultAsync<StorageListRequest, IReadOnlyList<ScopedDocumentRecord<JobDocument>>>(
             new SharpClawActionKey("storage.query"),
             new StorageListRequest(executionContext.Caller.SubjectId),
             (request, ct) => _store.ListJobRecordsAsync(request.CallerSubjectId, cancellationToken: ct),
@@ -1100,13 +1100,13 @@ public sealed class KernelJobsCoordinator
     {
         var job = await RequireOwnedJobAsync(jobId, executionContext, cancellationToken);
         var ownedJob = job.Value!;
-        IReadOnlyList<ModuleDocumentRecord<JobProgress>>? rows = null;
+        IReadOnlyList<ScopedDocumentRecord<JobProgress>>? rows = null;
         await RunFamilyAsync<KernelJobsOperationFamilies.LogsRead>(
             new SharpClawActionKey("jobs.logs.read"),
             ownedJob,
             async (_, ct) =>
             {
-                rows = await RunStorageResultAsync<StorageProgressListRequest, IReadOnlyList<ModuleDocumentRecord<JobProgress>>>(
+                rows = await RunStorageResultAsync<StorageProgressListRequest, IReadOnlyList<ScopedDocumentRecord<JobProgress>>>(
                     new SharpClawActionKey("storage.query"),
                     new StorageProgressListRequest(ownedJob.Id),
                     (request, storageCt) => _store.ListProgressRecordsAsync(request.JobId, storageCt),
@@ -1127,13 +1127,13 @@ public sealed class KernelJobsCoordinator
     {
         var job = await RequireOwnedJobAsync(jobId, executionContext, cancellationToken);
         var ownedJob = job.Value!;
-        IReadOnlyList<ModuleDocumentRecord<JobAttemptDocument>>? rows = null;
+        IReadOnlyList<ScopedDocumentRecord<JobAttemptDocument>>? rows = null;
         await RunFamilyAsync<KernelJobsOperationFamilies.AuditRead>(
             new SharpClawActionKey("jobs.audit.read"),
             ownedJob,
             async (_, ct) =>
             {
-                rows = await RunStorageResultAsync<StorageAttemptListRequest, IReadOnlyList<ModuleDocumentRecord<JobAttemptDocument>>>(
+                rows = await RunStorageResultAsync<StorageAttemptListRequest, IReadOnlyList<ScopedDocumentRecord<JobAttemptDocument>>>(
                     new SharpClawActionKey("storage.query"),
                     new StorageAttemptListRequest(ownedJob.Id),
                     (request, storageCt) => _store.ListAttemptRecordsAsync(request.JobId, storageCt),
@@ -1154,13 +1154,13 @@ public sealed class KernelJobsCoordinator
     {
         var job = await RequireOwnedJobAsync(jobId, executionContext, cancellationToken);
         var ownedJob = job.Value!;
-        ModuleDocumentRecord<JobPayloadEnvelope>? result = null;
+        ScopedDocumentRecord<JobPayloadEnvelope>? result = null;
         await RunFamilyAsync<KernelJobsOperationFamilies.ArtifactRead>(
             new SharpClawActionKey("jobs.artifact.read"),
             ownedJob,
             async (_, ct) =>
             {
-                result = await RunStorageResultAsync<StorageGetResultRequest, ModuleDocumentRecord<JobPayloadEnvelope>?>(
+                result = await RunStorageResultAsync<StorageGetResultRequest, ScopedDocumentRecord<JobPayloadEnvelope>?>(
                     new SharpClawActionKey("storage.get"),
                     new StorageGetResultRequest(ownedJob.Id),
                     (request, storageCt) => _store.GetResultAsync(request.JobId, storageCt),
@@ -1208,7 +1208,7 @@ public sealed class KernelJobsCoordinator
                 default,
                 job.Status == JobStatus.Cancelled ? ActionOutcomeKind.Cancelled : ActionOutcomeKind.Failed);
 
-        var result = await RunStorageResultAsync<StorageGetResultRequest, ModuleDocumentRecord<JobPayloadEnvelope>?>(
+        var result = await RunStorageResultAsync<StorageGetResultRequest, ScopedDocumentRecord<JobPayloadEnvelope>?>(
             new SharpClawActionKey("storage.get"),
             new StorageGetResultRequest(job.Id),
             (request, ct) => _store.GetResultAsync(request.JobId, ct),
@@ -1366,7 +1366,7 @@ public sealed class KernelJobsCoordinator
         KernelActionExecutionContext executionContext,
         long expectedRevision,
         CancellationToken cancellationToken,
-        ModuleStorageClaimAuthority? authority = null,
+        ScopedStorageClaimAuthority? authority = null,
         bool allowUnclaimedControlWrite = false)
     {
         var prepared = await RunFamilyAsync<KernelJobsOperationFamilies.StateTransitionPrepare>(
@@ -1437,7 +1437,7 @@ public sealed class KernelJobsCoordinator
             throw new KernelActionExecutionException($"Jobs record '{jobId:D}' was not found.");
 
         ActiveJobExecution? controlledExecution = null;
-        ModuleStorageClaimAuthority? controlAuthority = null;
+        ScopedStorageClaimAuthority? controlAuthority = null;
         if (status is JobStatus.Paused or JobStatus.Cancelled)
         {
             await FenceActiveExecutionAsync(jobId, status);
@@ -1541,7 +1541,7 @@ public sealed class KernelJobsCoordinator
 
     private async ValueTask ReleaseControlClaimAsync(
         Guid jobId,
-        ModuleStorageClaimAuthority? authority)
+        ScopedStorageClaimAuthority? authority)
     {
         if (authority is null)
             return;
@@ -1560,7 +1560,7 @@ public sealed class KernelJobsCoordinator
                 DateTimeOffset.UtcNow,
                 CancellationToken.None);
         }
-        catch (ModuleStorageContractException)
+        catch (ScopedStorageContractException)
         {
             // Storage already fenced or released this control claim.
         }
@@ -1628,7 +1628,7 @@ public sealed class KernelJobsCoordinator
                 DateTimeOffset.UtcNow,
                 CancellationToken.None);
         }
-        catch (ModuleStorageContractException)
+        catch (ScopedStorageContractException)
         {
             // Storage already fenced or released this execution claim.
         }
@@ -1778,8 +1778,8 @@ public sealed class KernelJobsCoordinator
         job.Status is JobStatus.Running or JobStatus.Paused or JobStatus.Held or
             JobStatus.Cancelled or JobStatus.Queued or JobStatus.Completed;
 
-    private async ValueTask<ModuleDocumentRecord<JobDocument>> AcquireExpiredControlledClaimAsync(
-        ModuleDocumentRecord<JobDocument> record,
+    private async ValueTask<ScopedDocumentRecord<JobDocument>> AcquireExpiredControlledClaimAsync(
+        ScopedDocumentRecord<JobDocument> record,
         CancellationToken cancellationToken)
     {
         if (record.Value is not { } job || !HasRecoverableControlledAttempt(job) ||
@@ -1797,16 +1797,16 @@ public sealed class KernelJobsCoordinator
             _claims[job.Id] = claimed.Authority;
             return claimed.Job;
         }
-        catch (ModuleStorageContractException exception)
-            when (exception.Failure.Code is ModuleStorageErrors.StaleClaim or ModuleStorageErrors.RevisionConflict)
+        catch (ScopedStorageContractException exception)
+            when (exception.Failure.Code is ScopedStorageErrors.StaleClaim or ScopedStorageErrors.RevisionConflict)
         {
             throw new KernelActionExecutionException(
                 $"{ClaimUnavailablePrefix} Jobs record '{job.Id:D}' is still controlled by another active execution.");
         }
     }
 
-    private async ValueTask<ModuleDocumentRecord<JobDocument>> AcquireControlClaimAsync(
-        ModuleDocumentRecord<JobDocument> record,
+    private async ValueTask<ScopedDocumentRecord<JobDocument>> AcquireControlClaimAsync(
+        ScopedDocumentRecord<JobDocument> record,
         KernelActionExecutionContext executionContext,
         CancellationToken cancellationToken)
     {
@@ -1832,8 +1832,8 @@ public sealed class KernelJobsCoordinator
             _claims[job.Id] = claimed.Authority;
             return claimed.Job;
         }
-        catch (ModuleStorageContractException exception)
-            when (exception.Failure.Code is ModuleStorageErrors.StaleClaim or ModuleStorageErrors.RevisionConflict)
+        catch (ScopedStorageContractException exception)
+            when (exception.Failure.Code is ScopedStorageErrors.StaleClaim or ScopedStorageErrors.RevisionConflict)
         {
             throw new KernelActionExecutionException(
                 $"{ClaimUnavailablePrefix} Jobs record '{job.Id:D}' is still controlled by another active execution.");
@@ -1857,7 +1857,7 @@ public sealed class KernelJobsCoordinator
             _claims[jobId] = renewed;
             return true;
         }
-        catch (ModuleStorageContractException)
+        catch (ScopedStorageContractException)
         {
             active.ControlRequested = true;
             active.ControlCancellation.Cancel();
@@ -1888,7 +1888,7 @@ public sealed class KernelJobsCoordinator
         }
     }
 
-    private async ValueTask<ModuleStorageClaimAuthority?> RenewClaimForWriteAsync(
+    private async ValueTask<ScopedStorageClaimAuthority?> RenewClaimForWriteAsync(
         Guid jobId,
         CancellationToken cancellationToken)
     {
@@ -1923,13 +1923,13 @@ public sealed class KernelJobsCoordinator
     private bool IsControlRequested(Guid jobId) =>
         _activeExecutions.TryGetValue(jobId, out var active) && active.ControlRequested;
 
-    private ModuleStorageClaimAuthority? GetActiveControlClaim(Guid jobId) =>
+    private ScopedStorageClaimAuthority? GetActiveControlClaim(Guid jobId) =>
         _activeExecutions.TryGetValue(jobId, out var active) &&
         active.ControlRequested
             ? active.Claim
             : null;
 
-    private async ValueTask<ModuleDocumentRecord<JobDocument>> RequireOwnedJobAsync(
+    private async ValueTask<ScopedDocumentRecord<JobDocument>> RequireOwnedJobAsync(
         Guid jobId,
         KernelActionExecutionContext executionContext,
         CancellationToken cancellationToken)
@@ -1942,11 +1942,11 @@ public sealed class KernelJobsCoordinator
         return record;
     }
 
-    private ValueTask<IReadOnlyList<ModuleDocumentRecord<JobAttemptDocument>>> ListAttemptRecordsAsync(
+    private ValueTask<IReadOnlyList<ScopedDocumentRecord<JobAttemptDocument>>> ListAttemptRecordsAsync(
         Guid jobId,
         KernelActionExecutionContext executionContext,
         CancellationToken cancellationToken) =>
-        RunStorageResultAsync<StorageAttemptListRequest, IReadOnlyList<ModuleDocumentRecord<JobAttemptDocument>>>(
+        RunStorageResultAsync<StorageAttemptListRequest, IReadOnlyList<ScopedDocumentRecord<JobAttemptDocument>>>(
             new SharpClawActionKey("storage.query"),
             new StorageAttemptListRequest(jobId),
             (request, ct) => _store.ListAttemptRecordsAsync(request.JobId, ct),
@@ -1970,7 +1970,7 @@ public sealed class KernelJobsCoordinator
         KernelActionExecutionContext executionContext,
         CancellationToken cancellationToken)
     {
-        var records = await RunStorageResultAsync<StorageIdempotencyRequest, IReadOnlyList<ModuleDocumentRecord<JobDocument>>>(
+        var records = await RunStorageResultAsync<StorageIdempotencyRequest, IReadOnlyList<ScopedDocumentRecord<JobDocument>>>(
             new SharpClawActionKey("storage.query"),
             new StorageIdempotencyRequest(idempotencyKey),
             (request, ct) => _store.FindJobRecordsByIdempotencyAsync(request.IdempotencyKey, ct),
@@ -2016,23 +2016,23 @@ public sealed class KernelJobsCoordinator
         SamePrincipal(job.Caller, executionContext.Caller) &&
         SameFeatures(job.Features, executionContext.Features);
 
-    private ValueTask<ModuleDocumentRecord<JobDocument>?> GetJobAsync(
+    private ValueTask<ScopedDocumentRecord<JobDocument>?> GetJobAsync(
         Guid jobId,
         KernelActionExecutionContext executionContext,
         CancellationToken cancellationToken) =>
-        RunStorageResultAsync<StorageGetRequest, ModuleDocumentRecord<JobDocument>?>(
+        RunStorageResultAsync<StorageGetRequest, ScopedDocumentRecord<JobDocument>?>(
             new SharpClawActionKey("storage.get"),
             new StorageGetRequest(jobId),
             (request, ct) => _store.GetJobAsync(request.JobId, ct),
             executionContext,
             cancellationToken);
 
-    private ValueTask<ModuleDocumentRecord<JobAttemptDocument>?> GetAttemptAsync(
+    private ValueTask<ScopedDocumentRecord<JobAttemptDocument>?> GetAttemptAsync(
         Guid jobId,
         Guid attemptId,
         KernelActionExecutionContext executionContext,
         CancellationToken cancellationToken) =>
-        RunStorageResultAsync<StorageGetAttemptRequest, ModuleDocumentRecord<JobAttemptDocument>?>(
+        RunStorageResultAsync<StorageGetAttemptRequest, ScopedDocumentRecord<JobAttemptDocument>?>(
             new SharpClawActionKey("storage.get"),
             new StorageGetAttemptRequest(jobId, attemptId),
             (request, ct) => _store.GetAttemptAsync(request.JobId, request.AttemptId, ct),
@@ -2044,7 +2044,7 @@ public sealed class KernelJobsCoordinator
         KernelActionExecutionContext executionContext,
         CancellationToken cancellationToken,
         long? expectedRevision = null,
-        ModuleStorageClaimAuthority? authority = null,
+        ScopedStorageClaimAuthority? authority = null,
         bool allowUnclaimedControlWrite = false)
     {
         var prepared = await RunFamilyAsync<KernelJobsOperationFamilies.PersistencePrepare>(
@@ -2110,7 +2110,7 @@ public sealed class KernelJobsCoordinator
         KernelActionExecutionContext executionContext,
         CancellationToken cancellationToken,
         long? expectedRevision = null,
-        ModuleStorageClaimAuthority? authority = null) =>
+        ScopedStorageClaimAuthority? authority = null) =>
         RunStorageMutationAsync(
             new StorageSaveAttemptRequest(attempt),
             async (request, ct) => await _store.SaveAttemptAsync(
@@ -2306,10 +2306,10 @@ public sealed class KernelJobsCoordinator
     }
 
     private static bool IsRevisionConflict(Exception exception) =>
-        exception is ModuleStorageContractException storageException
-            ? string.Equals(storageException.Failure.Code, ModuleStorageErrors.RevisionConflict, StringComparison.Ordinal)
+        exception is ScopedStorageContractException storageException
+            ? string.Equals(storageException.Failure.Code, ScopedStorageErrors.RevisionConflict, StringComparison.Ordinal)
             : exception.ToString().Contains("stale revision", StringComparison.OrdinalIgnoreCase) ||
-              exception.ToString().Contains(ModuleStorageErrors.RevisionConflict, StringComparison.OrdinalIgnoreCase) ||
+              exception.ToString().Contains(ScopedStorageErrors.RevisionConflict, StringComparison.OrdinalIgnoreCase) ||
               exception.ToString().Contains("aggregate revision", StringComparison.OrdinalIgnoreCase);
 
     private static bool SamePrincipal(RequestPrincipal left, RequestPrincipal right) =>
@@ -2327,7 +2327,7 @@ public sealed class KernelJobsCoordinator
                 (leftItem, rightItem) =>
                     string.Equals(leftItem.ContractName, rightItem.ContractName, StringComparison.Ordinal) &&
                     leftItem.SchemaVersion == rightItem.SchemaVersion &&
-                    string.Equals(leftItem.OwnerModuleId, rightItem.OwnerModuleId, StringComparison.Ordinal) &&
+                    string.Equals(leftItem.OwnerId, rightItem.OwnerId, StringComparison.Ordinal) &&
                     leftItem.MaxBytes == rightItem.MaxBytes &&
                     leftItem.Value.GetRawText() == rightItem.Value.GetRawText())
             .All(value => value);

@@ -1,12 +1,205 @@
 using System.Security.Cryptography;
 using System.Text.Json;
-using SharpClaw.Contracts.Modules;
+using Microsoft.Extensions.DependencyInjection;
+using SharpClaw.Contracts.Kernel;
 using SharpClaw.Core.Kernel;
 
 namespace SharpClaw.Core.Tests;
 
+internal sealed record TestSourceIdentity(
+    string Id,
+    string DisplayName,
+    string Prefix);
+
+internal interface ITestServiceRegistration
+{
+    TestSourceIdentity Identity { get; }
+
+    void Configure(IServiceCollection services);
+}
+
 internal static class KernelTestExecution
 {
+    private static readonly Type[] TestServiceTypes = typeof(KernelTestExecution).Assembly
+        .GetTypes()
+        .Where(type => type.IsClass && !type.IsAbstract && !type.ContainsGenericParameters)
+        .ToArray();
+
+    public static void Add(
+        this ServiceCollection services,
+        ITestServiceRegistration source)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(source);
+        source.Configure(services);
+    }
+
+    public static KernelGraph Compile(
+        this ServiceCollection services,
+        KernelGraphCompileOptions? options = null) =>
+        CompileServices(services, options);
+
+    public static KernelGraph Compile(
+        this KernelGraphBuilder builder,
+        KernelGraphCompileOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        var services = CreateTestServices();
+        var provider = services.BuildServiceProvider();
+        return builder.Compile(provider, options);
+    }
+
+    public static KernelGraph CompileForTest(
+        this ServiceCollection services,
+        KernelGraphCompileOptions? options = null)
+        => CompileServices(services, options);
+
+    public static KernelGraph CompileDeclaredServices(
+        this ServiceCollection services,
+        KernelGraphCompileOptions? options = null)
+        => CompileServices(services, options);
+
+    public static void AddAction<TAction, TResult>(
+        this IServiceCollection services,
+        string sourceId,
+        ActionDescriptor<TAction, TResult> descriptor) =>
+        services.AddSingleton<IActionDefinitionBinding>(
+            new ActionDefinitionBinding<TAction, TResult>(sourceId, descriptor));
+
+    public static void AddEvent<TEvent>(
+        this IServiceCollection services,
+        string sourceId,
+        EventDescriptor<TEvent> descriptor) =>
+        services.AddSingleton<IEventDefinitionBinding>(
+            new EventDefinitionBinding<TEvent>(sourceId, descriptor));
+
+    public static void AddActionHook<TInterceptor>(
+        this IServiceCollection services,
+        string sourceId,
+        SharpClawActionKey key,
+        HookOrdering ordering)
+        where TInterceptor : class
+    {
+        services.AddSingleton<TInterceptor>();
+        services.AddSingleton(new ActionHookBinding(
+            sourceId,
+            BehaviorTargetKind.Exact,
+            key,
+            null,
+            typeof(TInterceptor),
+            IsUntyped: typeof(IAnyActionInterceptor).IsAssignableFrom(typeof(TInterceptor)),
+            ordering,
+            typeof(TInterceptor).AssemblyQualifiedName!));
+    }
+
+    public static void AddEventListener<TListener>(
+        this IServiceCollection services,
+        string sourceId,
+        SharpClawEventKey key,
+        EventDelivery delivery,
+        HookOrdering ordering)
+        where TListener : class
+    {
+        services.AddSingleton<TListener>();
+        services.AddSingleton(new EventHookBinding(
+            sourceId,
+            BehaviorTargetKind.Exact,
+            key,
+            null,
+            typeof(TListener),
+            IsUntyped: typeof(IAnyEventListener).IsAssignableFrom(typeof(TListener)),
+            EventHookKind.Listener,
+            delivery,
+            ordering,
+            typeof(TListener).AssemblyQualifiedName!));
+    }
+
+    public static void AddContractExport<TService>(
+        this IServiceCollection services,
+        string sourceId,
+        string contractName,
+        int schemaVersion,
+        int maxBytes) =>
+        services.AddSingleton(new ServiceContractBinding(
+            sourceId,
+            typeof(TService),
+            contractName,
+            schemaVersion,
+            maxBytes,
+            IsExport: true,
+            Optional: false));
+
+    public static void AddContractRequirement<TService>(
+        this IServiceCollection services,
+        string sourceId,
+        string contractName,
+        int minimumSchemaVersion,
+        bool optional) =>
+        services.AddSingleton(new ServiceContractBinding(
+            sourceId,
+            typeof(TService),
+            contractName,
+            minimumSchemaVersion,
+            MaxBytes: 0,
+            IsExport: false,
+            optional));
+
+    public static void AddStorage(
+        this IServiceCollection services,
+        ScopedStorageContractDescriptor descriptor) =>
+        services.AddSingleton(descriptor);
+
+    public static void AddConversationResolver<TResolver>(this IServiceCollection services)
+        where TResolver : class, IConversationResolver
+    {
+        services.AddSingleton<TResolver>();
+        services.AddSingleton<IConversationResolver>(
+            provider => provider.GetRequiredService<TResolver>());
+    }
+
+    public static void AddContextContributor<TContributor>(this IServiceCollection services)
+        where TContributor : class, IChatContextContributor
+    {
+        services.AddSingleton<TContributor>();
+        services.AddSingleton<IChatContextContributor>(
+            provider => provider.GetRequiredService<TContributor>());
+    }
+
+    public static void AddTool<THandler>(
+        this IServiceCollection services,
+        string sourceId,
+        ToolDescriptor descriptor)
+        where THandler : class, IToolHandler
+    {
+        services.AddSingleton<THandler>();
+        services.AddSingleton(new ToolHandlerBinding(
+            sourceId,
+            descriptor,
+            typeof(THandler),
+            typeof(THandler).AssemblyQualifiedName!));
+    }
+
+    private static KernelGraph CompileServices(
+        ServiceCollection services,
+        KernelGraphCompileOptions? options)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        var provider = services.BuildServiceProvider(new ServiceProviderOptions
+        {
+            ValidateOnBuild = true,
+            ValidateScopes = true,
+        });
+        return new KernelGraphBuilder().Compile(provider, options);
+    }
+
+    private static ServiceCollection CreateTestServices()
+    {
+        var services = new ServiceCollection();
+        foreach (var type in TestServiceTypes)
+            services.AddSingleton(type, type);
+        return services;
+    }
+
     public static ToolInvocation CreateToolInvocation(
         string toolName,
         JsonElement? arguments = null,
@@ -56,7 +249,7 @@ internal static class KernelTestExecution
                     SharpClawActions.Tools.Invoke,
                     1,
                     "test-descriptor",
-                    "SharpClaw.Contracts.Modules.ToolInvocation",
+                    "SharpClaw.Contracts.Kernel.ToolInvocation",
                     1,
                     "test-schema",
                     Convert.ToHexString(SHA256.HashData(payload)),

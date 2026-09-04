@@ -5,18 +5,18 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 
 namespace SharpClaw.Core.Kernel;
 
-public sealed class KernelGraphBuilder
+public sealed class KernelGraphBuilder : IActionDefinitionSink, IEventDefinitionSink
 {
     private readonly List<IActionDefinitionRegistration> _actions = [];
     private readonly List<IEventDefinitionRegistration> _events = [];
     private readonly List<KernelActionHookRegistration> _actionHooks = [];
     private readonly List<KernelEventHookRegistration> _eventHooks = [];
     private readonly List<KernelToolRegistration> _tools = [];
-    private readonly List<KernelModuleDeclaration> _modules = [];
+    private bool _serviceBindingsImported;
 
     public KernelGraphBuilder(bool includeStandardDefinitions = true)
         : this(includeStandardDefinitions, includeLifecycleDefinitions: true)
@@ -33,45 +33,58 @@ public sealed class KernelGraphBuilder
             AddStandardDefinitions();
     }
 
-    public IActionDefinitionBuilder Actions => new KernelActionDefinitionBuilder(this, "core");
+    public KernelActionDefinitionBuilder Actions => new(this, "core");
 
-    public IEventDefinitionBuilder Events => new KernelEventDefinitionBuilder(this, "core");
+    public KernelEventDefinitionBuilder Events => new(this, "core");
 
-    public IActionHookBuilder Hooks => new KernelActionHookBuilder(this, "core");
+    public KernelActionHookBuilder Hooks => new(this, "core");
 
     public void Add<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor,
-        string ownerModuleId = "core") =>
-        _actions.Add(new ActionDefinitionRegistration<TAction, TResult>(descriptor, ownerModuleId));
+        string OwnerId = "core") =>
+        _actions.Add(new ActionDefinitionRegistration<TAction, TResult>(descriptor, OwnerId));
+
+    void IActionDefinitionSink.Add<TAction, TResult>(
+        string sourceId,
+        ActionDescriptor<TAction, TResult> descriptor) =>
+        Add(descriptor, sourceId);
 
     public void AddEvent<TEvent>(
         EventDescriptor<TEvent> descriptor,
-        string ownerModuleId = "core") =>
-        _events.Add(new EventDefinitionRegistration<TEvent>(descriptor, ownerModuleId));
+        string OwnerId = "core") =>
+        _events.Add(new EventDefinitionRegistration<TEvent>(descriptor, OwnerId));
 
-    public void AddTool<THandler>(ToolDescriptor descriptor, string ownerModuleId = "core") =>
+    void IEventDefinitionSink.Add<TEvent>(
+        string sourceId,
+        EventDescriptor<TEvent> descriptor) =>
+        AddEvent(descriptor, sourceId);
+
+    public void AddTool<THandler>(ToolDescriptor descriptor, string OwnerId = "core") =>
         _tools.Add(new KernelToolRegistration(
             descriptor,
-            ownerModuleId,
+            OwnerId,
             typeof(THandler),
             HandlerIdentity: typeof(THandler).AssemblyQualifiedName));
 
     internal void AddBoundTool(
         ToolDescriptor descriptor,
-        string ownerModuleId,
+        string OwnerId,
         IToolHandler handler,
         string handlerIdentity) =>
         _tools.Add(new KernelToolRegistration(
             descriptor,
-            ownerModuleId,
+            OwnerId,
             handler.GetType(),
             handler,
             handlerIdentity));
 
     public KernelGraph Compile(
-        IServiceProvider? serviceProvider = null,
-        KernelGraphCompileOptions? options = null) =>
-        new KernelSnapshotCompiler().Compile(this, serviceProvider, options);
+        IServiceProvider serviceProvider,
+        KernelGraphCompileOptions? options = null)
+    {
+        ImportServiceBindings(serviceProvider);
+        return new KernelSnapshotCompiler().Compile(this, serviceProvider, options);
+    }
 
     internal IReadOnlyList<IActionDefinitionRegistration> ActionDefinitions => _actions;
 
@@ -83,13 +96,9 @@ public sealed class KernelGraphBuilder
 
     internal IReadOnlyList<KernelToolRegistration> Tools => _tools;
 
-    internal IReadOnlyList<KernelModuleDeclaration> Modules => _modules;
-
     internal void AddActionHook(KernelActionHookRegistration registration) => _actionHooks.Add(registration);
 
     internal void AddEventHook(KernelEventHookRegistration registration) => _eventHooks.Add(registration);
-
-    internal void AddModule(KernelModuleDeclaration declaration) => _modules.Add(declaration);
 
     internal void Import(KernelGraphBuilder source)
     {
@@ -99,6 +108,68 @@ public sealed class KernelGraphBuilder
         _eventHooks.AddRange(source._eventHooks);
         _tools.AddRange(source._tools);
     }
+
+    private void ImportServiceBindings(IServiceProvider serviceProvider)
+    {
+        ArgumentNullException.ThrowIfNull(serviceProvider);
+        if (_serviceBindingsImported)
+            return;
+
+        foreach (var binding in serviceProvider.GetServices<IActionDefinitionBinding>())
+            binding.AddTo(this);
+        foreach (var binding in serviceProvider.GetServices<IEventDefinitionBinding>())
+            binding.AddTo(this);
+        foreach (var binding in serviceProvider.GetServices<ActionHookBinding>())
+        {
+            _actionHooks.Add(new KernelActionHookRegistration(
+                ToKernelTarget(binding.TargetKind),
+                binding.ActionKey,
+                binding.Category,
+                binding.HandlerType,
+                binding.BoundHandler,
+                binding.IsUntyped,
+                binding.Ordering,
+                binding.SourceId,
+                binding.HandlerIdentity));
+        }
+        foreach (var binding in serviceProvider.GetServices<EventHookBinding>())
+        {
+            _eventHooks.Add(new KernelEventHookRegistration(
+                ToKernelTarget(binding.TargetKind),
+                binding.EventKey,
+                binding.Category,
+                binding.HandlerType,
+                binding.BoundHandler,
+                binding.IsUntyped,
+                binding.Kind == EventHookKind.Interceptor
+                    ? KernelEventHookKind.Interceptor
+                    : KernelEventHookKind.Listener,
+                binding.Delivery,
+                binding.Ordering,
+                binding.SourceId,
+                binding.HandlerIdentity));
+        }
+        foreach (var binding in serviceProvider.GetServices<ToolHandlerBinding>())
+        {
+            _tools.Add(new KernelToolRegistration(
+                binding.Descriptor,
+                binding.SourceId,
+                binding.HandlerType,
+                binding.BoundHandler,
+                binding.HandlerIdentity));
+        }
+
+        _serviceBindingsImported = true;
+    }
+
+    private static KernelHookTargetKind ToKernelTarget(BehaviorTargetKind targetKind) =>
+        targetKind switch
+        {
+            BehaviorTargetKind.Exact => KernelHookTargetKind.Exact,
+            BehaviorTargetKind.Category => KernelHookTargetKind.Category,
+            BehaviorTargetKind.Any => KernelHookTargetKind.Any,
+            _ => throw new KernelGraphCompilationException("The behavior target is not supported."),
+        };
 
     private void AddStandardDefinitions()
     {
@@ -116,14 +187,125 @@ public sealed class KernelGraphBuilder
     }
 }
 
+public sealed class KernelActionDefinitionBuilder(
+    KernelGraphBuilder builder,
+    string sourceId)
+{
+    public void Add<TAction, TResult>(ActionDescriptor<TAction, TResult> descriptor) =>
+        builder.Add(descriptor, sourceId);
+}
+
+public sealed class KernelEventDefinitionBuilder(
+    KernelGraphBuilder builder,
+    string sourceId)
+{
+    public void Add<TEvent>(EventDescriptor<TEvent> descriptor) =>
+        builder.AddEvent(descriptor, sourceId);
+
+    public KernelEventHookRegistrationBuilder For(SharpClawEventKey key) =>
+        new(builder, sourceId, KernelHookTargetKind.Exact, key, null);
+
+    public KernelEventHookRegistrationBuilder Category(string category) =>
+        new(builder, sourceId, KernelHookTargetKind.Category, null, category);
+
+    public KernelEventHookRegistrationBuilder AnyEvent() =>
+        new(builder, sourceId, KernelHookTargetKind.Any, null, null);
+}
+
+public sealed class KernelActionHookBuilder(
+    KernelGraphBuilder builder,
+    string sourceId)
+{
+    public KernelActionHookRegistrationBuilder For(SharpClawActionKey key) =>
+        new(builder, sourceId, KernelHookTargetKind.Exact, key, null);
+
+    public KernelActionHookRegistrationBuilder Category(string category) =>
+        new(builder, sourceId, KernelHookTargetKind.Category, null, category);
+
+    public KernelActionHookRegistrationBuilder AnyAction() =>
+        new(builder, sourceId, KernelHookTargetKind.Any, null, null);
+}
+
+public sealed class KernelActionHookRegistrationBuilder(
+    KernelGraphBuilder builder,
+    string sourceId,
+    KernelHookTargetKind targetKind,
+    SharpClawActionKey? key,
+    string? category)
+{
+    public void Use<TInterceptor>(HookOrdering ordering) =>
+        builder.AddActionHook(new KernelActionHookRegistration(
+            targetKind,
+            key,
+            category,
+            typeof(TInterceptor),
+            null,
+            false,
+            ordering,
+            sourceId,
+            typeof(TInterceptor).AssemblyQualifiedName!));
+
+    public void UseAny<TInterceptor>(HookOrdering ordering) =>
+        builder.AddActionHook(new KernelActionHookRegistration(
+            targetKind,
+            key,
+            category,
+            typeof(TInterceptor),
+            null,
+            true,
+            ordering,
+            sourceId,
+            typeof(TInterceptor).AssemblyQualifiedName!));
+}
+
+public sealed class KernelEventHookRegistrationBuilder(
+    KernelGraphBuilder builder,
+    string sourceId,
+    KernelHookTargetKind targetKind,
+    SharpClawEventKey? key,
+    string? category)
+{
+    public void Intercept<TInterceptor>(HookOrdering ordering) =>
+        Add(typeof(TInterceptor), false, KernelEventHookKind.Interceptor, EventDelivery.Inline, ordering);
+
+    public void InterceptAny<TInterceptor>(HookOrdering ordering) =>
+        Add(typeof(TInterceptor), true, KernelEventHookKind.Interceptor, EventDelivery.Inline, ordering);
+
+    public void Listen<TListener>(EventDelivery delivery, HookOrdering ordering) =>
+        Add(typeof(TListener), false, KernelEventHookKind.Listener, delivery, ordering);
+
+    public void ListenAny<TListener>(EventDelivery delivery, HookOrdering ordering) =>
+        Add(typeof(TListener), true, KernelEventHookKind.Listener, delivery, ordering);
+
+    private void Add(
+        Type handlerType,
+        bool isUntyped,
+        KernelEventHookKind kind,
+        EventDelivery delivery,
+        HookOrdering ordering) =>
+        builder.AddEventHook(new KernelEventHookRegistration(
+            targetKind,
+            key,
+            category,
+            handlerType,
+            null,
+            isUntyped,
+            kind,
+            delivery,
+            ordering,
+            sourceId,
+            handlerType.AssemblyQualifiedName!));
+}
+
 public sealed class KernelSnapshotCompiler
 {
     public KernelGraph Compile(
         KernelGraphBuilder builder,
-        IServiceProvider? serviceProvider = null,
+        IServiceProvider serviceProvider,
         KernelGraphCompileOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(serviceProvider);
         options ??= new KernelGraphCompileOptions();
         options = KernelGraphCompileOptions.Freeze(options);
         var actionHooks = FreezeActionHooks(builder.ActionHooks);
@@ -131,10 +313,10 @@ public sealed class KernelSnapshotCompiler
         if (options.MaximumActionDepth < 1)
             throw new KernelGraphCompilationException("Maximum action depth must be positive.");
 
-        var modules = KernelModuleGraphCompiler.Compile(builder.Modules, serviceProvider);
-        var actions = CompileActions(builder, modules.Services, options, actionHooks);
-        var events = CompileEvents(builder, modules.Services, options, eventHooks);
-        var tools = CompileTools(builder, modules.Services);
+        var services = new KernelServiceGraph(serviceProvider);
+        var actions = CompileActions(builder, services.Services, options, actionHooks);
+        var events = CompileEvents(builder, services.Services, options, eventHooks);
+        var tools = CompileTools(builder, services.Services);
         var actionGrants = actions.Values
             .Select(action => new ActionCapabilityGrant(
                 action.Key,
@@ -157,7 +339,7 @@ public sealed class KernelSnapshotCompiler
             tools,
             actionHooks,
             eventHooks,
-            modules,
+            services,
             options);
         var snapshot = new ActionPipelineSnapshot(
             contractHash,
@@ -173,18 +355,18 @@ public sealed class KernelSnapshotCompiler
             actions,
             events,
             tools,
-            modules,
+            services,
             snapshot,
             chatSnapshot,
             options.MaximumActionDepth,
             actionHooks,
-            serviceProvider,
+            services.Services,
             options);
     }
 
     private static Dictionary<string, ICompiledActionDefinition> CompileActions(
         KernelGraphBuilder builder,
-        IServiceProvider? serviceProvider,
+        IServiceProvider serviceProvider,
         KernelGraphCompileOptions options,
         IReadOnlyList<KernelActionHookRegistration> actionHooks)
     {
@@ -236,7 +418,7 @@ public sealed class KernelSnapshotCompiler
         if (missing.Length > 0 || extra.Length > 0 || registered.Length != actual.Count)
         {
             throw new KernelGraphCompilationException(
-                $"Jobs module must register the catalog exactly once. Missing: " +
+                $"Jobs registration must register the catalog exactly once. Missing: " +
                 $"{string.Join(", ", missing)}. Extra: {string.Join(", ", extra)}.");
         }
 
@@ -249,11 +431,11 @@ public sealed class KernelSnapshotCompiler
             var before = definitions[$"{family}.before"];
             var after = definitions[$"{family}.after"];
 
-            if (!string.Equals(root.OwnerModuleId, before.OwnerModuleId, StringComparison.Ordinal) ||
-                !string.Equals(root.OwnerModuleId, after.OwnerModuleId, StringComparison.Ordinal))
+            if (!string.Equals(root.OwnerId, before.OwnerId, StringComparison.Ordinal) ||
+                !string.Equals(root.OwnerId, after.OwnerId, StringComparison.Ordinal))
             {
                 throw new KernelGraphCompilationException(
-                    $"Jobs family '{family}' must use one module owner for root, before, and after descriptors.");
+                    $"Jobs family '{family}' must use one registration owner for root, before, and after descriptors.");
             }
 
             var expectedBeforeType = typeof(JobCheckpoint<>).MakeGenericType(root.ActionType);
@@ -276,7 +458,7 @@ public sealed class KernelSnapshotCompiler
 
     private static Dictionary<string, ICompiledEventDefinition> CompileEvents(
         KernelGraphBuilder builder,
-        IServiceProvider? serviceProvider,
+        IServiceProvider serviceProvider,
         KernelGraphCompileOptions options,
         IReadOnlyList<KernelEventHookRegistration> eventHooks)
     {
@@ -327,7 +509,7 @@ public sealed class KernelSnapshotCompiler
             catch (Exception exception)
             {
                 throw new KernelGraphCompilationException(
-                    $"Module '{tool.OwnerModuleId}' tool handler '{tool.HandlerType.FullName}' " +
+                    $"Registration '{tool.OwnerId}' tool handler '{tool.HandlerType.FullName}' " +
                     $"cannot be resolved: {exception.Message}");
             }
             result.Add(tool with
@@ -346,7 +528,7 @@ public sealed class KernelSnapshotCompiler
         IEnumerable<KernelToolRegistration> tools,
         IEnumerable<KernelActionHookRegistration> actionHooks,
         IEnumerable<KernelEventHookRegistration> eventHooks,
-        KernelModuleGraph modules,
+        KernelServiceGraph services,
         KernelGraphCompileOptions options)
     {
         var records = new List<string>
@@ -362,7 +544,7 @@ public sealed class KernelSnapshotCompiler
                         $"{action.Category}|{KernelGraphHasher.StableScalar((int)action.Capabilities)}|" +
                         $"{KernelGraphHasher.StableScalar((int)action.EffectiveCapabilities)}|" +
                         $"{KernelGraphHasher.StableScalar(action.ContainsSensitiveData)}|" +
-                        $"{KernelGraphHasher.StableScalar(action.SensitiveApproved)}|{action.OwnerModuleId}|" +
+                        $"{KernelGraphHasher.StableScalar(action.SensitiveApproved)}|{action.OwnerId}|" +
                         $"{action.ActionType.AssemblyQualifiedName}|{action.ResultType.AssemblyQualifiedName}");
             records.AddRange(KernelGraphHasher.Flatten("action.input-schema", action.InputSchema));
             records.AddRange(KernelGraphHasher.Flatten("action.result-schema", action.ResultSchema));
@@ -371,8 +553,8 @@ public sealed class KernelSnapshotCompiler
                 var contract = KernelActionCatalog.DescriptorFor(action.Key);
                 records.Add(
                     $"action.payload-contract|{action.Key.Value}|" +
-                    $"{contract.InputPayloadType?.AssemblyQualifiedName ?? "module-typed"}|" +
-                    $"{contract.ResultPayloadType?.AssemblyQualifiedName ?? "module-typed"}");
+                    $"{contract.InputPayloadType?.AssemblyQualifiedName ?? "registration-typed"}|" +
+                    $"{contract.ResultPayloadType?.AssemblyQualifiedName ?? "registration-typed"}");
             }
             records.Add($"action.signature|{action.Signature}");
         }
@@ -386,7 +568,7 @@ public sealed class KernelSnapshotCompiler
                         $"{KernelGraphHasher.StableScalar((int)eventDefinition.EffectiveCapabilities)}|" +
                         $"{KernelGraphHasher.StableScalar(eventDefinition.ContainsSensitiveData)}|" +
                         $"{KernelGraphHasher.StableScalar(eventDefinition.SensitiveApproved)}|" +
-                        $"{eventDefinition.OwnerModuleId}|" +
+                        $"{eventDefinition.OwnerId}|" +
                         $"{eventDefinition.EventType.AssemblyQualifiedName}");
             records.AddRange(KernelGraphHasher.Flatten("event.payload-schema", eventDefinition.PayloadSchema));
             records.Add($"event.signature|{eventDefinition.Signature}");
@@ -394,55 +576,55 @@ public sealed class KernelSnapshotCompiler
         foreach (var tool in tools.OrderBy(tool => tool.Descriptor.Name, StringComparer.Ordinal))
         {
             records.AddRange(KernelGraphHasher.Flatten("tool.descriptor", tool.Descriptor));
-            records.Add($"tool.owner|{tool.OwnerModuleId}|{tool.HandlerIdentity}");
+            records.Add($"tool.owner|{tool.OwnerId}|{tool.HandlerIdentity}");
         }
         foreach (var hook in actionHooks
-                     .OrderBy(hook => hook.OwnerModuleId, StringComparer.Ordinal)
+                     .OrderBy(hook => hook.OwnerId, StringComparer.Ordinal)
                      .ThenBy(hook => hook.TargetKind)
                      .ThenBy(hook => hook.Key?.Value, StringComparer.Ordinal)
                      .ThenBy(hook => hook.Category, StringComparer.Ordinal)
                      .ThenBy(hook => hook.Ordering.Id, StringComparer.Ordinal))
             records.Add(
-                $"action.registration|{hook.OwnerModuleId}|{hook.TargetKind}|{hook.Key?.Value}|" +
+                $"action.registration|{hook.OwnerId}|{hook.TargetKind}|{hook.Key?.Value}|" +
                 $"{hook.Category}|{hook.HandlerIdentity}|{hook.IsUntyped}|" +
                 KernelGraphHasher.Flatten("ordering", hook.Ordering).JoinWith(";"));
         foreach (var hook in eventHooks
-                     .OrderBy(hook => hook.OwnerModuleId, StringComparer.Ordinal)
+                     .OrderBy(hook => hook.OwnerId, StringComparer.Ordinal)
                      .ThenBy(hook => hook.TargetKind)
                      .ThenBy(hook => hook.Key?.Value, StringComparer.Ordinal)
                      .ThenBy(hook => hook.Category, StringComparer.Ordinal)
                      .ThenBy(hook => hook.Ordering.Id, StringComparer.Ordinal))
             records.Add(
-                $"event.registration|{hook.OwnerModuleId}|{hook.TargetKind}|{hook.Key?.Value}|" +
+                $"event.registration|{hook.OwnerId}|{hook.TargetKind}|{hook.Key?.Value}|" +
                 $"{hook.Category}|{hook.HandlerIdentity}|{hook.IsUntyped}|{hook.Kind}|{hook.Delivery}|" +
                 KernelGraphHasher.Flatten("ordering", hook.Ordering).JoinWith(";"));
-        records.AddRange(modules.HashRecords);
+        records.AddRange(services.HashRecords);
         AddDictionary(records, "action.grant", options.ActionCapabilityGrants);
         AddDictionary(records, "event.grant", options.EventCapabilityGrants);
-        AddNestedDictionary(records, "action.module-grant", options.ActionModuleCapabilityGrants);
-        AddNestedDictionary(records, "event.module-grant", options.EventModuleCapabilityGrants);
+        AddNestedDictionary(records, "action.registration-grant", options.ActionRegistrationCapabilityGrants);
+        AddNestedDictionary(records, "event.registration-grant", options.EventRegistrationCapabilityGrants);
         AddApprovalBoundary(records, "sensitive.action", options.SensitiveActionApprovals);
         AddApprovalBoundary(records, "sensitive.external-action", options.ExternalSensitiveActionApprovals);
         AddApprovalBoundary(records, "sensitive.event", options.SensitiveEventApprovals);
         AddApprovalBoundary(records, "sensitive.external-event", options.ExternalSensitiveEventApprovals);
-        foreach (var approval in (options.SensitiveActionApprovals ?? []).OrderBy(approval => approval.ModuleId, StringComparer.Ordinal)
+        foreach (var approval in (options.SensitiveActionApprovals ?? []).OrderBy(approval => approval.SourceId, StringComparer.Ordinal)
                      .ThenBy(approval => approval.ActionKey.Value, StringComparer.Ordinal)
                      .ThenBy(approval => approval.ActionVersion)
                      .ThenBy(approval => approval.ActionType, StringComparer.Ordinal)
                      .ThenBy(approval => approval.ResultType, StringComparer.Ordinal)
                      .ThenBy(approval => approval.SchemaIdentity, StringComparer.Ordinal))
             records.AddRange(KernelGraphHasher.Flatten("sensitive.action", approval));
-        foreach (var approval in (options.SensitiveEventApprovals ?? []).OrderBy(approval => approval.ModuleId, StringComparer.Ordinal)
+        foreach (var approval in (options.SensitiveEventApprovals ?? []).OrderBy(approval => approval.SourceId, StringComparer.Ordinal)
                      .ThenBy(approval => approval.EventKey.Value, StringComparer.Ordinal)
                      .ThenBy(approval => approval.EventVersion)
                      .ThenBy(approval => approval.EventType, StringComparer.Ordinal)
                      .ThenBy(approval => approval.SchemaIdentity, StringComparer.Ordinal))
             records.AddRange(KernelGraphHasher.Flatten("sensitive.event", approval));
-        foreach (var approval in (options.ExternalSensitiveActionApprovals ?? []).OrderBy(approval => approval.ModuleId, StringComparer.Ordinal)
+        foreach (var approval in (options.ExternalSensitiveActionApprovals ?? []).OrderBy(approval => approval.SourceId, StringComparer.Ordinal)
                      .ThenBy(approval => approval.ActionKey.Value, StringComparer.Ordinal)
                      .ThenBy(approval => approval.ActionVersion))
             records.AddRange(KernelGraphHasher.Flatten("sensitive.external-action", approval));
-        foreach (var approval in (options.ExternalSensitiveEventApprovals ?? []).OrderBy(approval => approval.ModuleId, StringComparer.Ordinal)
+        foreach (var approval in (options.ExternalSensitiveEventApprovals ?? []).OrderBy(approval => approval.SourceId, StringComparer.Ordinal)
                      .ThenBy(approval => approval.EventKey.Value, StringComparer.Ordinal)
                      .ThenBy(approval => approval.EventVersion))
             records.AddRange(KernelGraphHasher.Flatten("sensitive.external-event", approval));
@@ -499,16 +681,16 @@ public sealed class KernelSnapshotCompiler
             records.Add($"{prefix}|<empty>");
             return;
         }
-        foreach (var module in values.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+        foreach (var registration in values.OrderBy(pair => pair.Key, StringComparer.Ordinal))
         {
-            if (module.Value.Count == 0)
+            if (registration.Value.Count == 0)
             {
-                records.Add($"{prefix}|{module.Key}|<empty>");
+                records.Add($"{prefix}|{registration.Key}|<empty>");
                 continue;
             }
-            foreach (var grant in module.Value.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+            foreach (var grant in registration.Value.OrderBy(pair => pair.Key, StringComparer.Ordinal))
                 records.Add(
-                    $"{prefix}|{module.Key}|{grant.Key}|{KernelGraphHasher.StableScalar(grant.Value)}");
+                    $"{prefix}|{registration.Key}|{grant.Key}|{KernelGraphHasher.StableScalar(grant.Value)}");
         }
     }
 
@@ -641,19 +823,19 @@ public sealed class KernelGraph
     private readonly IReadOnlyDictionary<string, ICompiledActionDefinition> _actions;
     private readonly IReadOnlyDictionary<string, ICompiledEventDefinition> _events;
     private readonly IReadOnlyList<KernelActionHookRegistration> _actionHooks;
-    private readonly IServiceProvider? _serviceProvider;
+    private readonly IServiceProvider _serviceProvider;
     private readonly KernelGraphCompileOptions _compileOptions;
 
     internal KernelGraph(
         IReadOnlyDictionary<string, ICompiledActionDefinition> actions,
         IReadOnlyDictionary<string, ICompiledEventDefinition> events,
         IReadOnlyList<KernelToolRegistration> tools,
-        KernelModuleGraph modules,
+        KernelServiceGraph services,
         ActionPipelineSnapshot actionSnapshot,
         ChatPipelineSnapshot chatSnapshot,
         int maximumActionDepth,
         IReadOnlyList<KernelActionHookRegistration> actionHooks,
-        IServiceProvider? serviceProvider,
+        IServiceProvider serviceProvider,
         KernelGraphCompileOptions compileOptions)
     {
         _actions = new ReadOnlyDictionary<string, ICompiledActionDefinition>(
@@ -661,7 +843,7 @@ public sealed class KernelGraph
         _events = new ReadOnlyDictionary<string, ICompiledEventDefinition>(
             new Dictionary<string, ICompiledEventDefinition>(events, StringComparer.Ordinal));
         Tools = tools;
-        Modules = modules;
+        Services = services;
         ActionSnapshot = actionSnapshot;
         ChatSnapshot = chatSnapshot;
         MaximumActionDepth = maximumActionDepth;
@@ -676,21 +858,18 @@ public sealed class KernelGraph
 
     public IReadOnlyList<KernelToolRegistration> Tools { get; }
 
-    public KernelModuleGraph Modules { get; }
+    public KernelServiceGraph Services { get; }
 
     public int MaximumActionDepth { get; }
 
-    public object? GetService(Type serviceType) => Modules.Services.GetService(serviceType);
+    public object? GetService(Type serviceType) => Services.Services.GetService(serviceType);
 
     public TService GetRequiredService<TService>() where TService : notnull =>
         (TService)(GetService(typeof(TService)) ?? throw new KernelGraphCompilationException(
-            $"Kernel module service '{typeof(TService).FullName}' is not registered."));
+            $"Kernel registration service '{typeof(TService).FullName}' is not registered."));
 
     public KernelChatContextAssembler CreateChatContextAssembler(KernelActionDispatcher dispatcher) =>
-        new(this, dispatcher, Modules.ContextContributors.Select(type =>
-                (IChatContextContributor)(GetService(type) ?? throw new KernelGraphCompilationException(
-                    $"Chat context contributor '{type.FullName}' is not registered.")))
-            .Concat(Modules.BoundContextContributors));
+        new(this, dispatcher, Services.ContextContributors);
 
     public bool ContainsAction(SharpClawActionKey key) => _actions.ContainsKey(key.Value);
 
@@ -762,11 +941,11 @@ public sealed class KernelGraph
     {
         ArgumentNullException.ThrowIfNull(descriptor);
         ArgumentNullException.ThrowIfNull(authority);
-        var ownerModuleId = authority.ModuleId;
-        if (string.IsNullOrWhiteSpace(ownerModuleId))
+        var OwnerId = authority.SourceId;
+        if (string.IsNullOrWhiteSpace(OwnerId))
             throw new KernelGraphCompilationException("An external action owner is required.");
 
-        var registration = new ActionDefinitionRegistration<TAction, TResult>(descriptor, ownerModuleId);
+        var registration = new ActionDefinitionRegistration<TAction, TResult>(descriptor, OwnerId);
         var definition = registration.Compile(_actionHooks, _serviceProvider, _compileOptions) as
             CompiledActionDefinition<TAction, TResult> ??
             throw new KernelGraphCompilationException(
@@ -787,8 +966,8 @@ public sealed class KernelGraph
         ArgumentNullException.ThrowIfNull(descriptorIdentity);
         ArgumentNullException.ThrowIfNull(snapshot);
         ArgumentNullException.ThrowIfNull(authority);
-        var ownerModuleId = authority.ModuleId;
-        if (string.IsNullOrWhiteSpace(ownerModuleId))
+        var OwnerId = authority.SourceId;
+        if (string.IsNullOrWhiteSpace(OwnerId))
             throw new KernelGraphCompilationException("An external action owner is required.");
 
         var descriptor = new ActionDescriptor<JsonElement, JsonElement>(
@@ -817,11 +996,11 @@ public sealed class KernelGraph
             definition,
             descriptorIdentity,
             snapshot,
-            ownerModuleId,
+            OwnerId,
             contractIdentity.SchemaIdentity);
         var registration = new ActionDefinitionRegistration<JsonElement, JsonElement>(
             descriptor,
-            ownerModuleId,
+            OwnerId,
             contractIdentity);
         var compiled = registration.Compile(_actionHooks, _serviceProvider, options) as
             CompiledActionDefinition<JsonElement, JsonElement> ??
@@ -845,7 +1024,7 @@ public sealed class KernelGraph
         SidecarActionDefinition definition,
         SidecarActionDescriptorIdentity descriptorIdentity,
         ActionPipelineSnapshot snapshot,
-        string ownerModuleId,
+        string OwnerId,
         string schemaIdentity)
     {
         var grant = SingleExternalGrant(snapshot, definition);
@@ -865,21 +1044,21 @@ public sealed class KernelGraph
                 $"Non-sensitive external action '{definition.ActionKey.Value}' has an invalid sensitive approval.");
         }
 
-        var moduleGrants = new Dictionary<
+        var registrationGrants = new Dictionary<
             string,
             IReadOnlyDictionary<string, ActionInterceptionCapabilities>>(StringComparer.Ordinal);
-        foreach (var module in _compileOptions.ActionModuleCapabilityGrants ??
+        foreach (var registration in _compileOptions.ActionRegistrationCapabilityGrants ??
                  new Dictionary<string, IReadOnlyDictionary<string, ActionInterceptionCapabilities>>())
         {
-            moduleGrants.Add(
-                module.Key,
-                new Dictionary<string, ActionInterceptionCapabilities>(module.Value, StringComparer.Ordinal));
+            registrationGrants.Add(
+                registration.Key,
+                new Dictionary<string, ActionInterceptionCapabilities>(registration.Value, StringComparer.Ordinal));
         }
-        var ownerGrants = moduleGrants.TryGetValue(ownerModuleId, out var existing)
+        var ownerGrants = registrationGrants.TryGetValue(OwnerId, out var existing)
             ? new Dictionary<string, ActionInterceptionCapabilities>(existing, StringComparer.Ordinal)
             : new Dictionary<string, ActionInterceptionCapabilities>(StringComparer.Ordinal);
         ownerGrants[definition.ActionKey.Value] = grant.Capabilities;
-        moduleGrants[ownerModuleId] = ownerGrants;
+        registrationGrants[OwnerId] = ownerGrants;
 
         var actionGrants = new Dictionary<string, ActionInterceptionCapabilities>(
             _compileOptions.ActionCapabilityGrants
@@ -893,7 +1072,7 @@ public sealed class KernelGraph
         if (definition.ContainsSensitiveData)
         {
             approvals.Add(new KernelSensitiveActionApproval(
-                ownerModuleId,
+                OwnerId,
                 definition.ActionKey,
                 definition.Version,
                 descriptorIdentity.InputTypeIdentity,
@@ -906,9 +1085,9 @@ public sealed class KernelGraph
             SupportedActionCapabilities = _compileOptions.SupportedActionCapabilities,
             SupportedEventCapabilities = _compileOptions.SupportedEventCapabilities,
             ActionCapabilityGrants = actionGrants,
-            ActionModuleCapabilityGrants = moduleGrants,
+            ActionRegistrationCapabilityGrants = registrationGrants,
             EventCapabilityGrants = _compileOptions.EventCapabilityGrants,
-            EventModuleCapabilityGrants = _compileOptions.EventModuleCapabilityGrants,
+            EventRegistrationCapabilityGrants = _compileOptions.EventRegistrationCapabilityGrants,
             SensitiveActionApprovals = approvals,
             ExternalSensitiveActionApprovals = _compileOptions.ExternalSensitiveActionApprovals,
             SensitiveEventApprovals = _compileOptions.SensitiveEventApprovals,
@@ -983,7 +1162,7 @@ internal sealed record KernelExternalActionPolicy<TAction, TResult>(
             [
                 "external-policy-v1",
                 snapshotContractHash,
-                authority.ModuleId,
+                authority.SourceId,
                 authority.GraphId,
                 authority.Descriptor.DescriptorHash,
                 authority.Action.ContentHash,
@@ -1039,7 +1218,7 @@ internal sealed record KernelActionHookRegistration(
     IAnyActionInterceptor? BoundHandler,
     bool IsUntyped,
     HookOrdering Ordering,
-    string OwnerModuleId,
+    string OwnerId,
     string HandlerIdentity);
 
 internal enum KernelEventHookKind
@@ -1058,7 +1237,7 @@ internal sealed record KernelEventHookRegistration(
     KernelEventHookKind Kind,
     EventDelivery Delivery,
     HookOrdering Ordering,
-    string OwnerModuleId,
+    string OwnerId,
     string HandlerIdentity);
 
 internal interface IActionDefinitionRegistration
@@ -1073,7 +1252,7 @@ internal interface IActionDefinitionRegistration
 
     Type ResultType { get; }
 
-    string OwnerModuleId { get; }
+    string OwnerId { get; }
 
     bool IsJobsAction { get; }
 
@@ -1081,7 +1260,7 @@ internal interface IActionDefinitionRegistration
 
     ICompiledActionDefinition Compile(
         IReadOnlyList<KernelActionHookRegistration> hooks,
-        IServiceProvider? serviceProvider,
+        IServiceProvider serviceProvider,
         KernelGraphCompileOptions options);
 }
 
@@ -1094,7 +1273,7 @@ internal sealed record KernelExternalActionContractIdentity(
 
 internal sealed class ActionDefinitionRegistration<TAction, TResult>(
     ActionDescriptor<TAction, TResult> descriptor,
-    string ownerModuleId,
+    string ownerId,
     KernelExternalActionContractIdentity? externalContractIdentity = null) : IActionDefinitionRegistration
 {
     public object DescriptorObject => descriptor;
@@ -1107,7 +1286,7 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
 
     public Type ResultType => typeof(TResult);
 
-    public string OwnerModuleId => ownerModuleId;
+    public string OwnerId => ownerId;
 
     public bool IsJobsAction => descriptor.Key.Value.StartsWith("jobs.", StringComparison.Ordinal);
 
@@ -1118,7 +1297,7 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
 
     public ICompiledActionDefinition Compile(
         IReadOnlyList<KernelActionHookRegistration> hooks,
-        IServiceProvider? serviceProvider,
+        IServiceProvider serviceProvider,
         KernelGraphCompileOptions options)
     {
         var unsupported = descriptor.Capabilities & ~options.SupportedActionCapabilities;
@@ -1130,9 +1309,9 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
         var effectiveCapabilities = descriptor.Capabilities & options.SupportedActionCapabilities;
         if (options.ActionCapabilityGrants?.TryGetValue(descriptor.Key.Value, out var grant) == true)
             effectiveCapabilities &= grant;
-        effectiveCapabilities &= ResolveActionModuleGrant(
+        effectiveCapabilities &= ResolveActionRegistrationGrant(
             descriptor,
-            ownerModuleId,
+            OwnerId,
             options);
 
         var matching = hooks
@@ -1146,12 +1325,12 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
             if (!hookCapabilities.HasFlag(ActionInterceptionCapabilities.Inspect))
             {
                 throw new KernelGraphCompilationException(
-                    $"Module '{hook.OwnerModuleId}' cannot receive action '{descriptor.Key.Value}' " +
+                    $"Registration '{hook.OwnerId}' cannot receive action '{descriptor.Key.Value}' " +
                     "without the Inspect capability.");
             }
             var hookSensitiveApproved = ResolveSensitiveApproval(
                 descriptor,
-                hook.OwnerModuleId,
+                hook.OwnerId,
                 options,
                 typeof(TAction),
                 typeof(TResult),
@@ -1168,7 +1347,7 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
                     hook.Key,
                     hook.Category,
                     hook.Ordering,
-                    hook.OwnerModuleId,
+                    hook.OwnerId,
                     hook.HandlerIdentity,
                     hookCapabilities,
                     hookSensitiveApproved));
@@ -1187,7 +1366,7 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
                     hook.Key,
                     hook.Category,
                     hook.Ordering,
-                    hook.OwnerModuleId,
+                    hook.OwnerId,
                     hook.HandlerIdentity,
                     hookCapabilities,
                     hookSensitiveApproved));
@@ -1196,7 +1375,7 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
 
         var sensitiveApproved = ResolveSensitiveApproval(
             descriptor,
-            ownerModuleId,
+            OwnerId,
             options,
             typeof(TAction),
             typeof(TResult),
@@ -1208,7 +1387,7 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
 
         return new CompiledActionDefinition<TAction, TResult>(
             descriptor,
-            ownerModuleId,
+            OwnerId,
             frames,
             effectiveCapabilities,
             sensitiveApproved,
@@ -1226,52 +1405,52 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
         var allowed = descriptor.Capabilities & options.SupportedActionCapabilities;
         if (options.ActionCapabilityGrants?.TryGetValue(descriptor.Key.Value, out var administratorGrant) == true)
             allowed &= administratorGrant;
-        if (hook.OwnerModuleId == KernelCapabilities.CoreOwner)
+        if (hook.OwnerId == KernelCapabilities.CoreOwner)
             return allowed;
 
-        var requested = GetActionModuleGrant(descriptor.Key, hook.OwnerModuleId, options);
+        var requested = GetActionRegistrationGrant(descriptor.Key, hook.OwnerId, options);
         var unauthorized = requested & ~allowed;
         if (unauthorized != 0)
         {
             throw new KernelGraphCompilationException(
-                $"Module '{hook.OwnerModuleId}' requests unauthorized effects '{unauthorized}' " +
+                $"Registration '{hook.OwnerId}' requests unauthorized effects '{unauthorized}' " +
                 $"for action '{descriptor.Key.Value}'.");
         }
         return requested;
     }
 
-    private static ActionInterceptionCapabilities ResolveActionModuleGrant<TActionValue, TResultValue>(
+    private static ActionInterceptionCapabilities ResolveActionRegistrationGrant<TActionValue, TResultValue>(
         ActionDescriptor<TActionValue, TResultValue> descriptor,
-        string ownerModuleId,
+        string OwnerId,
         KernelGraphCompileOptions options)
     {
-        if (ownerModuleId == KernelCapabilities.CoreOwner)
+        if (OwnerId == KernelCapabilities.CoreOwner)
             return KernelCapabilities.AllActions;
-        var moduleGrant = GetActionModuleGrant(descriptor.Key, ownerModuleId, options);
-        var unauthorized = descriptor.Capabilities & ~moduleGrant;
+        var registrationGrant = GetActionRegistrationGrant(descriptor.Key, OwnerId, options);
+        var unauthorized = descriptor.Capabilities & ~registrationGrant;
         if (unauthorized != 0)
             throw new KernelGraphCompilationException(
-                $"Module '{ownerModuleId}' requests unauthorized effects '{unauthorized}' " +
+                $"Registration '{OwnerId}' requests unauthorized effects '{unauthorized}' " +
                 $"for action '{descriptor.Key.Value}'.");
-        return moduleGrant;
+        return registrationGrant;
     }
 
-    private static ActionInterceptionCapabilities GetActionModuleGrant(
+    private static ActionInterceptionCapabilities GetActionRegistrationGrant(
         SharpClawActionKey key,
-        string ownerModuleId,
+        string OwnerId,
         KernelGraphCompileOptions options)
     {
-        if (options.ActionModuleCapabilityGrants is not { } grants ||
-            !grants.TryGetValue(ownerModuleId, out var moduleGrants) ||
-            !moduleGrants.TryGetValue(key.Value, out var moduleGrant))
+        if (options.ActionRegistrationCapabilityGrants is not { } grants ||
+            !grants.TryGetValue(OwnerId, out var registrationGrants) ||
+            !registrationGrants.TryGetValue(key.Value, out var registrationGrant))
             throw new KernelGraphCompilationException(
-                $"Module '{ownerModuleId}' has no manifest grant for action '{key.Value}'.");
-        return moduleGrant;
+                $"Registration '{OwnerId}' has no manifest grant for action '{key.Value}'.");
+        return registrationGrant;
     }
 
     private static bool ResolveSensitiveApproval<TActionValue, TResultValue>(
         ActionDescriptor<TActionValue, TResultValue> descriptor,
-        string moduleId,
+        string SourceId,
         KernelGraphCompileOptions options,
         Type actionType,
         Type resultType,
@@ -1280,7 +1459,7 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
         if (!descriptor.ContainsSensitiveData)
             return true;
         if ((options.ExternalSensitiveActionApprovals ?? []).Any(approval =>
-                approval.ModuleId == moduleId &&
+                approval.SourceId == SourceId &&
                 approval.ActionKey == descriptor.Key &&
                 approval.ActionVersion == descriptor.Version &&
                 approval.InputSchema == descriptor.InputSchema &&
@@ -1291,14 +1470,14 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
         if (externalContractIdentity is not null)
         {
             return (options.SensitiveActionApprovals ?? []).Any(approval =>
-                approval.ModuleId == moduleId &&
+                approval.SourceId == SourceId &&
                 approval.ActionKey == descriptor.Key &&
                 approval.ActionVersion == descriptor.Version &&
                 approval.ActionType == externalContractIdentity.ActionTypeIdentity &&
                 approval.ResultType == externalContractIdentity.ResultTypeIdentity &&
                 approval.SchemaIdentity == externalContractIdentity.SchemaIdentity);
         }
-        if (IsCanonicalCoreSensitiveAction(descriptor, moduleId, actionType, resultType))
+        if (IsCanonicalCoreSensitiveAction(descriptor, SourceId, actionType, resultType))
             return true;
         var contractTypes = KernelSchemaIdentity.ActionTypes(
             descriptor,
@@ -1306,7 +1485,7 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
             resultType);
         var schema = KernelSchemaIdentity.Action(descriptor, actionType, resultType);
         return (options.SensitiveActionApprovals ?? []).Any(approval =>
-            approval.ModuleId == moduleId &&
+            approval.SourceId == SourceId &&
             approval.ActionKey == descriptor.Key &&
             approval.ActionVersion == descriptor.Version &&
             approval.ActionType == contractTypes.ActionType.AssemblyQualifiedName &&
@@ -1316,10 +1495,10 @@ internal sealed class ActionDefinitionRegistration<TAction, TResult>(
 
     private static bool IsCanonicalCoreSensitiveAction<TActionValue, TResultValue>(
         ActionDescriptor<TActionValue, TResultValue> descriptor,
-        string moduleId,
+        string SourceId,
         Type actionType,
         Type resultType) =>
-        moduleId == KernelCapabilities.CoreOwner &&
+        SourceId == KernelCapabilities.CoreOwner &&
         descriptor.ContainsSensitiveData &&
         SharpClawActionCatalog.All.Contains(descriptor.Key) &&
         KernelActionCatalog.DescriptorFor(descriptor.Key).MatchesDescriptor(descriptor);
@@ -1346,13 +1525,13 @@ internal interface IEventDefinitionRegistration
 
     ICompiledEventDefinition Compile(
         IReadOnlyList<KernelEventHookRegistration> hooks,
-        IServiceProvider? serviceProvider,
+        IServiceProvider serviceProvider,
         KernelGraphCompileOptions options);
 }
 
 internal sealed class EventDefinitionRegistration<TEvent>(
     EventDescriptor<TEvent> descriptor,
-    string ownerModuleId) : IEventDefinitionRegistration
+    string OwnerId) : IEventDefinitionRegistration
 {
     public dynamic Descriptor => descriptor;
 
@@ -1360,7 +1539,7 @@ internal sealed class EventDefinitionRegistration<TEvent>(
 
     public ICompiledEventDefinition Compile(
         IReadOnlyList<KernelEventHookRegistration> hooks,
-        IServiceProvider? serviceProvider,
+        IServiceProvider serviceProvider,
         KernelGraphCompileOptions options)
     {
         var unsupported = descriptor.Capabilities & ~options.SupportedEventCapabilities;
@@ -1372,9 +1551,9 @@ internal sealed class EventDefinitionRegistration<TEvent>(
         var effectiveCapabilities = descriptor.Capabilities & options.SupportedEventCapabilities;
         if (options.EventCapabilityGrants?.TryGetValue(descriptor.Key.Value, out var grant) == true)
             effectiveCapabilities &= grant;
-        effectiveCapabilities &= ResolveEventModuleGrant(
+        effectiveCapabilities &= ResolveEventRegistrationGrant(
             descriptor,
-            ownerModuleId,
+            OwnerId,
             options);
 
         var matching = hooks
@@ -1392,12 +1571,12 @@ internal sealed class EventDefinitionRegistration<TEvent>(
             if ((hookCapabilities & requiredCapabilities) != requiredCapabilities)
             {
                 throw new KernelGraphCompilationException(
-                    $"Module '{hook.OwnerModuleId}' cannot receive event '{descriptor.Key.Value}' " +
+                    $"Registration '{hook.OwnerId}' cannot receive event '{descriptor.Key.Value}' " +
                     $"without the effective capabilities '{requiredCapabilities}'.");
             }
             var hookSensitiveApproved = ResolveSensitiveApproval(
                 descriptor,
-                hook.OwnerModuleId,
+                hook.OwnerId,
                 options,
                 typeof(TEvent));
             if (hook.Kind == KernelEventHookKind.Interceptor)
@@ -1414,7 +1593,7 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         hook.Key,
                         hook.Category,
                         hook.Ordering,
-                        hook.OwnerModuleId,
+                        hook.OwnerId,
                         hook.HandlerIdentity,
                         hookCapabilities,
                         hookSensitiveApproved));
@@ -1433,7 +1612,7 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         hook.Key,
                         hook.Category,
                         hook.Ordering,
-                        hook.OwnerModuleId,
+                        hook.OwnerId,
                         hook.HandlerIdentity,
                         hookCapabilities,
                         hookSensitiveApproved));
@@ -1454,7 +1633,7 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         hook.TargetKind,
                         hook.Key,
                         hook.Category,
-                        hook.OwnerModuleId,
+                        hook.OwnerId,
                         hook.HandlerType,
                         hook.HandlerIdentity,
                         hook.Ordering,
@@ -1476,7 +1655,7 @@ internal sealed class EventDefinitionRegistration<TEvent>(
                         hook.TargetKind,
                         hook.Key,
                         hook.Category,
-                        hook.OwnerModuleId,
+                        hook.OwnerId,
                         hook.HandlerType,
                         hook.HandlerIdentity,
                         hook.Ordering,
@@ -1488,7 +1667,7 @@ internal sealed class EventDefinitionRegistration<TEvent>(
 
         var sensitiveApproved = ResolveSensitiveApproval(
             descriptor,
-            ownerModuleId,
+            OwnerId,
             options,
             typeof(TEvent));
         if (descriptor.ContainsSensitiveData &&
@@ -1500,7 +1679,7 @@ internal sealed class EventDefinitionRegistration<TEvent>(
 
         return new CompiledEventDefinition<TEvent>(
             descriptor,
-            ownerModuleId,
+            OwnerId,
             interceptors,
             listeners,
             effectiveCapabilities,
@@ -1516,56 +1695,56 @@ internal sealed class EventDefinitionRegistration<TEvent>(
         var allowed = descriptor.Capabilities & options.SupportedEventCapabilities;
         if (options.EventCapabilityGrants?.TryGetValue(descriptor.Key.Value, out var administratorGrant) == true)
             allowed &= administratorGrant;
-        if (hook.OwnerModuleId == KernelCapabilities.CoreOwner)
+        if (hook.OwnerId == KernelCapabilities.CoreOwner)
             return allowed;
 
-        var requested = GetEventModuleGrant(descriptor.Key, hook.OwnerModuleId, options);
+        var requested = GetEventRegistrationGrant(descriptor.Key, hook.OwnerId, options);
         var unauthorized = requested & ~allowed;
         if (unauthorized != 0)
         {
             throw new KernelGraphCompilationException(
-                $"Module '{hook.OwnerModuleId}' requests unauthorized effects '{unauthorized}' " +
+                $"Registration '{hook.OwnerId}' requests unauthorized effects '{unauthorized}' " +
                 $"for event '{descriptor.Key.Value}'.");
         }
         return requested;
     }
 
-    private static EventInterceptionCapabilities ResolveEventModuleGrant<TEventValue>(
+    private static EventInterceptionCapabilities ResolveEventRegistrationGrant<TEventValue>(
         EventDescriptor<TEventValue> descriptor,
-        string ownerModuleId,
+        string OwnerId,
         KernelGraphCompileOptions options)
     {
-        if (ownerModuleId == KernelCapabilities.CoreOwner)
+        if (OwnerId == KernelCapabilities.CoreOwner)
             return EventInterceptionCapabilities.Inspect |
                    EventInterceptionCapabilities.Replace |
                    EventInterceptionCapabilities.Cancel |
                    EventInterceptionCapabilities.StopPropagation |
                    EventInterceptionCapabilities.Observe;
-        var moduleGrant = GetEventModuleGrant(descriptor.Key, ownerModuleId, options);
-        var unauthorized = descriptor.Capabilities & ~moduleGrant;
+        var registrationGrant = GetEventRegistrationGrant(descriptor.Key, OwnerId, options);
+        var unauthorized = descriptor.Capabilities & ~registrationGrant;
         if (unauthorized != 0)
             throw new KernelGraphCompilationException(
-                $"Module '{ownerModuleId}' requests unauthorized effects '{unauthorized}' " +
+                $"Registration '{OwnerId}' requests unauthorized effects '{unauthorized}' " +
                 $"for event '{descriptor.Key.Value}'.");
-        return moduleGrant;
+        return registrationGrant;
     }
 
-    private static EventInterceptionCapabilities GetEventModuleGrant(
+    private static EventInterceptionCapabilities GetEventRegistrationGrant(
         SharpClawEventKey key,
-        string ownerModuleId,
+        string OwnerId,
         KernelGraphCompileOptions options)
     {
-        if (options.EventModuleCapabilityGrants is not { } grants ||
-            !grants.TryGetValue(ownerModuleId, out var moduleGrants) ||
-            !moduleGrants.TryGetValue(key.Value, out var moduleGrant))
+        if (options.EventRegistrationCapabilityGrants is not { } grants ||
+            !grants.TryGetValue(OwnerId, out var registrationGrants) ||
+            !registrationGrants.TryGetValue(key.Value, out var registrationGrant))
             throw new KernelGraphCompilationException(
-                $"Module '{ownerModuleId}' has no manifest grant for event '{key.Value}'.");
-        return moduleGrant;
+                $"Registration '{OwnerId}' has no manifest grant for event '{key.Value}'.");
+        return registrationGrant;
     }
 
     private static bool ResolveSensitiveApproval<TEventValue>(
         EventDescriptor<TEventValue> descriptor,
-        string moduleId,
+        string SourceId,
         KernelGraphCompileOptions options,
         Type eventType)
     {
@@ -1573,7 +1752,7 @@ internal sealed class EventDefinitionRegistration<TEvent>(
             return true;
         var payloadSchema = KernelSchemaIdentity.EventPayload(descriptor, eventType);
         if ((options.ExternalSensitiveEventApprovals ?? []).Any(approval =>
-                approval.ModuleId == moduleId &&
+                approval.SourceId == SourceId &&
                 approval.EventKey == descriptor.Key &&
                 approval.EventVersion == descriptor.Version &&
                 approval.PayloadSchema == payloadSchema))
@@ -1582,7 +1761,7 @@ internal sealed class EventDefinitionRegistration<TEvent>(
         }
         var schema = KernelSchemaIdentity.Event(descriptor, eventType);
         return (options.SensitiveEventApprovals ?? []).Any(approval =>
-            approval.ModuleId == moduleId &&
+            approval.SourceId == SourceId &&
             approval.EventKey == descriptor.Key &&
             approval.EventVersion == descriptor.Version &&
             approval.EventType == eventType.AssemblyQualifiedName &&
@@ -1739,7 +1918,7 @@ public static class KernelSchemaIdentity
             if (contract.InputPayloadType is { } input && contract.ResultPayloadType is { } result)
                 return (input, result);
             throw new KernelGraphCompilationException(
-                $"Action '{descriptor.Key.Value}' requires a module-owned typed descriptor.");
+                $"Action '{descriptor.Key.Value}' requires a registration-owned typed descriptor.");
         }
         return (actionType, resultType);
     }
@@ -1841,12 +2020,12 @@ internal interface ICompiledActionDefinition
 
     JsonSchemaReference ResultSchema { get; }
 
-    string OwnerModuleId { get; }
+    string OwnerId { get; }
 }
 
 internal sealed class CompiledActionDefinition<TAction, TResult>(
     ActionDescriptor<TAction, TResult> descriptor,
-    string ownerModuleId,
+    string OwnerId,
     IReadOnlyList<IActionFrame<TAction, TResult>> frames,
     ActionInterceptionCapabilities effectiveCapabilities,
     bool sensitiveApproved,
@@ -1892,12 +2071,12 @@ internal sealed class CompiledActionDefinition<TAction, TResult>(
             $"{frame.Ordering.Id}|{KernelGraphHasher.StableScalar(frame.Ordering.Priority)}|" +
             $"{string.Join(";", frame.Ordering.Before ?? [])}|{string.Join(";", frame.Ordering.After ?? [])}|" +
             $"{KernelGraphHasher.StableScalar(frame.Ordering.Timeout)}|" +
-            $"{KernelGraphHasher.StableScalar(frame.Ordering.FailurePolicy)}|{frame.OwnerModuleId}|" +
+            $"{KernelGraphHasher.StableScalar(frame.Ordering.FailurePolicy)}|{frame.OwnerId}|" +
             $"{frame.HandlerIdentity}|{frame.IsUntyped}|" +
             $"{KernelGraphHasher.StableScalar((int)frame.EffectiveCapabilities)}|" +
             $"{KernelGraphHasher.StableScalar(frame.SensitiveApproved)}")]);
 
-    public string OwnerModuleId { get; } = ownerModuleId;
+    public string OwnerId { get; } = OwnerId;
 
     public IReadOnlyList<IActionFrame<TAction, TResult>> Frames { get; } = frames;
 
@@ -1922,7 +2101,7 @@ internal interface IActionFrame<TAction, TResult>
 
     HookOrdering Ordering { get; }
 
-    string OwnerModuleId { get; }
+    string OwnerId { get; }
 
     Type HandlerType { get; }
 
@@ -1939,7 +2118,7 @@ internal sealed class TypedActionFrame<TAction, TResult>(
     SharpClawActionKey? targetKey,
     string? targetCategory,
     HookOrdering ordering,
-    string ownerModuleId,
+    string OwnerId,
     string handlerIdentity,
     ActionInterceptionCapabilities effectiveCapabilities,
     bool sensitiveApproved)
@@ -1957,7 +2136,7 @@ internal sealed class TypedActionFrame<TAction, TResult>(
 
     public HookOrdering Ordering { get; } = ordering;
 
-    public string OwnerModuleId { get; } = ownerModuleId;
+    public string OwnerId { get; } = OwnerId;
 
     public Type HandlerType => Interceptor.GetType();
 
@@ -1974,7 +2153,7 @@ internal sealed class AnyActionFrame<TAction, TResult>(
     SharpClawActionKey? targetKey,
     string? targetCategory,
     HookOrdering ordering,
-    string ownerModuleId,
+    string OwnerId,
     string handlerIdentity,
     ActionInterceptionCapabilities effectiveCapabilities,
     bool sensitiveApproved)
@@ -1992,7 +2171,7 @@ internal sealed class AnyActionFrame<TAction, TResult>(
 
     public HookOrdering Ordering { get; } = ordering;
 
-    public string OwnerModuleId { get; } = ownerModuleId;
+    public string OwnerId { get; } = OwnerId;
 
     public Type HandlerType => Interceptor.GetType();
 
@@ -2031,12 +2210,12 @@ internal interface ICompiledEventDefinition
 
     JsonSchemaReference PayloadSchema { get; }
 
-    string OwnerModuleId { get; }
+    string OwnerId { get; }
 }
 
 internal sealed class CompiledEventDefinition<TEvent>(
     EventDescriptor<TEvent> descriptor,
-    string ownerModuleId,
+    string OwnerId,
     IReadOnlyList<IEventFrame<TEvent>> interceptors,
     IReadOnlyList<KernelEventListener<TEvent>> listeners,
     EventInterceptionCapabilities effectiveCapabilities,
@@ -2047,7 +2226,7 @@ internal sealed class CompiledEventDefinition<TEvent>(
 
     dynamic ICompiledEventDefinition.Descriptor => Descriptor;
 
-    public string OwnerModuleId { get; } = ownerModuleId;
+    public string OwnerId { get; } = OwnerId;
 
     public SharpClawEventKey Key => Descriptor.Key;
 
@@ -2085,13 +2264,13 @@ internal sealed class CompiledEventDefinition<TEvent>(
             $"{frame.Ordering.Id}|{KernelGraphHasher.StableScalar(frame.Ordering.Priority)}|" +
             $"{string.Join(";", frame.Ordering.Before ?? [])}|{string.Join(";", frame.Ordering.After ?? [])}|" +
             $"{KernelGraphHasher.StableScalar(frame.Ordering.Timeout)}|" +
-            $"{KernelGraphHasher.StableScalar(frame.Ordering.FailurePolicy)}|{frame.OwnerModuleId}|" +
+            $"{KernelGraphHasher.StableScalar(frame.Ordering.FailurePolicy)}|{frame.OwnerId}|" +
             $"{frame.HandlerIdentity}|{frame.IsUntyped}|" +
             $"{KernelGraphHasher.StableScalar((int)frame.EffectiveCapabilities)}|" +
             $"{KernelGraphHasher.StableScalar(frame.SensitiveApproved)}"),
             ..Listeners.Select(listener =>
                 $"l|{KernelGraphHasher.StableScalar(listener.TargetKind)}|{listener.TargetKey?.Value}|" +
-                $"{listener.TargetCategory}|{listener.Id}|{listener.OwnerModuleId}|" +
+                $"{listener.TargetCategory}|{listener.Id}|{listener.OwnerId}|" +
                 $"{listener.HandlerIdentity}|{KernelGraphHasher.StableScalar(listener.Delivery)}|" +
                 $"{KernelGraphHasher.StableScalar(listener.Ordering.Priority)}|" +
                 $"{string.Join(";", listener.Ordering.Before ?? [])}|" +
@@ -2122,7 +2301,7 @@ internal interface IEventFrame<TEvent>
 
     HookOrdering Ordering { get; }
 
-    string OwnerModuleId { get; }
+    string OwnerId { get; }
 
     Type HandlerType { get; }
 
@@ -2139,7 +2318,7 @@ internal sealed class TypedEventFrame<TEvent>(
     SharpClawEventKey? targetKey,
     string? targetCategory,
     HookOrdering ordering,
-    string ownerModuleId,
+    string OwnerId,
     string handlerIdentity,
     EventInterceptionCapabilities effectiveCapabilities,
     bool sensitiveApproved) : IEventFrame<TEvent>
@@ -2156,7 +2335,7 @@ internal sealed class TypedEventFrame<TEvent>(
 
     public HookOrdering Ordering { get; } = ordering;
 
-    public string OwnerModuleId { get; } = ownerModuleId;
+    public string OwnerId { get; } = OwnerId;
 
     public Type HandlerType => Interceptor.GetType();
 
@@ -2173,7 +2352,7 @@ internal sealed class AnyEventFrame<TEvent>(
     SharpClawEventKey? targetKey,
     string? targetCategory,
     HookOrdering ordering,
-    string ownerModuleId,
+    string OwnerId,
     string handlerIdentity,
     EventInterceptionCapabilities effectiveCapabilities,
     bool sensitiveApproved) : IEventFrame<TEvent>
@@ -2190,7 +2369,7 @@ internal sealed class AnyEventFrame<TEvent>(
 
     public HookOrdering Ordering { get; } = ordering;
 
-    public string OwnerModuleId { get; } = ownerModuleId;
+    public string OwnerId { get; } = OwnerId;
 
     public Type HandlerType => Interceptor.GetType();
 
@@ -2208,573 +2387,9 @@ internal sealed record KernelEventListener<TEvent>(
     KernelHookTargetKind TargetKind,
     SharpClawEventKey? TargetKey,
     string? TargetCategory,
-    string OwnerModuleId,
+    string OwnerId,
     Type HandlerType,
     string HandlerIdentity,
     HookOrdering Ordering,
     EventInterceptionCapabilities EffectiveCapabilities,
     bool SensitiveApproved);
-
-public sealed class KernelActionDefinitionBuilder(
-    KernelGraphBuilder builder,
-    string ownerModuleId) : IActionDefinitionBuilder
-{
-    public void Add<TAction, TResult>(ActionDescriptor<TAction, TResult> descriptor) =>
-        builder.Add(descriptor, ownerModuleId);
-}
-
-public sealed class KernelEventDefinitionBuilder(
-    KernelGraphBuilder builder,
-    string ownerModuleId) : IEventDefinitionBuilder
-{
-    public void Add<TEvent>(EventDescriptor<TEvent> descriptor) =>
-        builder.AddEvent(descriptor, ownerModuleId);
-
-    public IEventHookRegistrationBuilder For(SharpClawEventKey key) =>
-        new KernelEventHookRegistrationBuilder(builder, ownerModuleId, KernelHookTargetKind.Exact, key, null);
-
-    public IEventHookRegistrationBuilder Category(string category) =>
-        new KernelEventHookRegistrationBuilder(builder, ownerModuleId, KernelHookTargetKind.Category, null, category);
-
-    public IEventHookRegistrationBuilder AnyEvent() =>
-        new KernelEventHookRegistrationBuilder(builder, ownerModuleId, KernelHookTargetKind.Any, null, null);
-}
-
-public sealed class KernelActionHookBuilder(
-    KernelGraphBuilder builder,
-    string ownerModuleId) : IActionHookBuilder
-{
-    public IActionHookRegistrationBuilder For(SharpClawActionKey key) =>
-        new KernelActionHookRegistrationBuilder(builder, ownerModuleId, KernelHookTargetKind.Exact, key, null);
-
-    public IActionHookRegistrationBuilder Category(string category) =>
-        new KernelActionHookRegistrationBuilder(builder, ownerModuleId, KernelHookTargetKind.Category, null, category);
-
-    public IActionHookRegistrationBuilder AnyAction() =>
-        new KernelActionHookRegistrationBuilder(builder, ownerModuleId, KernelHookTargetKind.Any, null, null);
-}
-
-public sealed class KernelActionHookRegistrationBuilder(
-    KernelGraphBuilder builder,
-    string ownerModuleId,
-    KernelHookTargetKind targetKind,
-    SharpClawActionKey? key,
-    string? category) : IActionHookRegistrationBuilder
-{
-    public void Use<TInterceptor>(HookOrdering ordering) =>
-        builder.AddActionHook(new KernelActionHookRegistration(
-            targetKind,
-            key,
-            category,
-            typeof(TInterceptor),
-            null,
-            false,
-            ordering,
-            ownerModuleId,
-            typeof(TInterceptor).AssemblyQualifiedName!));
-
-    public void UseAny<TInterceptor>(HookOrdering ordering) =>
-        builder.AddActionHook(new KernelActionHookRegistration(
-            targetKind,
-            key,
-            category,
-            typeof(TInterceptor),
-            null,
-            true,
-            ordering,
-            ownerModuleId,
-            typeof(TInterceptor).AssemblyQualifiedName!));
-}
-
-public sealed class KernelEventHookBuilder(
-    KernelGraphBuilder builder,
-    string ownerModuleId) : IEventHookBuilder
-{
-    public IEventHookRegistrationBuilder For(SharpClawEventKey key) =>
-        new KernelEventHookRegistrationBuilder(builder, ownerModuleId, KernelHookTargetKind.Exact, key, null);
-
-    public IEventHookRegistrationBuilder Category(string category) =>
-        new KernelEventHookRegistrationBuilder(builder, ownerModuleId, KernelHookTargetKind.Category, null, category);
-
-    public IEventHookRegistrationBuilder AnyEvent() =>
-        new KernelEventHookRegistrationBuilder(builder, ownerModuleId, KernelHookTargetKind.Any, null, null);
-}
-
-public sealed class KernelEventHookRegistrationBuilder(
-    KernelGraphBuilder builder,
-    string ownerModuleId,
-    KernelHookTargetKind targetKind,
-    SharpClawEventKey? key,
-    string? category) : IEventHookRegistrationBuilder
-{
-    public void Intercept<TInterceptor>(HookOrdering ordering) =>
-        Add(typeof(TInterceptor), false, KernelEventHookKind.Interceptor, EventDelivery.Inline, ordering);
-
-    public void InterceptAny<TInterceptor>(HookOrdering ordering) =>
-        Add(typeof(TInterceptor), true, KernelEventHookKind.Interceptor, EventDelivery.Inline, ordering);
-
-    public void Listen<TListener>(EventDelivery delivery, HookOrdering ordering) =>
-        Add(typeof(TListener), false, KernelEventHookKind.Listener, delivery, ordering);
-
-    public void ListenAny<TListener>(EventDelivery delivery, HookOrdering ordering) =>
-        Add(typeof(TListener), true, KernelEventHookKind.Listener, delivery, ordering);
-
-    private void Add(
-        Type handlerType,
-        bool isUntyped,
-        KernelEventHookKind kind,
-        EventDelivery delivery,
-        HookOrdering ordering) =>
-        builder.AddEventHook(new KernelEventHookRegistration(
-            targetKind,
-            key,
-            category,
-            handlerType,
-            null,
-            isUntyped,
-            kind,
-            delivery,
-            ordering,
-            ownerModuleId,
-            handlerType.AssemblyQualifiedName!));
-}
-
-public sealed class KernelModuleRegistry
-{
-    private readonly KernelGraphBuilder _graphBuilder = new();
-    private readonly List<ISharpClawModule> _modules = [];
-    private readonly HashSet<string> _moduleIds = new(StringComparer.Ordinal);
-    private KernelGraph? _compiledGraph;
-
-    public IReadOnlyList<ISharpClawModule> Modules => new ReadOnlyCollection<ISharpClawModule>(_modules);
-
-    public void Add(ISharpClawModule module)
-    {
-        ArgumentNullException.ThrowIfNull(module);
-        if (_moduleIds.Contains(module.Identity.Id))
-            throw new KernelGraphCompilationException($"Module '{module.Identity.Id}' is registered more than once.");
-        var contributionGraph = new KernelGraphBuilder(
-            includeStandardDefinitions: false,
-            includeLifecycleDefinitions: false);
-        var moduleBuilder = new KernelModuleBuilder(contributionGraph, module.Identity);
-        module.Configure(moduleBuilder);
-        _graphBuilder.Import(contributionGraph);
-        _graphBuilder.AddModule(moduleBuilder.BuildDeclaration());
-        _moduleIds.Add(module.Identity.Id);
-        _modules.Add(module);
-    }
-
-    public KernelGraph Compile(
-        IServiceProvider? serviceProvider = null,
-        KernelGraphCompileOptions? options = null)
-    {
-        _compiledGraph = _graphBuilder.Compile(serviceProvider, options);
-        return _compiledGraph;
-    }
-
-    public async ValueTask StartAsync(
-        KernelGraph graph,
-        KernelActionExecutionContext executionContext,
-        string hostVersion,
-        ExtensionFeatureSet features,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(graph);
-        ArgumentNullException.ThrowIfNull(executionContext);
-        _compiledGraph = graph;
-        var dispatcher = new KernelActionDispatcher(graph, executionContext);
-        var descriptor = graph.GetStandardAction(new SharpClawActionKey("module.start"));
-        foreach (var module in _modules)
-        {
-            var context = new ModuleStartContext(
-                module.Identity,
-                hostVersion,
-                graph.ActionSnapshot.ContractHash,
-                features);
-            await dispatcher.RunRequiredAsync<KernelActionEnvelope, object>(
-                descriptor,
-                new KernelActionEnvelope(descriptor.Key, context),
-                async (context, ct) =>
-                {
-                    var effectiveContext = context.Action.Payload switch
-                    {
-                        ModuleStartContext value => value,
-                        KernelActionEnvelope nested when nested.Payload is ModuleStartContext value => value,
-                        _ => throw new KernelActionExecutionException(
-                            "The module.start action returned an invalid ModuleStartContext replacement.")
-                    };
-                    await module.StartAsync(effectiveContext, ct);
-                    return (object)true;
-                },
-                graph.ActionSnapshot,
-                cancellationToken);
-        }
-    }
-
-    public async ValueTask StopAsync(
-        KernelActionExecutionContext executionContext,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(executionContext);
-        if (_compiledGraph is null)
-            throw new KernelActionExecutionException("The module registry must compile before it can stop modules.");
-        var dispatcher = new KernelActionDispatcher(_compiledGraph, executionContext);
-        var descriptor = _compiledGraph.GetStandardAction(new SharpClawActionKey("module.stop"));
-        for (var index = _modules.Count - 1; index >= 0; index--)
-        {
-            var module = _modules[index];
-            await dispatcher.RunRequiredAsync<KernelActionEnvelope, object>(
-                descriptor,
-                new KernelActionEnvelope(descriptor.Key, module.Identity),
-                async (_, ct) =>
-                {
-                    await module.StopAsync(ct);
-                    return (object)true;
-                },
-                _compiledGraph.ActionSnapshot,
-                cancellationToken);
-        }
-    }
-}
-
-public sealed class KernelModuleBuilder : ISharpClawModuleBuilder, IBoundModuleContributionBuilder
-{
-    private readonly ModuleIdentity _identity;
-    private readonly KernelGraphBuilder _graphBuilder;
-
-    public KernelModuleBuilder(KernelGraphBuilder graphBuilder, ModuleIdentity identity)
-    {
-        _identity = identity;
-        _graphBuilder = graphBuilder;
-        Actions = new KernelActionDefinitionBuilder(graphBuilder, identity.Id);
-        Events = new KernelEventDefinitionBuilder(graphBuilder, identity.Id);
-        Hooks = new KernelActionHookBuilder(graphBuilder, identity.Id);
-        EventHooks = new KernelEventHookBuilder(graphBuilder, identity.Id);
-        Tools = new KernelToolContributionBuilder(graphBuilder, identity.Id);
-        Chat = new KernelChatLifecycleBuilder();
-        Contracts = new KernelModuleContractBuilder(identity.Id);
-        Storage = new KernelModuleStorageBuilder();
-        Services = new KernelServiceCollection();
-    }
-
-    public IActionDefinitionBuilder Actions { get; }
-
-    public IChatLifecycleBuilder Chat { get; }
-
-    public IModuleContractBuilder Contracts { get; }
-
-    public IEventDefinitionBuilder Events { get; }
-
-    public IActionHookBuilder Hooks { get; }
-
-    public IServiceCollection Services { get; }
-
-    public IModuleStorageBuilder Storage { get; }
-
-    public IToolContributionBuilder Tools { get; }
-
-    public IEventHookBuilder EventHooks { get; }
-
-    public void AddActionHook(
-        SidecarActionSubscription subscription,
-        IAnyActionInterceptor interceptor,
-        string handlerId)
-    {
-        ValidateBoundHandler(subscription.Ordering, subscription.PayloadMode, handlerId);
-        ArgumentNullException.ThrowIfNull(interceptor);
-        _graphBuilder.AddActionHook(new KernelActionHookRegistration(
-            ToKernelTarget(subscription.TargetKind),
-            subscription.ActionKey,
-            subscription.Category,
-            interceptor.GetType(),
-            interceptor,
-            true,
-            subscription.Ordering,
-            _identity.Id,
-            handlerId));
-    }
-
-    public void AddEventInterceptor(
-        SidecarEventSubscription subscription,
-        IAnyEventInterceptor interceptor,
-        string handlerId)
-    {
-        ArgumentNullException.ThrowIfNull(interceptor);
-        AddEventHandler(
-            subscription,
-            interceptor,
-            handlerId,
-            SidecarEventSubscriptionKind.Interceptor,
-            KernelEventHookKind.Interceptor);
-    }
-
-    public void AddEventListener(
-        SidecarEventSubscription subscription,
-        IAnyEventListener listener,
-        string handlerId)
-    {
-        ArgumentNullException.ThrowIfNull(listener);
-        AddEventHandler(
-            subscription,
-            listener,
-            handlerId,
-            SidecarEventSubscriptionKind.Listener,
-            KernelEventHookKind.Listener);
-    }
-
-    public void AddTool(
-        ToolDescriptor descriptor,
-        IToolHandler handler,
-        string handlerId)
-    {
-        ArgumentNullException.ThrowIfNull(descriptor);
-        ArgumentNullException.ThrowIfNull(handler);
-        ArgumentException.ThrowIfNullOrWhiteSpace(handlerId);
-        _graphBuilder.AddBoundTool(descriptor, _identity.Id, handler, handlerId);
-    }
-
-    public void UseConversationResolver(
-        IConversationResolver resolver,
-        ExclusiveRegistration registration,
-        string handlerId) =>
-        ((KernelChatLifecycleBuilder)Chat).UseBoundConversationResolver(
-            resolver,
-            registration,
-            handlerId);
-
-    public void UseChatProfileResolver(
-        IChatProfileResolver resolver,
-        ExclusiveRegistration registration,
-        string handlerId) =>
-        ((KernelChatLifecycleBuilder)Chat).UseBoundChatProfileResolver(
-            resolver,
-            registration,
-            handlerId);
-
-    public void UseConversationStore(IConversationStore store, string handlerId) =>
-        ((KernelChatLifecycleBuilder)Chat).UseBoundConversationStore(store, handlerId);
-
-    public void AddContextContributor(
-        IChatContextContributor contributor,
-        string handlerId) =>
-        ((KernelChatLifecycleBuilder)Chat).AddBoundContextContributor(contributor, handlerId);
-
-    private void AddEventHandler(
-        SidecarEventSubscription subscription,
-        object handler,
-        string handlerId,
-        SidecarEventSubscriptionKind expectedKind,
-        KernelEventHookKind kind)
-    {
-        ValidateBoundHandler(subscription.Ordering, subscription.PayloadMode, handlerId);
-        if (subscription.Kind != expectedKind)
-            throw new KernelGraphCompilationException("The event subscription kind does not match its bound handler.");
-        _graphBuilder.AddEventHook(new KernelEventHookRegistration(
-            ToKernelTarget(subscription.TargetKind),
-            subscription.EventKey,
-            subscription.Category,
-            handler.GetType(),
-            handler,
-            true,
-            kind,
-            subscription.Delivery,
-            subscription.Ordering,
-            _identity.Id,
-            handlerId));
-    }
-
-    private static void ValidateBoundHandler(
-        HookOrdering ordering,
-        SidecarPayloadMode payloadMode,
-        string handlerId)
-    {
-        ArgumentNullException.ThrowIfNull(ordering);
-        ArgumentException.ThrowIfNullOrWhiteSpace(handlerId);
-        if (payloadMode != SidecarPayloadMode.Untyped)
-            throw new KernelGraphCompilationException("A bound external hook must use the untyped payload mode.");
-        if (!string.Equals(ordering.Id, handlerId, StringComparison.Ordinal))
-            throw new KernelGraphCompilationException("A bound external hook id must match its ordering id.");
-    }
-
-    private static KernelHookTargetKind ToKernelTarget(SidecarHookTargetKind targetKind) =>
-        targetKind switch
-        {
-            SidecarHookTargetKind.Exact => KernelHookTargetKind.Exact,
-            SidecarHookTargetKind.Category => KernelHookTargetKind.Category,
-            SidecarHookTargetKind.Wildcard => KernelHookTargetKind.Any,
-            _ => throw new KernelGraphCompilationException("The external hook target kind is not supported."),
-        };
-
-    internal KernelModuleDeclaration BuildDeclaration()
-    {
-        var chat = (KernelChatLifecycleBuilder)Chat;
-        return new KernelModuleDeclaration(
-            _identity,
-            ((KernelServiceCollection)Services).ToArray(),
-            ((KernelModuleContractBuilder)Contracts).Declarations.ToArray(),
-            ((KernelModuleStorageBuilder)Storage).Descriptors.ToArray(),
-            chat.ConversationResolver,
-            chat.ConversationResolverRegistration,
-            chat.ProfileResolver,
-            chat.ProfileResolverRegistration,
-            chat.ContextContributors.ToArray(),
-            chat.BoundConversationResolver,
-            chat.BoundProfileResolver,
-            chat.BoundConversationStore,
-            chat.BoundContextContributors.ToArray());
-    }
-}
-
-public sealed class KernelToolContributionBuilder(
-    KernelGraphBuilder builder,
-    string ownerModuleId) : IToolContributionBuilder
-{
-    public void Add<THandler>(ToolDescriptor descriptor) where THandler : IToolHandler =>
-        builder.AddTool<THandler>(descriptor, ownerModuleId);
-}
-
-public sealed class KernelServiceCollection : List<ServiceDescriptor>, IServiceCollection;
-
-public enum KernelModuleContractKind
-{
-    Export,
-    Requirement
-}
-
-public sealed record KernelModuleContractDeclaration(
-    string OwnerModuleId,
-    Type ContractType,
-    string Name,
-    int SchemaVersion,
-    int MaxBytes,
-    KernelModuleContractKind Kind,
-    bool Optional);
-
-public sealed class KernelModuleContractBuilder(string ownerModuleId) : IModuleContractBuilder
-{
-    private readonly List<KernelModuleContractDeclaration> _declarations = [];
-
-    public IReadOnlyList<KernelModuleContractDeclaration> Declarations => _declarations;
-
-    public void Export<T>(string name, int schemaVersion, int maxBytes) =>
-        _declarations.Add(new KernelModuleContractDeclaration(
-            ownerModuleId,
-            typeof(T),
-            name,
-            schemaVersion,
-            maxBytes,
-            KernelModuleContractKind.Export,
-            false));
-
-    public void Require<T>(string name, int minimumVersion, bool optional) =>
-        _declarations.Add(new KernelModuleContractDeclaration(
-            ownerModuleId,
-            typeof(T),
-            name,
-            minimumVersion,
-            0,
-            KernelModuleContractKind.Requirement,
-            optional));
-}
-
-public sealed class KernelModuleStorageBuilder : IModuleStorageBuilder
-{
-    private readonly List<ModuleStorageContractDescriptor> _descriptors = [];
-
-    public IReadOnlyList<ModuleStorageContractDescriptor> Descriptors => _descriptors;
-
-    public void Add(ModuleStorageContractDescriptor descriptor) => _descriptors.Add(descriptor);
-}
-
-internal sealed record KernelBoundContribution<T>(T Handler, string Identity)
-    where T : class;
-
-public sealed class KernelChatLifecycleBuilder : IChatLifecycleBuilder
-{
-    private readonly List<Type> _contextContributors = [];
-
-    public IReadOnlyList<Type> ContextContributors => _contextContributors;
-
-    public Type? ProfileResolver { get; private set; }
-
-    public ExclusiveRegistration? ProfileResolverRegistration { get; private set; }
-
-    public Type? ConversationResolver { get; private set; }
-
-    public ExclusiveRegistration? ConversationResolverRegistration { get; private set; }
-
-    internal KernelBoundContribution<IConversationResolver>? BoundConversationResolver { get; private set; }
-
-    internal KernelBoundContribution<IChatProfileResolver>? BoundProfileResolver { get; private set; }
-
-    internal KernelBoundContribution<IConversationStore>? BoundConversationStore { get; private set; }
-
-    internal List<KernelBoundContribution<IChatContextContributor>> BoundContextContributors { get; } = [];
-
-    public void AddContextContributor<TContributor>() where TContributor : IChatContextContributor =>
-        _contextContributors.Add(typeof(TContributor));
-
-    internal void AddBoundContextContributor(
-        IChatContextContributor contributor,
-        string handlerId)
-    {
-        ArgumentNullException.ThrowIfNull(contributor);
-        ArgumentException.ThrowIfNullOrWhiteSpace(handlerId);
-        BoundContextContributors.Add(new(contributor, handlerId));
-    }
-
-    internal void UseBoundChatProfileResolver(
-        IChatProfileResolver resolver,
-        ExclusiveRegistration registration,
-        string handlerId)
-    {
-        ArgumentNullException.ThrowIfNull(resolver);
-        ArgumentNullException.ThrowIfNull(registration);
-        ArgumentException.ThrowIfNullOrWhiteSpace(handlerId);
-        if (ProfileResolver is not null || BoundProfileResolver is not null)
-            throw new KernelGraphCompilationException("A chat profile resolver was registered more than once.");
-        BoundProfileResolver = new(resolver, handlerId);
-        ProfileResolverRegistration = registration;
-    }
-
-    internal void UseBoundConversationResolver(
-        IConversationResolver resolver,
-        ExclusiveRegistration registration,
-        string handlerId)
-    {
-        ArgumentNullException.ThrowIfNull(resolver);
-        ArgumentNullException.ThrowIfNull(registration);
-        ArgumentException.ThrowIfNullOrWhiteSpace(handlerId);
-        if (ConversationResolver is not null || BoundConversationResolver is not null)
-            throw new KernelGraphCompilationException("A conversation resolver was registered more than once.");
-        BoundConversationResolver = new(resolver, handlerId);
-        ConversationResolverRegistration = registration;
-    }
-
-    internal void UseBoundConversationStore(IConversationStore store, string handlerId)
-    {
-        ArgumentNullException.ThrowIfNull(store);
-        ArgumentException.ThrowIfNullOrWhiteSpace(handlerId);
-        if (BoundConversationStore is not null)
-            throw new KernelGraphCompilationException("A conversation store was registered more than once.");
-        BoundConversationStore = new(store, handlerId);
-    }
-
-    public void UseChatProfileResolver<TResolver>(ExclusiveRegistration registration)
-        where TResolver : IChatProfileResolver
-    {
-        if (ProfileResolver is not null || BoundProfileResolver is not null)
-            throw new KernelGraphCompilationException("A chat profile resolver was registered more than once.");
-        ProfileResolver = typeof(TResolver);
-        ProfileResolverRegistration = registration ?? throw new ArgumentNullException(nameof(registration));
-    }
-
-    public void UseConversationResolver<TResolver>(ExclusiveRegistration registration)
-        where TResolver : IConversationResolver
-    {
-        if (ConversationResolver is not null || BoundConversationResolver is not null)
-            throw new KernelGraphCompilationException("A conversation resolver was registered more than once.");
-        ConversationResolver = typeof(TResolver);
-        ConversationResolverRegistration = registration ?? throw new ArgumentNullException(nameof(registration));
-    }
-}

@@ -1,5 +1,5 @@
 using System.Text.Json;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 
 namespace SharpClaw.Core.Kernel;
 
@@ -475,9 +475,9 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                     "ACTION_DEADLINE_EXCEEDED",
                     "The action deadline expired before this action path completed.");
 
-            var ownerModuleId = index >= _definition.Frames.Count
-                ? _definition.OwnerModuleId
-                : _definition.Frames[index].OwnerModuleId;
+            var OwnerId = index >= _definition.Frames.Count
+                ? _definition.OwnerId
+                : _definition.Frames[index].OwnerId;
             var context = new ActionContext<TAction>(
                 attempt.InvocationId,
                 attempt.ParentInvocationId,
@@ -487,7 +487,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                 attempt.Number,
                 _deadline,
                 _definition.Descriptor.Key,
-                ownerModuleId,
+                OwnerId,
                 _executionContext.Caller,
                 action,
                 _executionContext.Features,
@@ -630,7 +630,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                 context.Depth,
                 context.Attempt,
                 context.Deadline,
-                context.OwnerModuleId,
+                context.OwnerId,
                 context.Caller,
                 context.Features,
                 context.Snapshot.ContractHash,
@@ -1412,7 +1412,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
                 if (!frame.EffectiveCapabilities.HasFlag(capability))
                 {
                     throw new KernelCapabilityException(
-                        $"Module '{frame.OwnerModuleId}' does not have effective capability '{capability}' " +
+                        $"Registration '{frame.OwnerId}' does not have effective capability '{capability}' " +
                         $"for action '{context.ActionKey.Value}'.");
                 }
             }

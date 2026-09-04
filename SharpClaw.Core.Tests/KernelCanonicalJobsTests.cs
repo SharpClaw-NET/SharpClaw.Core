@@ -1,7 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 using SharpClaw.Core.Kernel;
 
 namespace SharpClaw.Core.Tests;
@@ -9,7 +9,7 @@ namespace SharpClaw.Core.Tests;
 public sealed class KernelCanonicalJobsTests
 {
     [Fact]
-    public void Canonical_jobs_module_compiles_without_host_domains()
+    public void Canonical_jobs_registration_compiles_without_host_domains()
     {
         var graph = CreateGraph();
 
@@ -18,7 +18,7 @@ public sealed class KernelCanonicalJobsTests
             key => Assert.True(graph.ContainsAction(key), $"Missing action '{key.Value}'."));
         Assert.Equal(
             [KernelJobsStorage.Jobs],
-            graph.Modules.Storage.Select(contract => contract.StorageName).ToArray());
+            graph.Services.Storage.Select(contract => contract.StorageName).ToArray());
         Assert.DoesNotContain(typeof(KernelJobsCoordinator).Assembly.GetTypes(),
             type => type.Namespace?.Contains("SharpClaw.Application", StringComparison.Ordinal) == true);
     }
@@ -1129,11 +1129,14 @@ public sealed class KernelCanonicalJobsTests
 
     private static KernelGraph CreateGraph(bool failPause = false)
     {
-        var registry = new KernelModuleRegistry();
-        var jobs = new KernelJobsActionModule();
-        var workload = new WorkloadModule(failPause);
-        registry.Add(jobs);
+        var registry = new ServiceCollection();
+        var jobs = new KernelJobsBindings();
+        var workload = new WorkloadRegistration(failPause);
         registry.Add(workload);
+        foreach (var contract in KernelJobsStorage.Contracts)
+            registry.AddSingleton(contract);
+        var builder = new KernelGraphBuilder();
+        jobs.AddTo(builder);
         var sensitiveApprovals = jobs.Approvals.ToList();
         if (failPause)
         {
@@ -1148,15 +1151,16 @@ public sealed class KernelCanonicalJobsTests
                 KernelSchemaIdentity.Action(pause)));
         }
 
-        return registry.Compile(
-            null,
+        var provider = registry.BuildServiceProvider();
+        return builder.Compile(
+            provider,
             new KernelGraphCompileOptions
             {
-                ActionModuleCapabilityGrants = new Dictionary<
+                ActionRegistrationCapabilityGrants = new Dictionary<
                     string,
                     IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
                 {
-                    [jobs.Identity.Id] = jobs.Grants,
+                    [KernelJobsBindings.SourceId] = jobs.Grants,
                     [workload.Identity.Id] = workload.Grants,
                 },
                 SensitiveActionApprovals = sensitiveApprovals,
@@ -1337,7 +1341,7 @@ public sealed class KernelCanonicalJobsTests
         }
     }
 
-    private sealed class WorkloadModule : ISharpClawModule
+    private sealed class WorkloadRegistration : ITestServiceRegistration
     {
         private const ActionInterceptionCapabilities WorkloadCapabilities =
             ActionInterceptionCapabilities.Inspect |
@@ -1347,7 +1351,7 @@ public sealed class KernelCanonicalJobsTests
 
         private readonly bool _failPause;
 
-        public WorkloadModule(bool failPause = false)
+        public WorkloadRegistration(bool failPause = false)
         {
             _failPause = failPause;
             var grants = new Dictionary<string, ActionInterceptionCapabilities>(StringComparer.Ordinal)
@@ -1366,19 +1370,20 @@ public sealed class KernelCanonicalJobsTests
             Grants = grants;
         }
 
-        public ModuleIdentity Identity { get; } =
+        public TestSourceIdentity Identity { get; } =
             new("test.workloads", "Test workloads", "tests");
 
         public IReadOnlyDictionary<string, ActionInterceptionCapabilities> Grants { get; }
 
-        public void Configure(ISharpClawModuleBuilder builder)
+        public void Configure(IServiceCollection services)
         {
             foreach (var key in Grants.Keys)
             {
                 if (key == "jobs.pause")
                     continue;
 
-                builder.Actions.Add(
+                services.AddAction(
+                    Identity.Id,
                     new ActionDescriptor<KernelActionEnvelope, object>(
                         new SharpClawActionKey(key),
                         1,
@@ -1392,8 +1397,12 @@ public sealed class KernelCanonicalJobsTests
             }
 
             if (_failPause)
-                builder.Hooks.For(new SharpClawActionKey("jobs.pause"))
-                    .Use<ThrowingPauseInterceptor>(new HookOrdering("test-pause-failure"));
+            {
+                services.AddActionHook<ThrowingPauseInterceptor>(
+                    Identity.Id,
+                    new SharpClawActionKey("jobs.pause"),
+                    new HookOrdering("test-pause-failure"));
+            }
         }
     }
 
@@ -1410,12 +1419,12 @@ public sealed class KernelCanonicalJobsTests
             throw new InvalidOperationException("The test pause interceptor failed.");
     }
 
-    private sealed class InMemoryJobsGateway : IModuleStorageGateway
+    private sealed class InMemoryJobsGateway : IScopedStorageGateway
     {
         private static readonly JsonSerializerOptions JsonOptions = CreateJsonOptions();
         private readonly TimeSpan _leaseDuration;
         private readonly Dictionary<(string Storage, string Key), StoredRecord> _records = [];
-        private readonly Dictionary<string, ModuleStorageMutationAndOutboxResult> _commits =
+        private readonly Dictionary<string, ScopedStorageMutationAndOutboxResult> _commits =
             new(StringComparer.Ordinal);
         private readonly Dictionary<(string Storage, string Key), ClaimState> _claims = [];
         private readonly object _sync = new();
@@ -1430,7 +1439,7 @@ public sealed class KernelCanonicalJobsTests
 
         public TaskCompletionSource<bool>? ClaimBarrier { get; set; }
 
-        public Func<ModuleStorageMutationAndOutboxRequest, CancellationToken, Task>? BeforeCommitAsync { get; set; }
+        public Func<ScopedStorageMutationAndOutboxRequest, CancellationToken, Task>? BeforeCommitAsync { get; set; }
 
         public bool RejectRenewals { get; set; }
 
@@ -1499,7 +1508,7 @@ public sealed class KernelCanonicalJobsTests
             throw new TimeoutException($"Expected {expected} storage claim waiters.");
         }
 
-        public IReadOnlyList<ModuleStorageContractDescriptor> ListContracts() =>
+        public IReadOnlyList<ScopedStorageContractDescriptor> ListContracts() =>
             KernelJobsStorage.Contracts;
 
         private int CountAggregateItems(string propertyName)
@@ -1525,14 +1534,14 @@ public sealed class KernelCanonicalJobsTests
         }
 
         public Task<JsonElement> InvokeAsync(
-            string moduleId,
+            string SourceId,
             string storageName,
             string operation,
             JsonElement parameters,
             CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
-            if (operation == ModuleStorageOperations.Query)
+            if (operation == ScopedStorageOperations.Query)
             {
                 var filters = parameters.TryGetProperty("filters", out var filterValue) &&
                     filterValue.ValueKind == JsonValueKind.Array &&
@@ -1541,25 +1550,25 @@ public sealed class KernelCanonicalJobsTests
                     orderValue.ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined);
                 if (RejectUnboundedQueries && !filters && !order)
                     throw new InvalidOperationException(
-                        "Module storage query requires at least one filter or order index.");
+                        "Registration storage query requires at least one filter or order index.");
                 lock (_sync)
                     _queryPayloads.Add(parameters.Clone());
             }
             var response = operation switch
             {
-                ModuleStorageOperations.Get => Get(storageName, parameters),
-                ModuleStorageOperations.List or ModuleStorageOperations.Query => List(storageName, parameters),
-                ModuleStorageOperations.Upsert => Upsert(storageName, parameters),
-                ModuleStorageOperations.Delete => Delete(storageName, parameters),
+                ScopedStorageOperations.Get => Get(storageName, parameters),
+                ScopedStorageOperations.List or ScopedStorageOperations.Query => List(storageName, parameters),
+                ScopedStorageOperations.Upsert => Upsert(storageName, parameters),
+                ScopedStorageOperations.Delete => Delete(storageName, parameters),
                 _ => throw new NotSupportedException(operation),
             };
             return Task.FromResult(response);
         }
 
-        public async Task<ModuleStorageMutationAndOutboxResult> CommitMutationAndOutboxAsync(
-            string moduleId,
+        public async Task<ScopedStorageMutationAndOutboxResult> CommitMutationAndOutboxAsync(
+            string SourceId,
             string storageName,
-            ModuleStorageMutationAndOutboxRequest request,
+            ScopedStorageMutationAndOutboxRequest request,
             CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
@@ -1577,7 +1586,7 @@ public sealed class KernelCanonicalJobsTests
                 if (_commits.TryGetValue(request.Commit.IdempotencyKey, out var committed))
                     return committed with { AlreadyCommitted = true };
 
-                var revisions = new List<ModuleStorageRevision>();
+                var revisions = new List<ScopedStorageRevision>();
                 foreach (var mutation in request.Mutations)
                 {
                     var storageKey = (storageName, mutation.Key);
@@ -1593,7 +1602,7 @@ public sealed class KernelCanonicalJobsTests
                         $"{mutation.Operation}:{mutation.Key}:expected={mutation.ExpectedRevision}:actual={actualRevision}:authority={mutation.Authority}");
                     ValidateAuthority(storageKey, mutation.Authority, actualRevision);
                     var revision = actualRevision + 1;
-                    if (mutation.Operation == ModuleStorageOperations.Delete)
+                    if (mutation.Operation == ScopedStorageOperations.Delete)
                     {
                         _records.Remove(storageKey);
                     }
@@ -1631,10 +1640,10 @@ public sealed class KernelCanonicalJobsTests
                             Authority = claim.Authority with { Revision = revision },
                         };
                     }
-                    revisions.Add(new ModuleStorageRevision(mutation.Key, revision));
+                    revisions.Add(new ScopedStorageRevision(mutation.Key, revision));
                 }
 
-                var result = new ModuleStorageMutationAndOutboxResult(
+                var result = new ScopedStorageMutationAndOutboxResult(
                     request.Commit,
                     revisions,
                     [],
@@ -1644,10 +1653,10 @@ public sealed class KernelCanonicalJobsTests
             }
         }
 
-        public Task<ModuleStorageClaimResult<T>> ClaimAsync<T>(
-            string moduleId,
+        public Task<ScopedStorageClaimResult<T>> ClaimAsync<T>(
+            string SourceId,
             string storageName,
-            ModuleStorageClaimRequest request,
+            ScopedStorageClaimRequest request,
             CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
@@ -1656,7 +1665,7 @@ public sealed class KernelCanonicalJobsTests
             {
                 Interlocked.Increment(ref _claimWaiters);
                 return WaitForClaimBarrierAsync<T>(
-                    moduleId,
+                    SourceId,
                     storageName,
                     request,
                     barrier,
@@ -1666,10 +1675,10 @@ public sealed class KernelCanonicalJobsTests
             return ClaimCore<T>(storageName, request);
         }
 
-        private async Task<ModuleStorageClaimResult<T>> WaitForClaimBarrierAsync<T>(
-            string moduleId,
+        private async Task<ScopedStorageClaimResult<T>> WaitForClaimBarrierAsync<T>(
+            string SourceId,
             string storageName,
-            ModuleStorageClaimRequest request,
+            ScopedStorageClaimRequest request,
             TaskCompletionSource<bool> barrier,
             CancellationToken ct)
         {
@@ -1677,9 +1686,9 @@ public sealed class KernelCanonicalJobsTests
             return await ClaimCore<T>(storageName, request);
         }
 
-        private Task<ModuleStorageClaimResult<T>> ClaimCore<T>(
+        private Task<ScopedStorageClaimResult<T>> ClaimCore<T>(
             string storageName,
-            ModuleStorageClaimRequest request)
+            ScopedStorageClaimRequest request)
         {
             lock (_sync)
             {
@@ -1692,7 +1701,7 @@ public sealed class KernelCanonicalJobsTests
                 {
                     var emptyAuthority = NewAuthority(0, 1);
                     return Task.FromResult(
-                        new ModuleStorageClaimResult<T>([], emptyAuthority));
+                        new ScopedStorageClaimResult<T>([], emptyAuthority));
                 }
 
                 if (request.ExpectedRevision is not null &&
@@ -1707,8 +1716,8 @@ public sealed class KernelCanonicalJobsTests
                 if (_claims.TryGetValue(candidate.Key, out var existingClaim) &&
                     existingClaim.Authority.IsValidAt(DateTimeOffset.UtcNow))
                 {
-                    throw new ModuleStorageContractException(new ModuleStorageContractFailure(
-                        ModuleStorageErrors.StaleClaim,
+                    throw new ScopedStorageContractException(new ScopedStorageContractFailure(
+                        ScopedStorageErrors.StaleClaim,
                         "The Jobs aggregate already has a live storage claim.",
                         candidate.Key.Key));
                 }
@@ -1724,31 +1733,31 @@ public sealed class KernelCanonicalJobsTests
                 var authority = NewAuthority(revision, existingClaim?.Authority.Generation + 1 ?? 1);
                 _claims[candidate.Key] = new ClaimState(authority);
                 var typed = value.Deserialize<T>(JsonOptions)!;
-                var record = new ModuleStorageClaimRecord<T>(
+                var record = new ScopedStorageClaimRecord<T>(
                     candidate.Key.Key,
                     typed,
                     revision,
                     authority,
                     _records[candidate.Key].Indexes);
                 return Task.FromResult(
-                    new ModuleStorageClaimResult<T>([record], authority));
+                    new ScopedStorageClaimResult<T>([record], authority));
             }
         }
 
-        public Task<ModuleStorageClaimRenewalResult> RenewClaimAsync(
-            string moduleId,
+        public Task<ScopedStorageClaimRenewalResult> RenewClaimAsync(
+            string SourceId,
             string storageName,
-            ModuleStorageClaimRenewalRequest request,
+            ScopedStorageClaimRenewalRequest request,
             CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
             Interlocked.Increment(ref _renewCount);
             if (RejectRenewals)
             {
-                return Task.FromResult(new ModuleStorageClaimRenewalResult(
+                return Task.FromResult(new ScopedStorageClaimRenewalResult(
                     false,
                     null,
-                    ModuleStorageErrors.StaleClaim));
+                    ScopedStorageErrors.StaleClaim));
             }
 
             lock (_sync)
@@ -1761,10 +1770,10 @@ public sealed class KernelCanonicalJobsTests
                     !match.Value.Authority.IsValidAt(DateTimeOffset.UtcNow) ||
                     !_records.TryGetValue(match.Key, out var record))
                 {
-                    return Task.FromResult(new ModuleStorageClaimRenewalResult(
+                    return Task.FromResult(new ScopedStorageClaimRenewalResult(
                         false,
                         null,
-                        ModuleStorageErrors.StaleClaim));
+                        ScopedStorageErrors.StaleClaim));
                 }
 
                 var authority = match.Value.Authority with
@@ -1773,14 +1782,14 @@ public sealed class KernelCanonicalJobsTests
                     Revision = record.Revision,
                 };
                 _claims[match.Key] = new ClaimState(authority);
-                return Task.FromResult(new ModuleStorageClaimRenewalResult(true, authority));
+                return Task.FromResult(new ScopedStorageClaimRenewalResult(true, authority));
             }
         }
 
-        public Task<ModuleStorageClaimRecoveryResult> RecoverClaimAsync(
-            string moduleId,
+        public Task<ScopedStorageClaimRecoveryResult> RecoverClaimAsync(
+            string SourceId,
             string storageName,
-            ModuleStorageClaimRecoveryRequest request,
+            ScopedStorageClaimRecoveryRequest request,
             CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
@@ -1792,13 +1801,13 @@ public sealed class KernelCanonicalJobsTests
                     pair.Value.Authority.HostToken == request.HostToken &&
                     pair.Value.Authority.Generation == request.Generation);
                 if (match.Value is null)
-                    return Task.FromResult(new ModuleStorageClaimRecoveryResult(
+                    return Task.FromResult(new ScopedStorageClaimRecoveryResult(
                         false,
                         null,
-                        ModuleStorageErrors.StaleClaim));
+                        ScopedStorageErrors.StaleClaim));
 
                 _claims.Remove(match.Key);
-                return Task.FromResult(new ModuleStorageClaimRecoveryResult(
+                return Task.FromResult(new ScopedStorageClaimRecoveryResult(
                     true,
                     match.Value.Authority,
                     null));
@@ -1858,7 +1867,7 @@ public sealed class KernelCanonicalJobsTests
             {
                 var indexName = filter.GetProperty("indexName").GetString()!;
                 var comparison = filter.GetProperty("operator").GetString();
-                if (!string.Equals(comparison, ModuleStorageComparisonOperators.EqualTo, StringComparison.Ordinal))
+                if (!string.Equals(comparison, ScopedStorageComparisonOperators.EqualTo, StringComparison.Ordinal))
                     continue;
                 if (indexes is null || !indexes.Value.TryGetProperty(indexName, out var actual))
                     return false;
@@ -1877,11 +1886,11 @@ public sealed class KernelCanonicalJobsTests
 
         private static bool MatchesFilters(
             JsonElement? indexes,
-            IReadOnlyList<ModuleDocumentIndexFilter> filters)
+            IReadOnlyList<ScopedDocumentIndexFilter> filters)
         {
             foreach (var filter in filters)
             {
-                if (!string.Equals(filter.Operator, ModuleStorageComparisonOperators.EqualTo, StringComparison.Ordinal))
+                if (!string.Equals(filter.Operator, ScopedStorageComparisonOperators.EqualTo, StringComparison.Ordinal))
                     continue;
                 if (indexes is null || !indexes.Value.TryGetProperty(filter.IndexName, out var actual))
                     return false;
@@ -1900,7 +1909,7 @@ public sealed class KernelCanonicalJobsTests
 
         private void ValidateAuthority(
             (string Storage, string Key) storageKey,
-            ModuleStorageClaimAuthority? authority,
+            ScopedStorageClaimAuthority? authority,
             long actualRevision)
         {
             if (authority is null)
@@ -1909,8 +1918,8 @@ public sealed class KernelCanonicalJobsTests
                 !claim.Authority.Matches(authority) ||
                 claim.Authority.Revision != actualRevision)
             {
-                throw new ModuleStorageContractException(new ModuleStorageContractFailure(
-                    ModuleStorageErrors.FencingRejected,
+                throw new ScopedStorageContractException(new ScopedStorageContractFailure(
+                    ScopedStorageErrors.FencingRejected,
                     $"The Jobs mutation does not carry the current storage claim. " +
                     $"Expected={authority}, Current={claim?.Authority}, ActualRevision={actualRevision}, " +
                     $"History={string.Join(" | ", _commitLog)}.",
@@ -1918,22 +1927,22 @@ public sealed class KernelCanonicalJobsTests
             }
         }
 
-        private ModuleStorageClaimAuthority NewAuthority(
+        private ScopedStorageClaimAuthority NewAuthority(
             long revision,
             long generation) =>
             new(
-                KernelJobsStorage.OwnerModuleId,
+                KernelJobsStorage.OwnerId,
                 Guid.NewGuid(),
                 DateTimeOffset.UtcNow.Add(_leaseDuration),
                 generation,
                 revision);
 
-        private static ModuleStorageContractException RevisionConflict(
+        private static ScopedStorageContractException RevisionConflict(
             string key,
             long? expectedRevision,
             long actualRevision) =>
-            new(new ModuleStorageContractFailure(
-                ModuleStorageErrors.RevisionConflict,
+            new(new ScopedStorageContractFailure(
+                ScopedStorageErrors.RevisionConflict,
                 $"The test storage rejected stale revision {expectedRevision} for '{key}'.",
                 key,
                 expectedRevision,
@@ -1986,7 +1995,7 @@ public sealed class KernelCanonicalJobsTests
 
         private sealed record StoredRecord(JsonElement Value, long Revision, JsonElement? Indexes);
 
-        private sealed record ClaimState(ModuleStorageClaimAuthority Authority);
+        private sealed record ClaimState(ScopedStorageClaimAuthority Authority);
 
         private sealed class ReadOnlySetJsonConverterFactory : JsonConverterFactory
         {

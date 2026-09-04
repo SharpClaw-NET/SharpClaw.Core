@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 using SharpClaw.Contracts.Providers;
 using SharpClaw.Core.Kernel;
 
@@ -527,58 +527,58 @@ public sealed class KernelBoundaryTests
     }
 
     [Fact]
-    public void Module_manifest_grants_are_required_for_requested_hook_effects()
+    public void Registration_manifest_grants_are_required_for_requested_hook_effects()
     {
-        var key = new SharpClawActionKey("boundary.module.grant");
-        var registry = new KernelModuleRegistry();
-        registry.Add(new CapabilityModule(key));
+        var key = new SharpClawActionKey("boundary.registration.grant");
+        var registry = new ServiceCollection();
+        registry.Add(new CapabilityRegistration(key));
 
         var exception = Assert.Throws<KernelGraphCompilationException>(() => registry.Compile(
             options: new KernelGraphCompileOptions
             {
-                ActionModuleCapabilityGrants = new Dictionary<
+                ActionRegistrationCapabilityGrants = new Dictionary<
                     string,
                     IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
                 {
-                    ["boundary.module"] = new Dictionary<string, ActionInterceptionCapabilities>
+                    ["boundary.registration"] = new Dictionary<string, ActionInterceptionCapabilities>
                     {
                         [key.Value] = ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap
                     }
                 }
             }));
 
-        Assert.Contains("boundary.module", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("boundary.registration", exception.Message, StringComparison.Ordinal);
         Assert.Contains("unauthorized", exception.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Contains(nameof(ActionInterceptionCapabilities.ReplaceInput), exception.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Module_hooks_without_manifest_grants_fail_closed()
+    public void Registration_hooks_without_manifest_grants_fail_closed()
     {
-        var key = new SharpClawActionKey("boundary.module.missing-grant");
-        var registry = new KernelModuleRegistry();
-        registry.Add(new CapabilityModule(key));
+        var key = new SharpClawActionKey("boundary.registration.missing-grant");
+        var registry = new ServiceCollection();
+        registry.Add(new CapabilityRegistration(key));
 
         var exception = Assert.Throws<KernelGraphCompilationException>(() => registry.Compile());
 
-        Assert.Contains("boundary.module", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("boundary.registration", exception.Message, StringComparison.Ordinal);
         Assert.Contains("no manifest grant", exception.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public async Task Restricted_module_hook_uses_its_own_effective_capabilities()
+    public async Task Restricted_registration_hook_uses_its_own_effective_capabilities()
     {
         var key = SharpClawActions.Chat.Turn;
-        var registry = new KernelModuleRegistry();
-        registry.Add(new RestrictedHookModule(key));
+        var registry = new ServiceCollection();
+        registry.Add(new RestrictedHookRegistration(key));
         var graph = registry.Compile(
             options: new KernelGraphCompileOptions
             {
-                ActionModuleCapabilityGrants = new Dictionary<
+                ActionRegistrationCapabilityGrants = new Dictionary<
                     string,
                     IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
                 {
-                    ["restricted.module"] = new Dictionary<string, ActionInterceptionCapabilities>
+                    ["restricted.registration"] = new Dictionary<string, ActionInterceptionCapabilities>
                     {
                         [key.Value] = ActionInterceptionCapabilities.Inspect
                     }
@@ -1490,46 +1490,6 @@ public sealed class KernelBoundaryTests
         Assert.Equal(EventInterceptionKind.Continued, result.Kind);
     }
 
-    [Fact]
-    public async Task Module_lifecycle_calls_are_dispatched_through_lifecycle_actions()
-    {
-        LifecycleModule.Starts = 0;
-        LifecycleModule.Stops = 0;
-        LifecycleInterceptor.Keys.Clear();
-        var registry = new KernelModuleRegistry();
-        registry.Add(new LifecycleModule());
-        var lifecycleStart = new SharpClawActionKey("module.start");
-        var lifecycleStop = new SharpClawActionKey("module.stop");
-        var graph = registry.Compile(
-            options: new KernelGraphCompileOptions
-            {
-                ActionModuleCapabilityGrants = new Dictionary<
-                    string,
-                    IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
-                {
-                    ["boundary.module"] = new Dictionary<string, ActionInterceptionCapabilities>
-                    {
-                        [lifecycleStart.Value] = KernelActionCatalog.StandardCapabilities(lifecycleStart),
-                        [lifecycleStop.Value] = KernelActionCatalog.StandardCapabilities(lifecycleStop)
-                    }
-                }
-            });
-
-        var executionContext = KernelTestExecution.CreateContext();
-        await registry.StartAsync(
-            graph,
-            executionContext,
-            "host",
-            ExtensionFeatureSet.Empty,
-            CancellationToken.None);
-        await registry.StopAsync(executionContext, CancellationToken.None);
-
-        Assert.Equal(1, LifecycleModule.Starts);
-        Assert.Equal(1, LifecycleModule.Stops);
-        Assert.Contains("module.start", LifecycleInterceptor.Keys);
-        Assert.Contains("module.stop", LifecycleInterceptor.Keys);
-    }
-
     private static string ActionHash<TAction, TResult>(
         ActionDescriptor<TAction, TResult> descriptor,
         KernelGraphCompileOptions? options = null)
@@ -1760,23 +1720,29 @@ public sealed class KernelBoundaryTests
                 cancellationToken);
     }
 
-    private sealed class CapabilityModule(SharpClawActionKey key) : ISharpClawModule
+    private sealed class CapabilityRegistration(SharpClawActionKey key) : ITestServiceRegistration
     {
-        public ModuleIdentity Identity { get; } = new("boundary.module", "Boundary module", "boundary");
+        public TestSourceIdentity Identity { get; } = new("boundary.registration", "Boundary registration", "boundary");
 
-        public void Configure(ISharpClawModuleBuilder module)
+        public void Configure(IServiceCollection services)
         {
-            module.Actions.Add(Descriptor(key));
-            module.Hooks.For(key).Use<ProceedInterceptor>(Order("module-hook"));
+            services.AddAction(Identity.Id, Descriptor(key));
+            services.AddActionHook<ProceedInterceptor>(
+                Identity.Id,
+                key,
+                Order("registration-hook"));
         }
     }
 
-    private sealed class RestrictedHookModule(SharpClawActionKey key) : ISharpClawModule
+    private sealed class RestrictedHookRegistration(SharpClawActionKey key) : ITestServiceRegistration
     {
-        public ModuleIdentity Identity { get; } = new("restricted.module", "Restricted module", "restricted");
+        public TestSourceIdentity Identity { get; } = new("restricted.registration", "Restricted registration", "restricted");
 
-        public void Configure(ISharpClawModuleBuilder module) =>
-            module.Hooks.For(key).Use<InspectOnlyInterceptor>(Order("restricted-hook"));
+        public void Configure(IServiceCollection services) =>
+            services.AddActionHook<InspectOnlyInterceptor>(
+                Identity.Id,
+                key,
+                Order("restricted-hook"));
     }
 
     private sealed class InspectOnlyInterceptor : IActionInterceptor<KernelActionEnvelope, object>
@@ -2282,42 +2248,4 @@ public sealed class KernelBoundaryTests
             ValueTask.FromResult(ToolInvocationOutcome.Rejected("unused", "unused"));
     }
 
-    private sealed class LifecycleModule : ISharpClawModule
-    {
-        public static int Starts { get; set; }
-        public static int Stops { get; set; }
-        public ModuleIdentity Identity { get; } = new("boundary.module", "Boundary", "boundary");
-
-        public void Configure(ISharpClawModuleBuilder module)
-        {
-            module.Hooks.For(new SharpClawActionKey("module.start")).Use<LifecycleInterceptor>(Order("start-hook"));
-            module.Hooks.For(new SharpClawActionKey("module.stop")).Use<LifecycleInterceptor>(Order("stop-hook"));
-        }
-
-        public ValueTask StartAsync(ModuleStartContext context, CancellationToken cancellationToken)
-        {
-            Starts++;
-            return ValueTask.CompletedTask;
-        }
-
-        public ValueTask StopAsync(CancellationToken cancellationToken)
-        {
-            Stops++;
-            return ValueTask.CompletedTask;
-        }
-    }
-
-    private sealed class LifecycleInterceptor : IActionInterceptor<KernelActionEnvelope, object>
-    {
-        public static List<string> Keys { get; } = [];
-
-        public ValueTask<IActionOutcome<object>> InvokeAsync(
-            ActionContext<KernelActionEnvelope> context,
-            IActionControl<KernelActionEnvelope, object> control,
-            CancellationToken cancellationToken)
-        {
-            Keys.Add(context.Action.Key.Value);
-            return control.ProceedAsync(cancellationToken);
-        }
-    }
 }

@@ -1,5 +1,5 @@
 using System.Text.Json;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 
 namespace SharpClaw.Core.Kernel;
 
@@ -16,7 +16,7 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
     private readonly KernelActionDispatcher _dispatcher;
     private readonly IReadOnlyList<IToolInvocationGate> _gates;
     private readonly IToolExecutionCoordinator _coordinator;
-    private readonly IServiceProvider? _serviceProvider;
+    private readonly IServiceProvider _serviceProvider;
 
     public UnifiedToolPipeline(
         KernelGraph graph,
@@ -29,7 +29,7 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _gates = gates?.ToArray() ?? [];
         _coordinator = coordinator ?? new ImmediateToolExecutionCoordinator();
-        _serviceProvider = serviceProvider ?? graph.Modules.Services;
+        _serviceProvider = serviceProvider ?? graph.Services.Services;
     }
 
     public IReadOnlyList<ToolDescriptor> Tools =>
@@ -469,7 +469,7 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
             left.Items.Zip(right.Items).All(pair =>
                 string.Equals(pair.First.ContractName, pair.Second.ContractName, StringComparison.Ordinal) &&
                 pair.First.SchemaVersion == pair.Second.SchemaVersion &&
-                string.Equals(pair.First.OwnerModuleId, pair.Second.OwnerModuleId, StringComparison.Ordinal) &&
+                string.Equals(pair.First.OwnerId, pair.Second.OwnerId, StringComparison.Ordinal) &&
                 pair.First.MaxBytes == pair.Second.MaxBytes &&
                 pair.First.Value.GetRawText() == pair.Second.Value.GetRawText());
 

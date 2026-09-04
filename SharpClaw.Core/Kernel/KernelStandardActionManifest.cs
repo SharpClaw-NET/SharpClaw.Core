@@ -3,7 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using SharpClaw.Contracts.Modules;
+using SharpClaw.Contracts.Kernel;
 using SharpClaw.Contracts.Providers;
 
 namespace SharpClaw.Core.Kernel;
@@ -238,7 +238,7 @@ internal static class KernelStandardActionManifest
                 ["gateway.stream.close"] = KernelStandardActionProfile.StreamEffect,
                 ["gateway.stream.fail"] = KernelStandardActionProfile.Signal,
                 ["gateway.stream.cancel"] = KernelStandardActionProfile.Signal,
-                ["gateway.module.endpoint.dispatch"] = KernelStandardActionProfile.Effect,
+                ["gateway.endpoint.dispatch"] = KernelStandardActionProfile.Effect,
                 ["gateway.bridge.session.validate"] = KernelStandardActionProfile.Pure,
                 ["gateway.bridge.forward"] = KernelStandardActionProfile.ReceiptedEffect,
                 ["chat.turn.start"] = KernelStandardActionProfile.Effect,
@@ -294,21 +294,6 @@ internal static class KernelStandardActionManifest
                 ["conversation.message.delete"] = KernelStandardActionProfile.ConflictEffect,
                 ["conversation.clear.prepare"] = KernelStandardActionProfile.Pure,
                 ["conversation.clear.commit"] = KernelStandardActionProfile.ConflictEffect,
-                ["module.discover"] = KernelStandardActionProfile.Pure,
-                ["module.validate"] = KernelStandardActionProfile.Pure,
-                ["module.configure"] = KernelStandardActionProfile.Pure,
-                ["module.graph.compile"] = KernelStandardActionProfile.Pure,
-                ["module.start"] = KernelStandardActionProfile.Effect,
-                ["module.enable.prepare"] = KernelStandardActionProfile.Pure,
-                ["module.enable.commit"] = KernelStandardActionProfile.IdempotentEffect,
-                ["module.disable.prepare"] = KernelStandardActionProfile.Pure,
-                ["module.disable.commit"] = KernelStandardActionProfile.IdempotentEffect,
-                ["module.stop"] = KernelStandardActionProfile.Effect,
-                ["module.unload"] = KernelStandardActionProfile.Effect,
-                ["module.health.check"] = KernelStandardActionProfile.Pure,
-                ["module.lifecycle.fail"] = KernelStandardActionProfile.Signal,
-                ["module.lifecycle.cancel"] = KernelStandardActionProfile.Signal,
-                ["module.lease.drain"] = KernelStandardActionProfile.Effect,
                 ["storage.get"] = KernelStandardActionProfile.Pure,
                 ["storage.list"] = KernelStandardActionProfile.Pure,
                 ["storage.query"] = KernelStandardActionProfile.Pure,
@@ -647,8 +632,6 @@ internal static class KernelStandardActionManifest
         "tool.result.transform" or "tool.result.return" =>
             (typeof(KernelToolResultStage), typeof(ToolResult)),
         "tool.call.fail" or "tool.call.cancel" => (typeof(ToolInvocationOutcome), typeof(bool)),
-        "module.start" => (typeof(ModuleStartContext), typeof(bool)),
-        "module.stop" => (typeof(ModuleIdentity), typeof(bool)),
             _ => (typeof(JsonElement), typeof(JsonElement))
         };
     }
@@ -662,7 +645,7 @@ internal static class KernelStandardActionManifest
         var contractName = $"sharpclaw.kernel.action.{key.Value}.{role}";
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
             $"{contractName}|{KernelGraphHasher.StableScalar(1)}|" +
-            $"{payloadType?.AssemblyQualifiedName ?? "module-typed"}|" +
+            $"{payloadType?.AssemblyQualifiedName ?? "registration-typed"}|" +
             $"{KernelGraphHasher.StableScalar((int)profile.Capabilities)}|" +
             $"{KernelGraphHasher.StableScalar(profile.HasIrreversibleEffects)}|" +
             $"{KernelGraphHasher.StableScalar(profile.RepeatPolicy.Kind)}|" +
