@@ -3,6 +3,11 @@ using System.Runtime.CompilerServices;
 
 namespace SharpClaw.Core.Kernel;
 
+internal interface IKernelExecutionScopeLifetime
+{
+    bool IsActive { get; }
+}
+
 internal static class KernelExecutionScope
 {
     private static readonly AsyncLocal<ScopeState?> CurrentScope = new();
@@ -14,6 +19,22 @@ internal static class KernelExecutionScope
             return rootProvider;
         current.EnsureUsable();
         return current.ServiceProvider;
+    }
+
+    public static IKernelExecutionScopeLifetime CaptureCurrent(
+        IServiceProvider services)
+    {
+        var current = CurrentScope.Value;
+        if (current is null ||
+            (!ReferenceEquals(current.RootProvider, services) &&
+             !ReferenceEquals(current.ServiceProvider, services)) ||
+            !current.IsActive)
+        {
+            throw new InvalidOperationException(
+                "The kernel execution scope is no longer active.");
+        }
+
+        return current;
     }
 
     public static async ValueTask<TResult> RunAsync<TResult>(
@@ -135,7 +156,7 @@ internal static class KernelExecutionScope
 
     private sealed class ScopeState(
         IServiceProvider rootProvider,
-        AsyncServiceScope scope)
+        AsyncServiceScope scope) : IKernelExecutionScopeLifetime
     {
         private readonly object _gate = new();
         private int _leases = 1;
@@ -143,6 +164,15 @@ internal static class KernelExecutionScope
 
         public IServiceProvider RootProvider { get; } = rootProvider;
         public IServiceProvider ServiceProvider => scope.ServiceProvider;
+
+        public bool IsActive
+        {
+            get
+            {
+                lock (_gate)
+                    return !_disposalStarted && _leases > 0;
+            }
+        }
 
         public void EnsureUsable()
         {

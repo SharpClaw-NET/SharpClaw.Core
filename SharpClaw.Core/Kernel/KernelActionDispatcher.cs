@@ -9,7 +9,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
     private sealed record InvocationScope(
         Guid InvocationId,
         int Depth,
-        KernelActionExecutionContext ExecutionContext);
+        KernelActionExecutionContext ExecutionContext,
+        IKernelExecutionScopeLifetime ExecutionScope);
     private readonly KernelGraph _graph;
     private readonly KernelActionExecutionContext _executionContext;
     private readonly IActionContinuationHost _continuationHost;
@@ -253,18 +254,23 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             throw new KernelActionExecutionException(
                 $"Action '{descriptor.Key.Value}' does not match the compiled descriptor schema.");
 
-        var parent = CurrentScope.Value;
-        var depth = parent is null ? 0 : parent.Depth + 1;
-        executionContext = parent?.ExecutionContext ?? executionContext;
+        var ambientParent = CurrentScope.Value;
         return await KernelExecutionScope.RunAsync(
             _graph.RootServices,
             services =>
             {
+                var executionScope = KernelExecutionScope.CaptureCurrent(services);
+                var parent = ambientParent is not null &&
+                             ReferenceEquals(ambientParent.ExecutionScope, executionScope)
+                    ? ambientParent
+                    : null;
+                var depth = parent is null ? 0 : parent.Depth + 1;
+                var effectiveExecutionContext = parent?.ExecutionContext ?? executionContext;
                 var invocation = new KernelActionInvocation<TAction, TResult>(
                     definition,
                     terminal,
                     snapshot,
-                    executionContext,
+                    effectiveExecutionContext,
                     services,
                     _continuationHost,
                     _eventWriter,
@@ -421,7 +427,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             CurrentScope.Value = new InvocationScope(
                 attempt.InvocationId,
                 attempt.Depth,
-                _executionContext);
+                _executionContext,
+                KernelExecutionScope.CaptureCurrent(_services));
             try
             {
                 await PublishLifecycleAsync(

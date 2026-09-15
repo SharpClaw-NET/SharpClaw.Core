@@ -289,6 +289,107 @@ public sealed class KernelScopedExecutionTests
         Assert.NotEqual(probe.RootInstances.Single(), probe.NestedInstances.Last());
     }
 
+    [Fact]
+    public async Task Completed_root_authority_does_not_flow_into_a_delayed_child()
+    {
+        var rootKey = new SharpClawActionKey("scope.authority.root");
+        var childKey = new SharpClawActionKey("scope.authority.child");
+        var root = Action(rootKey);
+        var child = Action(childKey);
+        var services = new ServiceCollection();
+        services.AddAction("scope", root);
+        services.AddAction("scope", child);
+        var graph = services.Compile(ActionOptions(rootKey, childKey));
+        using var defaultFeatureDocument = JsonDocument.Parse("{\"authority\":\"default\"}");
+        var defaultCaller = new RequestPrincipal(
+            "default-caller",
+            "Default Caller",
+            new HashSet<string>(["reader"], StringComparer.Ordinal),
+            IsAuthenticated: true);
+        var defaultFeatures = new ExtensionFeatureSet(
+        [
+            new ExtensionFeature(
+                "scope.authority",
+                1,
+                "default",
+                1024,
+                defaultFeatureDocument.RootElement.Clone()),
+        ]);
+        var defaultTraceId = Guid.NewGuid();
+        var defaultIdempotencyKey = Guid.NewGuid();
+        var dispatcher = new KernelActionDispatcher(
+            graph,
+            new KernelActionExecutionContext(
+                defaultCaller,
+                defaultFeatures,
+                defaultTraceId,
+                defaultIdempotencyKey));
+        using var privilegedFeatureDocument = JsonDocument.Parse("{\"authority\":\"privileged\"}");
+        var privilegedContext = new KernelActionExecutionContext(
+            new RequestPrincipal(
+                "privileged-caller",
+                "Privileged Caller",
+                new HashSet<string>(["administrator"], StringComparer.Ordinal),
+                IsAuthenticated: true),
+            new ExtensionFeatureSet(
+            [
+                new ExtensionFeature(
+                    "scope.authority",
+                    1,
+                    "privileged",
+                    1024,
+                    privilegedFeatureDocument.RootElement.Clone()),
+            ]),
+            Guid.NewGuid(),
+            Guid.NewGuid());
+        var childStarted = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseChild = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<ActionContext<KernelActionEnvelope>>? delayedChild = null;
+
+        var rootOutcome = await dispatcher.RunWithContextAsync<KernelActionEnvelope, object>(
+            privilegedContext,
+            root,
+            new KernelActionEnvelope(rootKey, "root"),
+            async (_, _) =>
+            {
+                delayedChild = Task.Run(async () =>
+                {
+                    childStarted.TrySetResult(true);
+                    await releaseChild.Task;
+                    ActionContext<KernelActionEnvelope>? captured = null;
+                    await dispatcher.RunRequiredAsync(
+                        child,
+                        new KernelActionEnvelope(childKey, "child"),
+                        (context, _) =>
+                        {
+                            captured = context;
+                            return ValueTask.FromResult<object>("child");
+                        },
+                        graph.ActionSnapshot,
+                        CancellationToken.None);
+                    return captured!;
+                });
+                await childStarted.Task;
+                return "root";
+            },
+            graph.ActionSnapshot,
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Completed, rootOutcome.Kind);
+        releaseChild.TrySetResult(true);
+        var childContext = await delayedChild!.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Null(childContext.ParentInvocationId);
+        Assert.Equal(0, childContext.Depth);
+        Assert.Equal(defaultCaller.SubjectId, childContext.Caller.SubjectId);
+        Assert.Equal(defaultCaller.Roles, childContext.Caller.Roles);
+        Assert.Equal(defaultTraceId, childContext.TraceId);
+        Assert.Equal(defaultIdempotencyKey, childContext.IdempotencyKey);
+        Assert.Equal("default", childContext.Features.Items.Single().OwnerId);
+    }
+
     private static ActionDescriptor<KernelActionEnvelope, object> Action(SharpClawActionKey key) =>
         new(
             key,
