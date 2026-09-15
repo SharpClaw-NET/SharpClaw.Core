@@ -24,10 +24,17 @@ internal static class KernelExecutionScope
         ArgumentNullException.ThrowIfNull(operation);
 
         if (CurrentScope.Value is { } current
-            && ReferenceEquals(current.RootProvider, rootProvider))
+            && ReferenceEquals(current.RootProvider, rootProvider)
+            && current.TryRetain())
         {
-            current.EnsureUsable();
-            return await operation(current.ServiceProvider);
+            try
+            {
+                return await operation(current.ServiceProvider);
+            }
+            finally
+            {
+                await current.ReleaseAsync();
+            }
         }
 
         var scope = rootProvider.CreateAsyncScope();
@@ -76,12 +83,19 @@ internal static class KernelExecutionScope
         ArgumentNullException.ThrowIfNull(operation);
 
         if (CurrentScope.Value is { } current
-            && ReferenceEquals(current.RootProvider, rootProvider))
+            && ReferenceEquals(current.RootProvider, rootProvider)
+            && current.TryRetain())
         {
-            current.EnsureUsable();
-            await foreach (var item in operation(current.ServiceProvider)
-                               .WithCancellation(cancellationToken))
-                yield return item;
+            try
+            {
+                await foreach (var item in operation(current.ServiceProvider)
+                                   .WithCancellation(cancellationToken))
+                    yield return item;
+            }
+            finally
+            {
+                await current.ReleaseAsync();
+            }
             yield break;
         }
 

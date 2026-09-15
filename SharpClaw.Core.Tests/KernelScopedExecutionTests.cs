@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using SharpClaw.Contracts.Kernel;
@@ -129,6 +130,235 @@ public sealed class KernelScopedExecutionTests
         Assert.Equal(2, capture.Disposals["chat"]);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Detached_action_keeps_its_scope_until_nested_work_completes(
+        bool cancelCaller)
+    {
+        var rootKey = new SharpClawActionKey("scope.action.detached");
+        var nestedKey = new SharpClawActionKey("scope.action.nested");
+        var root = Action(rootKey);
+        var nested = Action(nestedKey);
+        var probe = new DetachedScopeProbe();
+        var services = new ServiceCollection();
+        services.AddSingleton(probe);
+        services.AddAction("scope", root);
+        services.AddAction("scope", nested);
+        services.AddScoped<DetachedScopedService>();
+        services.AddScoped<DetachedActionInterceptor>();
+        services.AddScoped<NestedActionInterceptor>();
+        services.AddSingleton(new ActionHookBinding(
+            "scope",
+            BehaviorTargetKind.Exact,
+            rootKey,
+            null,
+            typeof(DetachedActionInterceptor),
+            false,
+            new HookOrdering(
+                "scope.action.detached",
+                Timeout: cancelCaller ? TimeSpan.FromSeconds(5) : TimeSpan.FromMilliseconds(20)),
+            typeof(DetachedActionInterceptor).AssemblyQualifiedName!));
+        services.AddSingleton(new ActionHookBinding(
+            "scope",
+            BehaviorTargetKind.Exact,
+            nestedKey,
+            null,
+            typeof(NestedActionInterceptor),
+            false,
+            new HookOrdering("scope.action.nested"),
+            typeof(NestedActionInterceptor).AssemblyQualifiedName!));
+        var graph = services.Compile(ActionOptions(rootKey, nestedKey));
+        var dispatcher = KernelTestExecution.CreateDispatcher(
+            graph,
+            new StoreBackedContinuationHost(new TestDurableContinuationStore()));
+        probe.NestedOperation = async () =>
+        {
+            var nestedOutcome = await dispatcher.RunAsync(
+                nested,
+                new KernelActionEnvelope(nestedKey, "nested"),
+                static (_, _) => ValueTask.FromResult<object>("nested"),
+                graph.ActionSnapshot,
+                CancellationToken.None);
+            Assert.Equal(ActionOutcomeKind.Completed, nestedOutcome.Kind);
+        };
+        using var callerCancellation = new CancellationTokenSource();
+
+        var dispatch = dispatcher.RunAsync(
+            root,
+            new KernelActionEnvelope(rootKey, "root"),
+            static (_, _) => ValueTask.FromResult<object>("root"),
+            graph.ActionSnapshot,
+            callerCancellation.Token).AsTask();
+        await probe.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        if (cancelCaller)
+            callerCancellation.Cancel();
+
+        var outcome = await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(ActionOutcomeKind.Uncertain, outcome.Kind);
+        Assert.Equal(0, probe.DisposalCount);
+
+        probe.Release.TrySetResult(true);
+        await probe.Completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitForDisposalsAsync(probe, 1);
+        Assert.Equal(probe.RootInstances.Single(), probe.NestedInstances.Single());
+
+        probe.ReleasePostCompletion.TrySetResult(true);
+        await probe.PostCompletionOperation.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitForDisposalsAsync(probe, 2);
+        Assert.NotEqual(probe.RootInstances.Single(), probe.NestedInstances.Last());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Detached_event_keeps_its_scope_until_nested_work_completes(
+        bool cancelCaller)
+    {
+        var rootKey = new SharpClawEventKey("scope.event.detached");
+        var nestedKey = new SharpClawEventKey("scope.event.nested");
+        var root = Event(rootKey);
+        var nested = Event(nestedKey);
+        var probe = new DetachedScopeProbe();
+        var services = new ServiceCollection();
+        services.AddSingleton(probe);
+        services.AddEvent("scope", root);
+        services.AddEvent("scope", nested);
+        services.AddScoped<DetachedScopedService>();
+        services.AddScoped<DetachedEventInterceptor>();
+        services.AddScoped<NestedEventInterceptor>();
+        services.AddSingleton(new EventHookBinding(
+            "scope",
+            BehaviorTargetKind.Exact,
+            rootKey,
+            null,
+            typeof(DetachedEventInterceptor),
+            false,
+            EventHookKind.Interceptor,
+            EventDelivery.Inline,
+            new HookOrdering(
+                "scope.event.detached",
+                Timeout: cancelCaller ? TimeSpan.FromSeconds(5) : TimeSpan.FromMilliseconds(20)),
+            typeof(DetachedEventInterceptor).AssemblyQualifiedName!));
+        services.AddSingleton(new EventHookBinding(
+            "scope",
+            BehaviorTargetKind.Exact,
+            nestedKey,
+            null,
+            typeof(NestedEventInterceptor),
+            false,
+            EventHookKind.Interceptor,
+            EventDelivery.Inline,
+            new HookOrdering("scope.event.nested"),
+            typeof(NestedEventInterceptor).AssemblyQualifiedName!));
+        var graph = services.Compile(EventOptions(rootKey, nestedKey));
+        var dispatcher = new KernelEventDispatcher(graph);
+        probe.NestedOperation = async () =>
+        {
+            var nestedOutcome = await dispatcher.DispatchAsync(
+                nested,
+                new ScopeEvent(2),
+                graph.ActionSnapshot,
+                cancellationToken: CancellationToken.None);
+            Assert.Equal(EventInterceptionKind.Continued, nestedOutcome.Kind);
+        };
+        using var callerCancellation = new CancellationTokenSource();
+
+        var dispatch = dispatcher.DispatchAsync(
+            root,
+            new ScopeEvent(1),
+            graph.ActionSnapshot,
+            cancellationToken: callerCancellation.Token).AsTask();
+        await probe.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        if (cancelCaller)
+            callerCancellation.Cancel();
+
+        var outcome = await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(EventInterceptionKind.Failed, outcome.Kind);
+        Assert.Equal("EVENT_OUTCOME_UNCERTAIN", outcome.Error?.Code);
+        Assert.Equal(0, probe.DisposalCount);
+
+        probe.Release.TrySetResult(true);
+        await probe.Completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitForDisposalsAsync(probe, 1);
+        Assert.Equal(probe.RootInstances.Single(), probe.NestedInstances.Single());
+
+        probe.ReleasePostCompletion.TrySetResult(true);
+        await probe.PostCompletionOperation.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitForDisposalsAsync(probe, 2);
+        Assert.NotEqual(probe.RootInstances.Single(), probe.NestedInstances.Last());
+    }
+
+    private static ActionDescriptor<KernelActionEnvelope, object> Action(SharpClawActionKey key) =>
+        new(
+            key,
+            1,
+            "scope",
+            ActionInterceptionCapabilities.Inspect | ActionInterceptionCapabilities.Wrap,
+            false,
+            false,
+            new ActionRepeatPolicy(ActionRepeatKind.None, 1, TimeSpan.Zero, "scope"),
+            new ActionContinuationPolicy(TimeSpan.FromMinutes(1), true, true),
+            TimeSpan.FromSeconds(10));
+
+    private static EventDescriptor<ScopeEvent> Event(SharpClawEventKey key) =>
+        new(
+            key,
+            1,
+            "scope",
+            EventInterceptionCapabilities.Inspect | EventInterceptionCapabilities.Observe,
+            false,
+            false);
+
+    private static KernelGraphCompileOptions ActionOptions(
+        SharpClawActionKey rootKey,
+        SharpClawActionKey nestedKey) =>
+        new()
+        {
+            ActionRegistrationCapabilityGrants = new Dictionary<
+                string,
+                IReadOnlyDictionary<string, ActionInterceptionCapabilities>>
+            {
+                ["scope"] = new Dictionary<string, ActionInterceptionCapabilities>
+                {
+                    [rootKey.Value] =
+                        ActionInterceptionCapabilities.Inspect |
+                        ActionInterceptionCapabilities.Wrap,
+                    [nestedKey.Value] =
+                        ActionInterceptionCapabilities.Inspect |
+                        ActionInterceptionCapabilities.Wrap,
+                },
+            },
+        };
+
+    private static KernelGraphCompileOptions EventOptions(
+        SharpClawEventKey rootKey,
+        SharpClawEventKey nestedKey) =>
+        new()
+        {
+            EventRegistrationCapabilityGrants = new Dictionary<
+                string,
+                IReadOnlyDictionary<string, EventInterceptionCapabilities>>
+            {
+                ["scope"] = new Dictionary<string, EventInterceptionCapabilities>
+                {
+                    [rootKey.Value] =
+                        EventInterceptionCapabilities.Inspect |
+                        EventInterceptionCapabilities.Observe,
+                    [nestedKey.Value] =
+                        EventInterceptionCapabilities.Inspect |
+                        EventInterceptionCapabilities.Observe,
+                },
+            },
+        };
+
+    private static async Task WaitForDisposalsAsync(DetachedScopeProbe probe, int expected)
+    {
+        for (var attempt = 0; attempt < 100 && probe.DisposalCount < expected; attempt++)
+            await Task.Delay(10);
+        Assert.Equal(expected, probe.DisposalCount);
+    }
+
     private sealed class ScopeCapture
     {
         public HashSet<Guid> ActionInstances { get; } = [];
@@ -139,6 +369,120 @@ public sealed class KernelScopedExecutionTests
 
         public void RecordDisposal(string category) =>
             Disposals[category] = Disposals.GetValueOrDefault(category) + 1;
+    }
+
+    private sealed class DetachedScopeProbe
+    {
+        private int _disposalCount;
+
+        public ConcurrentQueue<Guid> RootInstances { get; } = new();
+        public ConcurrentQueue<Guid> NestedInstances { get; } = new();
+        public TaskCompletionSource<bool> Started { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> Release { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> Completed { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> ReleasePostCompletion { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Func<ValueTask> NestedOperation { get; set; } = null!;
+        public Task PostCompletionOperation { get; set; } = null!;
+        public int DisposalCount => Volatile.Read(ref _disposalCount);
+
+        public void RecordDisposal() => Interlocked.Increment(ref _disposalCount);
+    }
+
+    private sealed class DetachedScopedService(DetachedScopeProbe probe) : IDisposable
+    {
+        public Guid InstanceId { get; } = Guid.NewGuid();
+
+        public void Dispose() => probe.RecordDisposal();
+    }
+
+    private sealed class DetachedActionInterceptor(
+        DetachedScopeProbe probe,
+        DetachedScopedService scoped) : IActionInterceptor<KernelActionEnvelope, object>
+    {
+        public async ValueTask<IActionOutcome<object>> InvokeAsync(
+            ActionContext<KernelActionEnvelope> context,
+            IActionControl<KernelActionEnvelope, object> control,
+            CancellationToken cancellationToken)
+        {
+            probe.RootInstances.Enqueue(scoped.InstanceId);
+            probe.Started.TrySetResult(true);
+            await probe.Release.Task;
+            try
+            {
+                await probe.NestedOperation();
+                probe.PostCompletionOperation = Task.Run(async () =>
+                {
+                    await probe.ReleasePostCompletion.Task;
+                    await probe.NestedOperation();
+                });
+                throw new InvalidOperationException("The detached action completed after its boundary returned.");
+            }
+            finally
+            {
+                probe.Completed.TrySetResult(true);
+            }
+        }
+    }
+
+    private sealed class NestedActionInterceptor(
+        DetachedScopeProbe probe,
+        DetachedScopedService scoped) : IActionInterceptor<KernelActionEnvelope, object>
+    {
+        public ValueTask<IActionOutcome<object>> InvokeAsync(
+            ActionContext<KernelActionEnvelope> context,
+            IActionControl<KernelActionEnvelope, object> control,
+            CancellationToken cancellationToken)
+        {
+            probe.NestedInstances.Enqueue(scoped.InstanceId);
+            return control.ProceedAsync(cancellationToken);
+        }
+    }
+
+    private sealed class DetachedEventInterceptor(
+        DetachedScopeProbe probe,
+        DetachedScopedService scoped) : IEventInterceptor<ScopeEvent>
+    {
+        public async ValueTask<IEventInterception<ScopeEvent>> InterceptAsync(
+            EventContext<ScopeEvent> context,
+            IEventControl<ScopeEvent> control,
+            CancellationToken cancellationToken)
+        {
+            probe.RootInstances.Enqueue(scoped.InstanceId);
+            probe.Started.TrySetResult(true);
+            await probe.Release.Task;
+            try
+            {
+                await probe.NestedOperation();
+                probe.PostCompletionOperation = Task.Run(async () =>
+                {
+                    await probe.ReleasePostCompletion.Task;
+                    await probe.NestedOperation();
+                });
+                throw new InvalidOperationException("The detached event completed after its boundary returned.");
+            }
+            finally
+            {
+                probe.Completed.TrySetResult(true);
+            }
+        }
+    }
+
+    private sealed class NestedEventInterceptor(
+        DetachedScopeProbe probe,
+        DetachedScopedService scoped) : IEventInterceptor<ScopeEvent>
+    {
+        public ValueTask<IEventInterception<ScopeEvent>> InterceptAsync(
+            EventContext<ScopeEvent> context,
+            IEventControl<ScopeEvent> control,
+            CancellationToken cancellationToken)
+        {
+            probe.NestedInstances.Enqueue(scoped.InstanceId);
+            return ValueTask.FromResult(control.Continue());
+        }
     }
 
     private abstract class ScopedBehavior(ScopeCapture capture, string category) : IDisposable
