@@ -445,7 +445,15 @@ public sealed class KernelDirectTurnStreamingTests
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
         {
             yield return ChatStreamChunk.Text("partial");
-            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(100), CancellationToken.None);
+                throw;
+            }
         }
     }
 

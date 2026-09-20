@@ -350,7 +350,8 @@ public sealed class KernelActionDispatcher : IActionDispatcher
 
     private sealed class KernelActionInvocation<TAction, TResult>
     {
-        private static readonly TimeSpan CancellationObservationWindow = TimeSpan.FromMilliseconds(25);
+        private static readonly TimeSpan CancellationObservationWindow = TimeSpan.FromSeconds(1);
+        private static readonly TimeSpan TimeoutObservationWindow = TimeSpan.FromMilliseconds(25);
         private sealed record ActionAttempt(
             Guid InvocationId,
             Guid? ParentInvocationId,
@@ -1022,7 +1023,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             catch (TimeoutException)
             {
                 linked.Cancel();
-                if (await ObserveCompletionAsync(operationTask))
+                if (await ObserveCompletionAsync(operationTask, TimeoutObservationWindow))
                 {
                     try
                     {
@@ -1049,7 +1050,7 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 linked.Cancel();
-                if (await ObserveCompletionAsync(operationTask))
+                if (await ObserveCompletionAsync(operationTask, CancellationObservationWindow))
                     return await operationTask;
                 throw new KernelOperationCancellationException(
                     "Caller cancellation occurred while the action hook or terminal was still running.",
@@ -1057,13 +1058,15 @@ public sealed class KernelActionDispatcher : IActionDispatcher
             }
         }
 
-        private static async ValueTask<bool> ObserveCompletionAsync(Task operationTask)
+        private static async ValueTask<bool> ObserveCompletionAsync(
+            Task operationTask,
+            TimeSpan observationWindow)
         {
             if (operationTask.IsCompleted)
                 return true;
             var observed = await Task.WhenAny(
                 operationTask,
-                Task.Delay(CancellationObservationWindow, CancellationToken.None));
+                Task.Delay(observationWindow, CancellationToken.None));
             return ReferenceEquals(observed, operationTask);
         }
 
