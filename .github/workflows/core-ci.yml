@@ -32,6 +32,7 @@ jobs:
       - name: Configure the isolated package source map
         shell: bash
         run: |
+          mkdir -p "$GITHUB_WORKSPACE/.ci"
           cat > "$GITHUB_WORKSPACE/.ci/NuGet.config" <<EOF
           <?xml version="1.0" encoding="utf-8"?>
           <configuration>
