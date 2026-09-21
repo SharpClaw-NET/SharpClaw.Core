@@ -29,21 +29,6 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
-      - name: Check out exact unpublished Contracts source
-        uses: actions/checkout@v4
-        with:
-          repository: SharpClaw-NET/SharpClaw.Contracts
-          ref: 4cf302ddff93271dfa91688f61f8b23c201a965c
-          path: .ci/contracts
-
-      - name: Pack exact Contracts source to the local feed
-        run: >-
-          dotnet pack .ci/contracts/SharpClaw.Contracts/SharpClaw.Contracts.csproj
-          --configuration Release --output "$GITHUB_WORKSPACE/.ci/feed"
-          -p:PackageVersion=0.5.0-dev.20260904.5
-          -p:Version=0.5.0-dev.20260904.5
-          -p:InformationalVersion=0.5.0-dev.20260904.5
-
       - name: Configure the isolated package source map
         shell: bash
         run: |
@@ -52,13 +37,9 @@ jobs:
           <configuration>
             <packageSources>
               <clear />
-              <add key="local-contracts" value="$GITHUB_WORKSPACE/.ci/feed" />
               <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
             </packageSources>
             <packageSourceMapping>
-              <packageSource key="local-contracts">
-                <package pattern="SharpClaw.Contracts" />
-              </packageSource>
               <packageSource key="nuget.org">
                 <package pattern="*" />
               </packageSource>
