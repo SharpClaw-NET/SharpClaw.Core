@@ -19,6 +19,9 @@ jobs:
     name: Restore, build, and test Core
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      NUGET_PACKAGES: ${{ runner.temp }}/sharpclaw-core-nuget/packages
+      NUGET_HTTP_CACHE_PATH: ${{ runner.temp }}/sharpclaw-core-nuget/http-cache
 
     steps:
       - name: Check out source
@@ -32,7 +35,7 @@ jobs:
       - name: Configure the isolated package source map
         shell: bash
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/.ci"
+          mkdir -p "$GITHUB_WORKSPACE/.ci" "$NUGET_PACKAGES" "$NUGET_HTTP_CACHE_PATH"
           cat > "$GITHUB_WORKSPACE/.ci/NuGet.config" <<EOF
           <?xml version="1.0" encoding="utf-8"?>
           <configuration>
