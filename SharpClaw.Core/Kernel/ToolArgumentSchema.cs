@@ -44,8 +44,8 @@ internal static class ToolArgumentSchema
 
     private static JsonSchema Build(JsonElement definition)
     {
-        if (definition.ValueKind != JsonValueKind.Object)
-            throw new JsonException("Tool parameters must have an object JSON Schema.");
+        if (definition.ValueKind is not (JsonValueKind.Object or JsonValueKind.True or JsonValueKind.False))
+            throw new JsonException("Tool parameters must have an object or Boolean JSON Schema.");
         RejectExternalReferences(definition);
         return JsonSchema.Build(definition, new BuildOptions
         {
@@ -54,24 +54,13 @@ internal static class ToolArgumentSchema
         });
     }
 
-    private static void RejectExternalReferences(JsonElement element)
+    private static void RejectExternalReferences(JsonElement schema)
     {
-        if (element.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in element.EnumerateArray())
-                RejectExternalReferences(item);
-            return;
-        }
-
-        if (element.ValueKind != JsonValueKind.Object)
+        if (schema.ValueKind != JsonValueKind.Object)
             return;
 
-        foreach (var property in element.EnumerateObject())
+        foreach (var property in schema.EnumerateObject())
         {
-            // These keywords contain instance data, not nested schemas.
-            if (property.Name is "const" or "enum" or "default" or "examples")
-                continue;
-
             if (property.Name is "$ref" or "$dynamicRef" or "$recursiveRef"
                 && (property.Value.ValueKind != JsonValueKind.String
                     || !property.Value.GetString()!.StartsWith('#')))
@@ -79,7 +68,46 @@ internal static class ToolArgumentSchema
                 throw new JsonException("Tool schemas may reference only their own definitions.");
             }
 
-            RejectExternalReferences(property.Value);
+            // Unknown keywords and annotation values are opaque. Descend only through
+            // Draft 2020-12 keyword locations that actually contain subschemas.
+            switch (property.Name)
+            {
+                case "$defs":
+                case "properties":
+                case "patternProperties":
+                case "dependentSchemas":
+                    if (property.Value.ValueKind == JsonValueKind.Object)
+                    {
+                        foreach (var child in property.Value.EnumerateObject())
+                            RejectExternalReferences(child.Value);
+                    }
+                    break;
+
+                case "allOf":
+                case "anyOf":
+                case "oneOf":
+                case "prefixItems":
+                    if (property.Value.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var child in property.Value.EnumerateArray())
+                            RejectExternalReferences(child);
+                    }
+                    break;
+
+                case "not":
+                case "if":
+                case "then":
+                case "else":
+                case "items":
+                case "contains":
+                case "additionalProperties":
+                case "unevaluatedProperties":
+                case "unevaluatedItems":
+                case "propertyNames":
+                case "contentSchema":
+                    RejectExternalReferences(property.Value);
+                    break;
+            }
         }
     }
 }

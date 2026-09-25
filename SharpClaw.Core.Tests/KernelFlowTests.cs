@@ -281,6 +281,9 @@ public sealed class KernelFlowTests
     [Theory]
     [InlineData("{\"type\":\"invalid\"}")]
     [InlineData("{\"$ref\":\"https://example.invalid/schema\"}")]
+    [InlineData("{\"properties\":{\"value\":{\"$ref\":\"https://example.invalid/schema\"}}}")]
+    [InlineData("{\"$defs\":{\"value\":{\"$dynamicRef\":\"https://example.invalid/schema\"}}}")]
+    [InlineData("{\"allOf\":[{\"items\":{\"$ref\":\"https://example.invalid/schema\"}}]}")]
     public void Graph_rejects_invalid_or_external_tool_schemas(string schemaJson)
     {
         using var schema = JsonDocument.Parse(schemaJson);
@@ -289,6 +292,65 @@ public sealed class KernelFlowTests
             "sample", "sample tool", schema.RootElement.Clone()));
 
         Assert.Throws<KernelGraphCompilationException>(() => builder.Compile());
+    }
+
+    [Theory]
+    [InlineData("true", "{}", true)]
+    [InlineData("false", "{}", false)]
+    [InlineData("true", "[]", false)]
+    public async Task BooleanToolSchemasCompileButStillRequireValidObjectArguments(
+        string schemaJson,
+        string argumentsJson,
+        bool shouldInvoke)
+    {
+        SampleToolHandler.Calls = 0;
+        using var schema = JsonDocument.Parse(schemaJson);
+        var builder = new KernelGraphBuilder();
+        builder.AddTool<SampleToolHandler>(new ToolDescriptor(
+            "sample", "sample tool", schema.RootElement.Clone()));
+        var graph = builder.Compile();
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        var loop = new ProviderRoundLoop(
+            new ConfigurableToolCallTransport(argumentsJson),
+            graph,
+            dispatcher,
+            KernelTestExecution.CreateToolContextIssuer());
+        var pipeline = new UnifiedToolPipeline(graph, dispatcher);
+
+        if (shouldInvoke)
+        {
+            var result = await loop.RunAsync(
+                NewProviderRequest(graph), pipeline, CancellationToken.None).ConfigureAwait(true);
+            Assert.Equal("final", result.Content);
+            Assert.Equal(1, SampleToolHandler.Calls);
+        }
+        else
+        {
+            await Assert.ThrowsAsync<KernelActionExecutionException>(async () =>
+                await loop.RunAsync(
+                    NewProviderRequest(graph), pipeline, CancellationToken.None).ConfigureAwait(true))
+                .ConfigureAwait(true);
+            Assert.Equal(0, SampleToolHandler.Calls);
+        }
+    }
+
+    [Fact]
+    public void GraphAcceptsOpaqueVendorMetadataContainingReferenceShapedValues()
+    {
+        using var schema = JsonDocument.Parse("""
+            {
+              "type": "object",
+              "x-module-metadata": {
+                "$ref": "https://example.invalid/help",
+                "nested": { "$dynamicRef": "https://example.invalid/anchor" }
+              }
+            }
+            """);
+        var builder = new KernelGraphBuilder();
+        builder.AddTool<SampleToolHandler>(new ToolDescriptor(
+            "sample", "sample tool", schema.RootElement.Clone()));
+
+        Assert.NotNull(builder.Compile());
     }
 
     [Fact]
