@@ -68,6 +68,10 @@ internal static class ToolArgumentSchema
 
         foreach (var property in element.EnumerateObject())
         {
+            // These keywords contain instance data, not nested schemas.
+            if (property.Name is "const" or "enum" or "default" or "examples")
+                continue;
+
             if (property.Name is "$ref" or "$dynamicRef" or "$recursiveRef"
                 && (property.Value.ValueKind != JsonValueKind.String
                     || !property.Value.GetString()!.StartsWith('#')))

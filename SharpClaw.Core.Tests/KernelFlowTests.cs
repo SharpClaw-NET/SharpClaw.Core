@@ -292,6 +292,25 @@ public sealed class KernelFlowTests
     }
 
     [Fact]
+    public void Graph_accepts_reference_shaped_values_in_schema_instance_data()
+    {
+        using var schema = JsonDocument.Parse("""
+            {
+              "type": "object",
+              "properties": {
+                "payload": { "const": { "$ref": "https://example.invalid/data" } }
+              },
+              "required": ["payload"]
+            }
+            """);
+        var builder = new KernelGraphBuilder();
+        builder.AddTool<SampleToolHandler>(new ToolDescriptor(
+            "sample", "sample tool", schema.RootElement.Clone()));
+
+        Assert.NotNull(builder.Compile());
+    }
+
+    [Fact]
     public async Task Provider_issues_one_valid_context_for_each_distinct_tool_call()
     {
         SampleToolHandler.Calls = 0;
