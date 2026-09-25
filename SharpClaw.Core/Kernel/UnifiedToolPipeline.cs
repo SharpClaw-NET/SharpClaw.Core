@@ -231,6 +231,9 @@ public sealed class UnifiedToolPipeline : IUnifiedToolPipeline
                                 throw new KernelActionExecutionException(
                                     $"Tool handler '{handlerRegistration.HandlerType.FullName}' does not implement IToolHandler.");
                             EnsureEffectiveInvocation(effectiveHandlerInvocation, authority, "handler-before-call");
+                            ToolArgumentSchema.ValidateArguments(
+                                handlerRegistration.Descriptor,
+                                effectiveHandlerInvocation.Arguments);
                             return (object)await typedHandler.InvokeAsync(
                                 effectiveHandlerInvocation,
                                 handlerCancellationToken);

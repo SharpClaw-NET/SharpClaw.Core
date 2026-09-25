@@ -97,6 +97,32 @@ public sealed class KernelFlowTests
     }
 
     [Fact]
+    public async Task Tool_argument_transform_cannot_bypass_schema_validation_at_the_handler()
+    {
+        SampleToolHandler.Calls = 0;
+        var builder = new KernelGraphBuilder();
+        builder.AddTool<SampleToolHandler>(new ToolDescriptor(
+            "sample", "sample tool", JsonSerializer.SerializeToElement(new
+            {
+                type = "object",
+                properties = new { value = new { type = "integer" } },
+                required = new[] { "value" },
+            })));
+        builder.Hooks.For(new SharpClawActionKey("tool.call.input.transform"))
+            .Use<InvalidArgumentsInterceptor>(Order("invalid-arguments"));
+        var graph = builder.Compile();
+
+        var outcome = await new UnifiedToolPipeline(
+            graph,
+            KernelTestExecution.CreateDispatcher(graph)).InvokeAsync(
+            NewInvocation("sample"),
+            CancellationToken.None);
+
+        Assert.Equal(ActionOutcomeKind.Failed, outcome.Kind);
+        Assert.Equal(0, SampleToolHandler.Calls);
+    }
+
+    [Fact]
     public async Task Provider_rounds_feed_tool_results_back_to_the_same_pipeline()
     {
         SampleToolHandler.Calls = 0;
@@ -123,6 +149,146 @@ public sealed class KernelFlowTests
         Assert.Equal("final", completion.Content);
         Assert.Equal(2, transport.Calls);
         Assert.Equal(1, SampleToolHandler.Calls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Provider_cannot_invoke_a_registered_but_unselected_tool(bool streaming)
+    {
+        SampleToolHandler.Calls = 0;
+        var builder = new KernelGraphBuilder();
+        builder.AddTool<SampleToolHandler>(new ToolDescriptor(
+            "sample", "sample tool", ToolSchemas.EmptyObject));
+        var graph = builder.Compile();
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        var loop = new ProviderRoundLoop(
+            streaming ? new StreamingTwoRoundTransport() : new TwoRoundTransport(),
+            graph,
+            dispatcher,
+            KernelTestExecution.CreateToolContextIssuer());
+        var request = NewProviderRequest(graph) with { Tools = [] };
+
+        if (streaming)
+        {
+            await Assert.ThrowsAsync<KernelActionExecutionException>(async () =>
+            {
+                await foreach (var _ in loop.StreamAsync(
+                                   request, new UnifiedToolPipeline(graph, dispatcher), CancellationToken.None))
+                {
+                }
+            });
+        }
+        else
+        {
+            await Assert.ThrowsAsync<KernelActionExecutionException>(async () =>
+                await loop.RunAsync(
+                    request, new UnifiedToolPipeline(graph, dispatcher), CancellationToken.None));
+        }
+
+        Assert.Equal(0, SampleToolHandler.Calls);
+    }
+
+    [Fact]
+    public async Task Provider_cannot_invoke_a_tool_removed_from_the_sent_round()
+    {
+        SampleToolHandler.Calls = 0;
+        var builder = new KernelGraphBuilder();
+        builder.AddTool<SampleToolHandler>(new ToolDescriptor(
+            "sample", "sample tool", ToolSchemas.EmptyObject));
+        builder.Hooks.For(new SharpClawActionKey("provider.request.prepare"))
+            .Use<RemoveSentToolsInterceptor>(Order("remove-sent-tools"));
+        var graph = builder.Compile();
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+
+        await Assert.ThrowsAsync<KernelActionExecutionException>(async () =>
+            await new ProviderRoundLoop(
+                new TwoRoundTransport(),
+                graph,
+                dispatcher,
+                KernelTestExecution.CreateToolContextIssuer()).RunAsync(
+                NewProviderRequest(graph),
+                new UnifiedToolPipeline(graph, dispatcher),
+                CancellationToken.None));
+
+        Assert.Equal(0, SampleToolHandler.Calls);
+    }
+
+    [Theory]
+    [InlineData("{", "malformed JSON")]
+    [InlineData("[]", "JSON object")]
+    [InlineData("{}", "JSON Schema")]
+    [InlineData("{\"value\":\"wrong\"}", "JSON Schema")]
+    public async Task Invalid_provider_tool_arguments_never_reach_the_handler(
+        string argumentsJson,
+        string expectedMessage)
+    {
+        SampleToolHandler.Calls = 0;
+        var builder = new KernelGraphBuilder();
+        builder.AddTool<SampleToolHandler>(new ToolDescriptor(
+            "sample", "sample tool", JsonSerializer.SerializeToElement(new
+            {
+                type = "object",
+                properties = new { value = new { type = "integer" } },
+                required = new[] { "value" },
+                additionalProperties = false,
+            })));
+        var graph = builder.Compile();
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+        var exception = await Assert.ThrowsAsync<KernelActionExecutionException>(async () =>
+            await new ProviderRoundLoop(
+                new ConfigurableToolCallTransport(argumentsJson),
+                graph,
+                dispatcher,
+                KernelTestExecution.CreateToolContextIssuer()).RunAsync(
+                NewProviderRequest(graph),
+                new UnifiedToolPipeline(graph, dispatcher),
+                CancellationToken.None));
+
+        Assert.Contains(expectedMessage, exception.Message);
+        Assert.Equal(0, SampleToolHandler.Calls);
+    }
+
+    [Fact]
+    public async Task Valid_provider_tool_arguments_reach_the_handler()
+    {
+        SampleToolHandler.Calls = 0;
+        var builder = new KernelGraphBuilder();
+        builder.AddTool<SampleToolHandler>(new ToolDescriptor(
+            "sample", "sample tool", JsonSerializer.SerializeToElement(new
+            {
+                type = "object",
+                properties = new { value = new { type = "integer" } },
+                required = new[] { "value" },
+                additionalProperties = false,
+            })));
+        var graph = builder.Compile();
+        var dispatcher = KernelTestExecution.CreateDispatcher(graph);
+
+        var result = await new ProviderRoundLoop(
+            new ConfigurableToolCallTransport("{\"value\":1}"),
+            graph,
+            dispatcher,
+            KernelTestExecution.CreateToolContextIssuer()).RunAsync(
+            NewProviderRequest(graph),
+            new UnifiedToolPipeline(graph, dispatcher),
+            CancellationToken.None);
+
+        Assert.Equal("final", result.Content);
+        Assert.Equal(1, SampleToolHandler.Calls);
+    }
+
+    [Theory]
+    [InlineData("{\"type\":\"invalid\"}")]
+    [InlineData("{\"$ref\":\"https://example.invalid/schema\"}")]
+    public void Graph_rejects_invalid_or_external_tool_schemas(string schemaJson)
+    {
+        using var schema = JsonDocument.Parse(schemaJson);
+        var builder = new KernelGraphBuilder();
+        builder.AddTool<SampleToolHandler>(new ToolDescriptor(
+            "sample", "sample tool", schema.RootElement.Clone()));
+
+        Assert.Throws<KernelGraphCompilationException>(() => builder.Compile());
     }
 
     [Fact]
@@ -399,6 +565,81 @@ public sealed class KernelFlowTests
                 Content = "stream",
                 ToolCalls = Array.Empty<ChatToolCall>()
             });
+        }
+    }
+
+    private sealed class ConfigurableToolCallTransport(string argumentsJson) : IKernelProviderTransport
+    {
+        private int _calls;
+
+        public ValueTask<ChatCompletionResult> CompleteAsync(
+            ProviderTurnRequest request,
+            IReadOnlyList<ToolAwareMessage> messages,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult(++_calls == 1
+                ? new ChatCompletionResult
+                {
+                    Content = "call",
+                    ToolCalls = [new ChatToolCall("call-1", "sample", argumentsJson)],
+                }
+                : new ChatCompletionResult { Content = "final" });
+
+        public async IAsyncEnumerable<ChatStreamChunk> StreamAsync(
+            ProviderTurnRequest request,
+            IReadOnlyList<ToolAwareMessage> messages,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await Task.Yield();
+            yield return ChatStreamChunk.Final(await CompleteAsync(
+                request, messages, cancellationToken));
+        }
+    }
+
+    private sealed class RemoveSentToolsInterceptor : IActionInterceptor<KernelActionEnvelope, object>
+    {
+        public ValueTask<IActionOutcome<object>> InvokeAsync(
+            ActionContext<KernelActionEnvelope> context,
+            IActionControl<KernelActionEnvelope, object> control,
+            CancellationToken cancellationToken)
+        {
+            if (context.Action.Payload is not KernelProviderRequestEnvelope state)
+                return control.ProceedAsync(cancellationToken);
+
+            return control.ProceedWithInputAsync(
+                new ActionReplacement<KernelActionEnvelope>(
+                    context.Action with
+                    {
+                        Payload = state with
+                        {
+                            Request = state.Request with { Tools = [] },
+                        },
+                    },
+                    "Remove tools before transport."),
+                cancellationToken);
+        }
+    }
+
+    private sealed class InvalidArgumentsInterceptor : IActionInterceptor<KernelActionEnvelope, object>
+    {
+        public ValueTask<IActionOutcome<object>> InvokeAsync(
+            ActionContext<KernelActionEnvelope> context,
+            IActionControl<KernelActionEnvelope, object> control,
+            CancellationToken cancellationToken)
+        {
+            if (context.Action.Payload is not ToolInvocation invocation)
+                return control.ProceedAsync(cancellationToken);
+
+            return control.ProceedWithInputAsync(
+                new ActionReplacement<KernelActionEnvelope>(
+                    context.Action with
+                    {
+                        Payload = invocation with
+                        {
+                            Arguments = JsonSerializer.SerializeToElement(new { value = "wrong" }),
+                        },
+                    },
+                    "Replace arguments with an invalid value."),
+                cancellationToken);
         }
     }
 

@@ -67,13 +67,14 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(toolPipeline);
+        var selectedTools = request.Tools.ToArray();
         var messages = BuildMessages(request);
 
         try
         {
             for (var round = 0; round < _maximumRounds; round++)
             {
-                var completion = await RunCompletionTransportAsync(
+                var (completion, sentTools) = await RunCompletionTransportAsync(
                     request,
                     messages,
                     cancellationToken);
@@ -88,6 +89,8 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
                 {
                     var invocation = await CreateInvocationAsync(
                         request,
+                        selectedTools,
+                        sentTools,
                         call,
                         parentActionContext,
                         cancellationToken);
@@ -163,6 +166,7 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(toolPipeline);
+        var selectedTools = request.Tools.ToArray();
         var messages = BuildMessages(request);
         var completedNormally = false;
         var failureDispatched = false;
@@ -173,6 +177,7 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
             {
                 KernelProviderRequestEnvelope state;
                 IAsyncEnumerable<ChatStreamChunk> stream;
+                IReadOnlyList<ToolDescriptor>? sentTools = null;
                 try
                 {
                     state = await PrepareRequestAsync(request, messages, cancellationToken);
@@ -181,9 +186,13 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
                     var streamHandle = await DispatchInputAsync(
                         SharpClawActions.Provider.Send,
                         state,
-                        (value, ct) => ValueTask.FromResult(
-                            KernelProviderTransportResult.Streaming(
-                                _transport.StreamAsync(value.Request, value.Messages, ct))),
+                        (value, ct) =>
+                        {
+                            sentTools = value.Request.Tools.ToArray();
+                            return ValueTask.FromResult(
+                                KernelProviderTransportResult.Streaming(
+                                    _transport.StreamAsync(value.Request, value.Messages, ct)));
+                        },
                         cancellationToken);
                     stream = streamHandle.IsStreaming && streamHandle.Stream is not null
                         ? streamHandle.Stream
@@ -395,6 +404,8 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
                     var outcome = await toolPipeline.InvokeAsync(
                         await CreateInvocationAsync(
                             request,
+                            selectedTools,
+                            sentTools,
                             call,
                             parentActionContext,
                             cancellationToken),
@@ -434,17 +445,23 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
         }
     }
 
-    private async ValueTask<ChatCompletionResult> RunCompletionTransportAsync(
+    private async ValueTask<(ChatCompletionResult Completion, IReadOnlyList<ToolDescriptor>? SentTools)>
+        RunCompletionTransportAsync(
         ProviderTurnRequest request,
         IReadOnlyList<ToolAwareMessage> messages,
         CancellationToken cancellationToken)
     {
         var state = await PrepareRequestAsync(request, messages, cancellationToken);
+        IReadOnlyList<ToolDescriptor>? sentTools = null;
         var transportResult = await DispatchInputAsync(
             SharpClawActions.Provider.Send,
             state,
-            async (value, ct) => KernelProviderTransportResult.Buffered(
-                await _transport.CompleteAsync(value.Request, value.Messages, ct)),
+            async (value, ct) =>
+            {
+                sentTools = value.Request.Tools.ToArray();
+                return KernelProviderTransportResult.Buffered(
+                    await _transport.CompleteAsync(value.Request, value.Messages, ct));
+            },
             cancellationToken);
         var raw = !transportResult.IsStreaming && transportResult.Completion is not null
             ? transportResult.Completion
@@ -455,11 +472,12 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
             new KernelProviderCompletionEnvelope(state, raw),
             static (value, _) => ValueTask.FromResult(value.Completion),
             cancellationToken);
-        return await DispatchInputAsync(
+        var completion = await DispatchInputAsync(
             SharpClawActions.Provider.AfterTransport,
             deserialized,
             static (value, _) => ValueTask.FromResult(value),
             cancellationToken);
+        return (completion, sentTools);
     }
 
     private async ValueTask<KernelProviderRequestEnvelope> PrepareRequestAsync(
@@ -652,11 +670,26 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
 
     private async ValueTask<ToolInvocation> CreateInvocationAsync(
         ProviderTurnRequest request,
+        IReadOnlyList<ToolDescriptor> selectedTools,
+        IReadOnlyList<ToolDescriptor>? sentTools,
         ChatToolCall call,
         ActionContext<KernelActionEnvelope>? parentActionContext,
         CancellationToken cancellationToken)
     {
+        var selected = selectedTools.Where(tool =>
+            string.Equals(tool.Name, call.Name, StringComparison.Ordinal)).ToArray();
+        var sent = sentTools?.Where(tool =>
+            string.Equals(tool.Name, call.Name, StringComparison.Ordinal)).ToArray();
+        var registered = _graph.Tools.Where(tool =>
+            string.Equals(tool.Descriptor.Name, call.Name, StringComparison.Ordinal)).ToArray();
+        if (selected.Length != 1 || sent?.Length != 1 || registered.Length != 1)
+            throw new KernelActionExecutionException(
+                "The provider called a tool that was not selected and advertised for this round.");
+
         var arguments = ParseArguments(call.ArgumentsJson);
+        ToolArgumentSchema.ValidateArguments(registered[0].Descriptor, arguments);
+        ToolArgumentSchema.ValidateArguments(selected[0], arguments);
+        ToolArgumentSchema.ValidateArguments(sent[0], arguments);
         var invocationId = Guid.NewGuid();
         var requestForIssuer = new KernelToolContextIssueRequest(
             invocationId,
@@ -708,12 +741,13 @@ public sealed class ProviderRoundLoop : IProviderRoundLoop
     {
         try
         {
-            using var document = JsonDocument.Parse(argumentsJson);
+            using var document = JsonDocument.Parse(argumentsJson ?? string.Empty);
             return document.RootElement.Clone();
         }
         catch (JsonException)
         {
-            return JsonSerializer.SerializeToElement(new { });
+            throw new KernelActionExecutionException(
+                "The provider returned malformed JSON tool arguments.");
         }
     }
 

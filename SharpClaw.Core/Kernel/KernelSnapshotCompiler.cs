@@ -491,6 +491,7 @@ public sealed class KernelSnapshotCompiler
             if (!typeof(IToolHandler).IsAssignableFrom(tool.HandlerType))
                 throw new KernelGraphCompilationException(
                     $"Tool handler '{tool.HandlerType.FullName}' does not implement IToolHandler.");
+            ToolArgumentSchema.ValidateDefinition(tool.Descriptor);
             result.Add(tool with
             {
                 HandlerIdentity = tool.HandlerIdentity ?? tool.HandlerType.AssemblyQualifiedName,
